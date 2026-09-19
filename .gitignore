@@ -1,0 +1,38 @@
+# --- secrets and local state ------------------------------------------------
+.env
+.env.local
+*.pem
+*.key
+
+# --- runtime data -----------------------------------------------------------
+var/
+*.db
+*.db-wal
+*.db-shm
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# --- node -------------------------------------------------------------------
+node_modules/
+frontend/dist/
+npm-debug.log*
+
+# --- editors / os -----------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+
+# --- build artifacts --------------------------------------------------------
+*.tsbuildinfo
