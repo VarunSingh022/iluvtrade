@@ -17,7 +17,12 @@ from typing import Any
 from sqlalchemy.orm import Session as DbSession
 
 from iluvtrade.brokers import zerodha
-from iluvtrade.brokers.crypto import CredentialError, decrypt_credentials, encrypt_credentials
+from iluvtrade.brokers.crypto import (
+    CredentialError,
+    decrypt_credentials,
+    encrypt_credentials,
+    rotate_credential,
+)
 from iluvtrade.config import get_settings
 from iluvtrade.db.base import utcnow
 from iluvtrade.db.models.broker import (
@@ -279,6 +284,18 @@ def authorize_zerodha(
     account.venue_account_id = venue_session.user_id or None
     account.venue_user_name = venue_session.user_name or None
 
+    notifications.notify(
+        session,
+        organization_id=principal.organization_id,
+        kind="broker.connected",
+        title=f"{account.label} connected",
+        body=(
+            f"Zerodha session for {venue_session.user_id or 'this account'} is active until "
+            f"{venue_session.expires_at.isoformat()}. Access tokens expire at 06:00 IST daily."
+        ),
+        resource_type="broker_account",
+        resource_id=account.id,
+    )
     audit.record(
         session,
         organization_id=principal.organization_id,
@@ -364,6 +381,15 @@ def disconnect(
     connection.token_expires_at = None
     connection.state = ConnectionState.REVOKED
     connection.connected_at = None
+    notifications.notify(
+        session,
+        organization_id=principal.organization_id,
+        kind="broker.disconnected",
+        title=f"{account.label} disconnected",
+        body=f"The stored credential was destroyed. Reason: {reason}",
+        resource_type="broker_account",
+        resource_id=account.id,
+    )
     audit.record(
         session,
         organization_id=principal.organization_id,
@@ -375,3 +401,88 @@ def disconnect(
     )
     session.flush()
     return view(account, connection)
+
+
+@dataclass(frozen=True, slots=True)
+class RotationReport:
+    """The result of rotating every stored broker credential."""
+
+    examined: int
+    rotated: int
+    already_current: int
+    failed: tuple[tuple[str, str], ...]
+
+    @property
+    def complete(self) -> bool:
+        """Whether every credential is now under the current key."""
+
+        return not self.failed
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "examined": self.examined,
+            "rotated": self.rotated,
+            "already_current": self.already_current,
+            "failed": [{"connection_id": c, "reason": r} for c, r in self.failed],
+            "complete": self.complete,
+        }
+
+
+def rotate_credentials(session: DbSession, *, dry_run: bool = False) -> RotationReport:
+    """Re-seal every stored broker credential under the current key.
+
+    **Deliberately not tenant-scoped.** Rotation is an operational act over the
+    whole deployment, run from the CLI by someone with the key material — not
+    something one organization performs on its own rows. It is not reachable
+    from the HTTP API at all.
+
+    A credential that cannot be decrypted is **left exactly as it was** and
+    reported. That is the important behaviour: the usual cause is a missing
+    retired key, and destroying the ciphertext would turn a recoverable
+    misconfiguration into permanent loss.
+    """
+
+    from sqlalchemy import select
+
+    rotated = already = 0
+    failures: list[tuple[str, str]] = []
+    connections = list(
+        session.execute(
+            select(BrokerConnection).where(BrokerConnection.encrypted_credentials.is_not(None))
+        ).scalars()
+    )
+
+    for connection in connections:
+        blob = connection.encrypted_credentials
+        if blob is None:
+            continue
+        try:
+            resealed, outcome = rotate_credential(blob, connection_id=connection.id)
+        except CredentialError as exc:
+            failures.append((connection.id, str(exc)))
+            continue
+
+        if not outcome.rotated:
+            already += 1
+            continue
+        rotated += 1
+        if not dry_run:
+            connection.encrypted_credentials = resealed
+            audit.record(
+                session,
+                organization_id=connection.organization_id,
+                action="broker.credential.rotated",
+                resource_type="broker_connection",
+                resource_id=connection.id,
+                payload={
+                    "from_key_id": outcome.previous_key_id,
+                    "to_key_id": outcome.current_key_id,
+                },
+            )
+
+    return RotationReport(
+        examined=len(connections),
+        rotated=rotated,
+        already_current=already,
+        failed=tuple(failures),
+    )

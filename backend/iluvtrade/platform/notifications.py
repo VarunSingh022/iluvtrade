@@ -1,37 +1,77 @@
-"""In-app notifications, and the boundary a real channel would plug into.
+"""In-app notifications, and the seam an external channel would attach to.
 
-PHASE 16 names the events that must reach an operator: a broker disconnecting, a
-strategy stopping, a backtest failing, an order rejected, a risk limit breached,
-stale market data, a reconciliation mismatch. All of them are written here as
-rows, and the ones that matter are also written to the audit trail — two records
-with different retention and different audiences.
+Every notification is a declared kind from :mod:`iluvtrade.platform.events`.
+:func:`notify` refuses an undeclared one, which is what keeps the catalogue an
+accurate description of the product rather than an aspirational list.
 
-Email and push are not implemented. :class:`NotificationChannel` is the seam
-they would attach to, and ``docs/SECURITY.md`` records that as an external
-dependency rather than pretending a delivery guarantee exists.
+Severity and audience come from the catalogue by default, so the same kind
+cannot be `info` in one call site and `error` in another.
+
+**Email and push do not exist.** :class:`NotificationChannel` is the interface
+they would implement and :func:`register_channel` is where they would attach.
+Nothing is registered, `deliver()` is never called, and
+``NotificationKind.deliverable_externally`` records which kinds would be worth
+sending when a channel exists — a per-kind product decision rather than a
+transport one.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Protocol
 
 from sqlalchemy.orm import Session as DbSession
 
 from iluvtrade.db.base import utcnow
 from iluvtrade.db.models.platform import Notification, NotificationSeverity
+from iluvtrade.platform.events import Audience, kind_of
 from iluvtrade.platform.tenancy import require_owned, scoped
 
-__all__ = ["NotificationChannel", "mark_read", "notify", "recent", "unread_count"]
+logger = logging.getLogger("iluvtrade.notifications")
+
+__all__ = [
+    "NotificationChannel",
+    "mark_all_read",
+    "mark_read",
+    "notify",
+    "recent",
+    "register_channel",
+    "registered_channels",
+    "unread_count",
+]
 
 
 class NotificationChannel(Protocol):
-    """Where a notification goes besides the database.
+    """Somewhere a notification goes besides the database.
 
-    Nothing implements this yet. It exists so that adding email does not mean
-    editing every call site of :func:`notify`.
+    Nothing implements this. It exists so that adding email means writing one
+    class and registering it, rather than editing every call site of
+    :func:`notify`.
     """
 
-    def deliver(self, notification: Notification) -> None: ...
+    @property
+    def name(self) -> str:
+        """Identifies the channel in logs and in the health endpoint."""
+        ...
+
+    def deliver(self, notification: Notification) -> None:
+        """Send it. Must not raise — a transport failure is not an application failure."""
+        ...
+
+
+_CHANNELS: list[NotificationChannel] = []
+
+
+def register_channel(channel: NotificationChannel) -> None:
+    """Attach an external channel. None is registered in this build."""
+
+    _CHANNELS.append(channel)
+
+
+def registered_channels() -> tuple[str, ...]:
+    """Which external channels are attached. Empty in this build, and said so."""
+
+    return tuple(channel.name for channel in _CHANNELS)
 
 
 def notify(
@@ -41,17 +81,29 @@ def notify(
     kind: str,
     title: str,
     body: str = "",
-    severity: str = "info",
+    severity: str | None = None,
     user_id: str | None = None,
     resource_type: str | None = None,
     resource_id: str | None = None,
 ) -> Notification:
-    """Record a notification. The caller still commits."""
+    """Record a notification. The caller still commits.
+
+    ``kind`` must be declared in the catalogue. ``severity`` and the audience
+    default to what the catalogue says, so one kind cannot be ``info`` at one
+    call site and ``error`` at another; passing ``severity`` overrides it for a
+    case that genuinely differs.
+    """
+
+    declared = kind_of(kind)
+    if declared.audience is Audience.ORGANIZATION:
+        # An organization-wide fact addressed to one person would be invisible
+        # to the colleague who needs to act on it.
+        user_id = None
 
     notification = Notification(
         organization_id=organization_id,
         user_id=user_id,
-        severity=NotificationSeverity(severity),
+        severity=NotificationSeverity(severity or declared.severity.value),
         kind=kind,
         title=title[:200],
         body=body[:4000],
@@ -59,13 +111,22 @@ def notify(
         resource_id=resource_id,
     )
     session.add(notification)
+
+    for channel in _CHANNELS:
+        if not declared.deliverable_externally:
+            continue
+        try:
+            channel.deliver(notification)
+        except Exception:
+            logger.exception("Notification channel %s failed", channel.name)
+
     return notification
 
 
 def recent(
     session: DbSession, organization_id: str, user_id: str, *, limit: int = 50
 ) -> list[Notification]:
-    """This user's notifications, newest first, including org-wide ones."""
+    """This user's notifications, newest first, including organization-wide ones."""
 
     query = (
         scoped(Notification, organization_id)

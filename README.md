@@ -148,11 +148,14 @@ Stated plainly, because a trading platform that overstates itself is dangerous.
   report and the approval gate. Every rejected row carries its line number and
   reason; every changed value carries its before and after.
 - **Security controls.** Tenant isolation (a 32-operation cross-tenant matrix),
-  role-based authorization, credential encryption bound to its connection,
-  SSRF defence with an explicit address deny-list, CSRF on all 33 mutating
-  routes, path-traversal refusal, strategy-version immutability, order
-  idempotency, per-principal rate limiting, and a per-tenant audit hash chain.
-- **258 backend tests and 28 frontend tests.**
+  role-based authorization, TOTP two-factor authentication, credential
+  encryption bound to its connection with working key rotation, SSRF defence
+  with an explicit address deny-list, CSRF on every mutating route,
+  path-traversal refusal, strategy-version immutability, order idempotency,
+  per-principal rate limiting, and a per-tenant audit hash chain.
+- **Traceability.** One correlation id spans an HTTP request, the job it
+  queued, the AlphaLab run that executed it and the row that stored the result.
+- **353 backend tests and 28 frontend tests.**
 
 ### Real boundary, not yet run against the outside world
 
@@ -163,8 +166,13 @@ Stated plainly, because a trading platform that overstates itself is dangerous.
   needs a Kite Connect subscription, a registered app and a funded account. The
   UI says so rather than implying otherwise. See [docs/BROKERS.md](docs/BROKERS.md).
 - **Payments.** `iluvtrade.billing` defines the provider interface; the only
-  implementation records a settled purchase without moving money. The ledger
-  fields are written correctly either way.
+  implementation records a settled purchase without moving money, and *raises*
+  rather than recording a payout. The marketplace UI states which posture is
+  live before the button is clicked. See [docs/PAYMENTS.md](docs/PAYMENTS.md).
+- **Email and push.** `NotificationChannel` is the seam; nothing is registered,
+  and `GET /api/health` reports that rather than implying delivery.
+- **Multi-instance rate limiting.** Counters are per-process, so N workers means
+  N x the limit. `GET /api/health` reports the real scope.
 
 ### Deliberately not built
 
@@ -194,6 +202,8 @@ Stated plainly, because a trading platform that overstates itself is dangerous.
 | [BROKERS.md](docs/BROKERS.md) | The broker boundary, Zerodha, what is unverified |
 | [TRADING.md](docs/TRADING.md) | Paper sessions, the live gap, risk controls, the kill switch |
 | [SECURITY.md](docs/SECURITY.md) | Controls, threat model, and what is deferred |
+| [OBSERVABILITY.md](docs/OBSERVABILITY.md) | Correlation, structured logs, and where metrics would attach |
+| [PAYMENTS.md](docs/PAYMENTS.md) | The provider boundary, the state machine, and why no money moves |
 | [SANDBOX_CONTRACT.md](docs/SANDBOX_CONTRACT.md) | The contract a seller-code sandbox must satisfy — unbuilt, specified |
 | [COMPLIANCE.md](docs/COMPLIANCE.md) | Compliance boundaries and external dependencies |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Running it somewhere real, and what has to change first |
@@ -207,7 +217,7 @@ cd backend
 ./.venv/bin/ruff check iluvtrade tests
 ./.venv/bin/ruff format --check iluvtrade tests
 ./.venv/bin/mypy
-PYTHONPATH=$PWD ./.venv/bin/python -m pytest -q          # 258 tests
+PYTHONPATH=$PWD ./.venv/bin/python -m pytest -q          # 353 tests
 ./.venv/bin/alembic check                                 # models vs migrations
 
 cd ../frontend

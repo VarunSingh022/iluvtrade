@@ -26,6 +26,8 @@ most in production:
 ```bash
 ILUVTRADE_ENVIRONMENT=production
 ILUVTRADE_SECRET_KEY=<48+ bytes of generated material>
+# Only during a rotation. Remove once `iluvtrade rotate-credentials` reports clean.
+# ILUVTRADE_RETIRED_SECRET_KEYS=["<the previous key>"]
 ILUVTRADE_DATABASE_URL=postgresql+psycopg://user:pass@host:5432/iluvtrade
 ILUVTRADE_STORAGE_ROOT=/var/lib/iluvtrade/storage
 ILUVTRADE_BACKTEST_WORKER_COUNT=4
@@ -106,6 +108,24 @@ function plus a different `run_forever`. Nothing above it changes.
 This is stated rather than implied: **the current design does not scale past one
 node**, and pretending otherwise would be the kind of claim this project avoids.
 
+## Key rotation
+
+```bash
+# 1. append the current key to ILUVTRADE_RETIRED_SECRET_KEYS, set the new
+#    ILUVTRADE_SECRET_KEY, restart
+./.venv/bin/python -m iluvtrade.cli rotate-credentials --dry-run
+./.venv/bin/python -m iluvtrade.cli rotate-credentials
+# 2. only now remove the old key from the retired list
+```
+
+Removing the old key before rotating makes every stored broker credential
+unreadable. The error names that specific cause, so it is recoverable — but the
+order is not optional.
+
+Rotating **does not** re-issue sessions: changing `ILUVTRADE_SECRET_KEY` changes
+the session-token HMAC, so every user is signed out. Plan the restart
+accordingly.
+
 ## Backups
 
 | What | Where | Matters because |
@@ -118,7 +138,20 @@ artifact is missing is a result nobody can inspect.
 
 ## Health
 
-`GET /api/health` returns the app version, the environment, **the AlphaLab
-version actually loaded**, and whether live trading is enabled. The engine
-version is there deliberately — "which engine produced these numbers" should be
-answerable from a health check.
+`GET /api/health` reports more than liveness, because each of these is
+otherwise something an operator has to assume:
+
+| Field | Why it is there |
+|---|---|
+| `engine.version` | "Which engine produced these numbers" should be answerable from a health check |
+| `live_trading_enabled` | The deployment-level gate |
+| `rate_limiting.shared_across_instances` | **`false` here.** With N workers the effective limit is N x the configured one |
+| `notification_channels` | Empty, so nothing is delivered outside the app |
+| `payment_provider` | `manual` means purchases charge nothing |
+
+## Logs
+
+JSON lines by default (`ILUVTRADE_STRUCTURED_LOGGING=false` for a terminal),
+each carrying the correlation id. A request's id is on its response as
+`X-Request-ID`, so a user's report leads straight to every line for it. See
+[OBSERVABILITY.md](OBSERVABILITY.md).

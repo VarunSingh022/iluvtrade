@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session as DbSession
 
 from iluvtrade.backtests.requests import BacktestRequest
 from iluvtrade.common import storage
+from iluvtrade.common.observability import correlation_id
 from iluvtrade.data import canonical, ingest
 from iluvtrade.db.base import utcnow
 from iluvtrade.db.models.backtest import BacktestJob, BacktestRun, JobStatus
@@ -80,6 +81,7 @@ def submit(
         request_json=request.to_json(),
         dataset_version_id=dataset_version.id,
         strategy_version_id=strategy_version.id,
+        correlation_id=correlation_id(),
         queued_at=utcnow(),
     )
     session.add(job)

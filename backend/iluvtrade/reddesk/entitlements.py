@@ -34,7 +34,7 @@ from iluvtrade.db.models.reddesk import (
     VersionAccessPolicy,
 )
 from iluvtrade.db.models.strategy import Strategy, StrategyVersion, StrategyVersionStatus
-from iluvtrade.platform import audit
+from iluvtrade.platform import audit, notifications
 from iluvtrade.platform.tenancy import scoped
 
 __all__ = [
@@ -269,6 +269,18 @@ def revoke(
         raise EntitlementError("That entitlement does not exist.")
     entitlement.status = EntitlementStatus.REVOKED
     entitlement.revoked_reason = reason[:400]
+    notifications.notify(
+        session,
+        organization_id=entitlement.organization_id,
+        kind="reddesk.entitlement_revoked",
+        title="Strategy licence revoked",
+        body=(
+            f"Version {entitlement.granted_strategy_version_id[:8]} can no longer be run "
+            f"in this workspace. Reason: {reason}"
+        ),
+        resource_type="entitlement",
+        resource_id=entitlement.id,
+    )
     audit.record(
         session,
         organization_id=entitlement.organization_id,

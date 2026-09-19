@@ -36,6 +36,7 @@ from sqlalchemy.engine import CursorResult
 from iluvtrade.alphalab_bridge import engine, instruments, market, runconfig
 from iluvtrade.alphalab_bridge import strategies as implementations
 from iluvtrade.common import storage
+from iluvtrade.common.observability import correlated, correlation_id, set_context
 from iluvtrade.db.base import utcnow
 from iluvtrade.db.models.data import DatasetVersion
 from iluvtrade.db.models.strategy import StrategyVersion
@@ -186,6 +187,9 @@ def run_session(session_id: str, *, max_records: int | None = None) -> str:
         created_by = trading_session.created_by_user_id
         session_name = trading_session.name
 
+    set_context(organization_id=organization_id, mode="paper")
+    logger.info("Replaying %d records for %s", len(loaded.rows), ", ".join(loaded.symbols))
+
     universe = instruments.universe_for(loaded.symbols, currency=loaded.currency)
     source = market.source_from_rows(
         f"session-{session_id}", loaded.rows, universe=universe, frequency=loaded.frequency
@@ -308,6 +312,21 @@ def run_session(session_id: str, *, max_records: int | None = None) -> str:
                 ),
                 payload={"reasons": counts, "first": refusals[:10]},
             )
+            # Also a notification: a refusal buried in a per-run log is a
+            # refusal nobody sees until they go looking, and the whole point of
+            # surfacing them is that somebody notices.
+            notifications.notify(
+                session,
+                organization_id=organization_id,
+                kind="trading.risk_rejected",
+                title="Risk controls refused orders",
+                body=(
+                    f"{session_name}: {len(refusals)} order(s) refused. "
+                    f"Most common reason: {max(counts, key=lambda r: counts[r])}"
+                ),
+                resource_type="trading_session",
+                resource_id=session_id,
+            )
         for level, text in logs[-50:]:
             log_event(session, trading_session, kind="strategy_log", severity=level, message=text)
 
@@ -356,28 +375,54 @@ class SessionRunner:
             if existing is not None and existing.is_alive():
                 return
 
+            # Captured here, in the request's thread, and adopted below in the
+            # runner's. A ContextVar does not cross a thread boundary, so this
+            # is the one place propagation has to be written down.
+            origin = correlation_id()
+
             def _run() -> None:
-                try:
-                    run_session(session_id)
-                except Exception as exc:
-                    logger.exception("Trading session %s failed", session_id)
-                    with session_scope() as session:
-                        trading_session = session.get(TradingSession, session_id)
-                        if trading_session is not None:
-                            trading_session.status = SessionStatus.FAILED
-                            trading_session.failure_reason = str(exc)[:4000]
-                            trading_session.stopped_at = utcnow()
-                            log_event(
-                                session,
-                                trading_session,
-                                kind="session.failed",
-                                severity="error",
-                                message=str(exc)[:2000],
-                            )
+                with correlated(origin, session_id=session_id):
+                    self._run_session(session_id)
 
             thread = threading.Thread(target=_run, name=f"session-{session_id[:8]}", daemon=True)
             self._threads[session_id] = thread
             thread.start()
+
+    def _run_session(self, session_id: str) -> None:
+        """The body of a runner thread, already inside its correlation scope.
+
+        A named method rather than a closure nested three levels inside
+        :meth:`launch`, so the correlation scope wraps exactly one call and the
+        failure handling is readable on its own.
+        """
+
+        try:
+            run_session(session_id)
+        except Exception as exc:
+            logger.exception("Trading session %s failed", session_id)
+            with session_scope() as session:
+                trading_session = session.get(TradingSession, session_id)
+                if trading_session is None:
+                    return
+                trading_session.status = SessionStatus.FAILED
+                trading_session.failure_reason = str(exc)[:4000]
+                trading_session.stopped_at = utcnow()
+                log_event(
+                    session,
+                    trading_session,
+                    kind="session.failed",
+                    severity="error",
+                    message=str(exc)[:2000],
+                )
+                notifications.notify(
+                    session,
+                    organization_id=trading_session.organization_id,
+                    kind="trading.session.failed",
+                    title="Trading session failed",
+                    body=f"{trading_session.name}: {str(exc)[:300]}",
+                    resource_type="trading_session",
+                    resource_id=session_id,
+                )
 
     def join(self, session_id: str, timeout: float = 120.0) -> None:
         thread = self._threads.get(session_id)

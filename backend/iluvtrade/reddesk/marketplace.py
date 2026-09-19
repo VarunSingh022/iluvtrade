@@ -655,6 +655,20 @@ def purchase(
     )
     notifications.notify(
         session,
+        organization_id=principal.organization_id,
+        user_id=principal.user_id,
+        kind="reddesk.purchased",
+        title=f"Licence acquired: {listing.title}",
+        body=(
+            f"Your workspace may now run strategy version "
+            f"{current.strategy_version_id[:8]} under a "
+            f"{listing.version_access_policy.value} licence."
+        ),
+        resource_type="entitlement",
+        resource_id=entitlement.id,
+    )
+    notifications.notify(
+        session,
         organization_id=listing.organization_id,
         kind="reddesk.sale",
         title="Your strategy was purchased",

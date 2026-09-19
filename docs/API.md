@@ -10,6 +10,11 @@ Two mechanisms:
 - **Session cookie** (`iluvtrade_session`, HttpOnly) — what the browser app
   uses. State-changing requests must also send `X-Requested-With`, which a
   cross-origin form post cannot set without a preflight the browser refuses.
+
+When an account has two-factor authentication enabled, `POST /auth/login`
+without `mfa_code` answers `401` with an `X-MFA-Required: true` header — a
+distinct signal, so a client presents a challenge instead of reporting the
+password as wrong. A wrong code and a wrong password give the same message.
 - **Bearer token** — `Authorization: Bearer <token>` from a login response.
   Accepted on any method, because a header token is not attached automatically
   by the browser.
@@ -53,6 +58,11 @@ parsing prose.
 | POST | `/auth/logout` | 204 |
 | GET | `/auth/me` | |
 | PATCH | `/auth/me` | display name, and the *user* half of the live-trading gate |
+| GET | `/auth/mfa` | enrolment status and remaining recovery codes |
+| POST | `/auth/mfa/enrol` | issue a secret and recovery codes; **does not enable** |
+| POST | `/auth/mfa/confirm` | enable, by proving the authenticator holds the secret |
+| POST | `/auth/mfa/recovery-codes` | replace every code; requires a current factor |
+| POST | `/auth/mfa/disable` | requires a current code — a session is not enough |
 
 ### Datasets
 
@@ -92,6 +102,7 @@ parsing prose.
 
 | Method | Path | Notes |
 |---|---|---|
+| GET | `/reddesk/billing-status` | whether a purchase actually charges anything |
 | GET | `/reddesk/discover` | published listings, cross-tenant by design |
 | GET | `/reddesk/listings/{id}` | |
 | GET | `/reddesk/my-listings` | this org's listings at any status |
@@ -146,6 +157,14 @@ exchange, marketplace writes and session starts are rate limited. A refusal is
 `429` in the same envelope, with `error.policy`, `error.retry_after_seconds` and
 a `Retry-After` header. Limits count failed calls too. See `SECURITY.md` for the
 table.
+
+## Correlation
+
+Every response carries `X-Request-ID`. An inbound one is adopted rather than
+replaced, so a trace that began at a load balancer stays one trace. The same id
+is persisted on a backtest job and adopted by the worker thread, so one
+identifier spans the HTTP request, the job and the engine run. See
+[OBSERVABILITY.md](OBSERVABILITY.md).
 
 ## Conventions
 

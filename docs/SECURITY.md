@@ -18,6 +18,28 @@ section matters most: a security document that lists only wins is not useful.
 A database disclosure does not yield usable sessions: the rows hold HMACs, not
 tokens.
 
+## Two-factor authentication
+
+TOTP (RFC 6238) via `pyotp`. Nothing cryptographic is invented; what this
+application decides is the part that matters more than the algorithm:
+
+| Decision | Why |
+|---|---|
+| **Enrolment is two-step** | A secret is issued, and MFA is enabled only once a code proves the authenticator has it. Enabling on issue locks out anyone whose authenticator never received it — unrecoverable for the last admin of an organization. |
+| **A code cannot be replayed** | TOTP codes are valid for a window, so one works twice within it. The last accepted counter is stored and a code at or below it is refused. |
+| **One step of drift, no more** | A wider window multiplies the codes valid at any instant. |
+| **The secret is encrypted at rest** | Same AES-GCM envelope as a broker credential, bound to the user id. A database disclosure otherwise mints valid codes forever. |
+| **Recovery codes are hashed** | Argon2id, exactly as passwords are — they are password-equivalent. Single-use, and shown once. |
+| **Disabling requires proof** | A current code or a recovery code, not merely a session. Disabling MFA is the first thing a stolen session would be used for. |
+| **A wrong password is refused before the code is considered** | A caller must not learn whether an account has MFA without first proving the password. |
+
+The secret and the recovery codes appear in exactly one response, at enrolment.
+`tests/security/test_api_contract.py` holds a two-entry allowlist for that and
+asserts the values are never re-served by any endpoint.
+
+**Not implemented:** WebAuthn/passkeys, and per-organization enforcement (a user
+enables MFA on their own account; an admin cannot yet require it).
+
 ## CSRF
 
 Cookie authentication is honoured for safe methods, and for unsafe methods only
@@ -74,8 +96,30 @@ every credential, guessing which key each one used.
 A blob sealed under a different key now fails with a *specific* message naming
 that as the cause, rather than a generic decryption failure.
 
-**Still not implemented: rotation itself.** It needs a second active key, a
-re-encryption pass, and a window in which both keys decrypt.
+### Rotation
+
+Implemented. `ILUVTRADE_RETIRED_SECRET_KEYS` lists keys that may still
+*decrypt*; nothing is ever encrypted under one.
+
+```bash
+# 1. append the current key to the retired list, set the new one, restart
+# 2. see what would change
+iluvtrade rotate-credentials --dry-run
+# 3. re-seal
+iluvtrade rotate-credentials
+# 4. only now remove the old key from the retired list
+```
+
+The order matters: removing the old key first makes every stored credential
+unreadable. `decrypt_credentials` names that specific cause rather than
+reporting a generic failure, so the mistake is recoverable.
+
+A credential that cannot be decrypted is **left exactly as it was** and
+reported. Destroying the ciphertext would turn a recoverable misconfiguration
+into permanent loss.
+
+**Retired keys are never dropped automatically.** Removing one is the
+operator's decision, taken after a rotation reports nothing left under it.
 
 ## Rate limiting
 
@@ -231,9 +275,8 @@ so in its output rather than leaving it to be discovered.
 | Gap | What it needs |
 |---|---|
 | **Sandboxed strategy execution** | container or gVisor isolation, resource limits, an import allowlist. The largest single piece of deferred work. |
-| **Secret rotation** | a second active key and a re-encryption pass. Envelopes already carry a key id, so this no longer needs a migration first |
-| **Shared rate-limit state** | the limiter is per-process; a Redis backend behind `RateLimitBackend` would make limits exact across workers |
-| **MFA** | no second factor on any account |
+| **Shared rate-limit state** | a Redis backend behind `RateLimitBackend`. `SharedBackend` documents what it must provide — atomic increment-and-expire, server-side expiry, a deliberate fail-open/fail-closed choice, and the store's own clock. Not written, because an untested `INCR`/`EXPIRE` pair that races is worse than a limiter known to be local |
+| **Email / push delivery** | an SMTP relay or push provider behind `NotificationChannel`. The catalogue already marks which kinds are worth sending |
 | **Email verification and password reset** | there is no email channel at all |
 | **Webhook signature verification** | no webhooks exist yet; a payment provider will need HMAC verification and replay protection |
 | **External audit anchoring** | the hash chain detects row-level tampering but not a full rewrite; anchoring the head externally is what would |

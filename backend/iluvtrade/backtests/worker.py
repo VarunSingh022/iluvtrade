@@ -30,6 +30,7 @@ from iluvtrade.backtests import service
 from iluvtrade.backtests.requests import BacktestRequest
 from iluvtrade.backtests.runner import execute
 from iluvtrade.common import storage
+from iluvtrade.common.observability import correlated, set_context
 from iluvtrade.config import get_settings
 from iluvtrade.db.base import utcnow
 from iluvtrade.db.models.backtest import BacktestJob, JobStatus
@@ -63,6 +64,18 @@ def process_one() -> bool:
         if job is None:
             return False
         job_id = job.id
+        # The id the submitting request carried, so a job's log lines join to
+        # the HTTP call that queued it. A ContextVar does not cross a thread,
+        # so this adoption is deliberate.
+        correlation = job.correlation_id
+        organization_id = job.organization_id
+
+    with correlated(correlation, job_id=job_id, organization_id=organization_id):
+        return _execute_claimed(job_id)
+
+
+def _execute_claimed(job_id: str) -> bool:
+    """Run a job already claimed by this worker, under its correlation scope."""
 
     try:
         with session_scope() as session:
@@ -96,6 +109,11 @@ def process_one() -> bool:
                     job.finished_at = utcnow()
             return True
 
+        set_context(
+            dataset_version_id=request.dataset_version_id,
+            strategy_version_id=request.strategy_version_id,
+        )
+        logger.info("Executing backtest over %d records", len(rows))
         executed = execute(
             request,
             rows=rows,

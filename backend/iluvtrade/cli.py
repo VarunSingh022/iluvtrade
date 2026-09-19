@@ -18,6 +18,16 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("init-db", help="Create every table.")
     sub.add_parser("demo", help="Run the end-to-end demonstration workflow.")
 
+    rotate = sub.add_parser(
+        "rotate-credentials",
+        help="Re-seal stored broker credentials under the current secret key.",
+    )
+    rotate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be rotated without writing anything.",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "serve":
@@ -37,6 +47,27 @@ def main(argv: list[str] | None = None) -> int:
         from iluvtrade.demo import run_demo
 
         return run_demo()
+
+    if args.command == "rotate-credentials":
+        from iluvtrade.brokers.service import rotate_credentials
+        from iluvtrade.db.session import session_scope
+
+        with session_scope() as session:
+            report = rotate_credentials(session, dry_run=args.dry_run)
+
+        prefix = "Would rotate" if args.dry_run else "Rotated"
+        print(f"{prefix} {report.rotated} of {report.examined} stored credential(s).")
+        print(f"  already under the current key: {report.already_current}")
+        if report.failed:
+            print(f"  FAILED: {len(report.failed)} — left untouched:")
+            for connection_id, reason in report.failed:
+                print(f"    {connection_id}: {reason}")
+            print(
+                "\n  The usual cause is a missing retired key. Add the previous "
+                "ILUVTRADE_SECRET_KEY\n  to ILUVTRADE_RETIRED_SECRET_KEYS and run this again."
+            )
+            return 1
+        return 0
 
     return 1
 

@@ -20,6 +20,8 @@ from iluvtrade.api.v1.schemas import (
     RateListingRequest,
     ReviewListingRequest,
 )
+from iluvtrade.billing import get_provider
+from iluvtrade.config import get_settings
 from iluvtrade.db.models.reddesk import (
     BillingCadence,
     Entitlement,
@@ -44,6 +46,38 @@ def _entitlement(row: Entitlement) -> EntitlementResponse:
         valid_from=row.valid_from,
         valid_until=row.valid_until,
     )
+
+
+@router.get("/billing-status")
+def billing_status(_principal: Principal = Depends(current_principal)) -> dict:
+    """Whether acquiring a listing actually moves money.
+
+    Surfaced so the UI can say which of two very different things a purchase is,
+    rather than showing one "Acquire" button for both. A buyer who believes they
+    paid when nothing was charged — or the reverse — is the failure this exists
+    to prevent.
+    """
+
+    provider = get_provider(_configured_provider())
+    return {
+        "provider": provider.name,
+        "moves_money": provider.moves_money,
+        "state": (
+            "REAL_PAYMENT_PROCESSING_ENABLED"
+            if provider.moves_money
+            else "READY_FOR_PROVIDER_INTEGRATION"
+        ),
+        "notice": (
+            "Purchases are settled by a real payment provider."
+            if provider.moves_money
+            else (
+                "No payment provider is configured. A purchase records the licence and "
+                "grants the entitlement, but no money is charged and no payout can be "
+                "settled."
+            )
+        ),
+        "payouts_settleable": provider.moves_money,
+    }
 
 
 @router.get("/discover")
@@ -207,8 +241,13 @@ def purchase(
         principal,
         listing_id=payload.listing_id,
         idempotency_key=payload.idempotency_key,
+        provider=_configured_provider(),
     )
     return {
+        "billing": {
+            "provider": purchase_row.provider,
+            "moves_money": get_provider(purchase_row.provider).moves_money,
+        },
         "purchase": {
             "id": purchase_row.id,
             "status": purchase_row.status.value,
@@ -265,3 +304,13 @@ def rate(
         session, principal, listing_id=listing_id, rating=payload.rating, body=payload.body
     )
     return {"id": row.id, "rating": row.rating, "body": row.body}
+
+
+def _configured_provider() -> str:
+    """The provider this deployment is configured to use.
+
+    A single place to read it, so the status endpoint and the purchase route
+    cannot disagree about which provider is in play.
+    """
+
+    return get_settings().payment_provider

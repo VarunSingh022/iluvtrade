@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session as DbSession
 
 from iluvtrade.api.deps import (
@@ -13,6 +13,9 @@ from iluvtrade.api.deps import (
 )
 from iluvtrade.api.v1.schemas import (
     LoginRequest,
+    MfaCodeRequest,
+    MfaEnrolmentResponse,
+    MfaStatusResponse,
     RegisterRequest,
     SessionResponse,
     UpdateSettingsRequest,
@@ -20,7 +23,7 @@ from iluvtrade.api.v1.schemas import (
 )
 from iluvtrade.config import get_settings
 from iluvtrade.db.models.platform import Organization, User
-from iluvtrade.platform import accounts
+from iluvtrade.platform import accounts, audit, mfa, notifications
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -36,6 +39,7 @@ def _user_response(session: DbSession, principal: accounts.Principal) -> UserRes
         organization_name=organization.name if organization else "",
         role=principal.role.value,
         live_trading_enabled=bool(user.live_trading_enabled) if user else False,
+        mfa_enabled=mfa.is_enabled(user) if user else False,
     )
 
 
@@ -108,14 +112,24 @@ def login(
     response: Response,
     session: DbSession = Depends(db_session),
 ) -> SessionResponse:
-    row, token = accounts.login(
-        session,
-        email=payload.email,
-        password=payload.password,
-        organization_id=payload.organization_id,
-        ip_address=request.client.host if request.client else None,
-        user_agent=request.headers.get("user-agent"),
-    )
+    try:
+        row, token = accounts.login(
+            session,
+            email=payload.email,
+            password=payload.password,
+            organization_id=payload.organization_id,
+            mfa_code=payload.mfa_code,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except mfa.MfaRequired as exc:
+        # 401 with a distinct code, so the client shows a challenge rather than
+        # reporting the password as wrong.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+            headers={"X-MFA-Required": "true"},
+        ) from exc
     principal = accounts.resolve_principal(session, token)
     _set_cookie(response, token)
     return SessionResponse(
@@ -156,8 +170,6 @@ def update_me(
     not enable live trading.
     """
 
-    from iluvtrade.platform import audit
-
     user = session.get(User, principal.user_id)
     if user is None:
         raise LookupError("User not found")
@@ -184,4 +196,153 @@ def update_me(
         organization_name=organization.name if organization else "",
         role=principal.role.value,
         live_trading_enabled=user.live_trading_enabled,
+        mfa_enabled=mfa.is_enabled(user),
     )
+
+
+# ---------------------------------------------------------------------------
+# Two-factor authentication
+# ---------------------------------------------------------------------------
+
+
+@router.get("/mfa", response_model=MfaStatusResponse)
+def mfa_status(
+    session: DbSession = Depends(db_session),
+    principal: accounts.Principal = Depends(current_principal),
+) -> MfaStatusResponse:
+    user = session.get(User, principal.user_id)
+    if user is None:
+        raise LookupError("User not found")
+    return MfaStatusResponse(
+        enabled=mfa.is_enabled(user),
+        enrolment_pending=bool(user.mfa_secret) and not mfa.is_enabled(user),
+        recovery_codes_remaining=mfa.remaining_recovery_codes(user),
+    )
+
+
+@router.post("/mfa/enrol", response_model=MfaEnrolmentResponse, status_code=201)
+def begin_mfa_enrolment(
+    session: DbSession = Depends(db_session),
+    principal: accounts.Principal = Depends(current_principal),
+) -> MfaEnrolmentResponse:
+    """Issue a secret and recovery codes. Does **not** enable MFA.
+
+    This is the only time the secret and the recovery codes exist outside the
+    user's hands — the codes are stored hashed and the secret encrypted, so
+    neither can be shown again.
+    """
+
+    user = session.get(User, principal.user_id)
+    if user is None:
+        raise LookupError("User not found")
+
+    enrolment = mfa.begin_enrolment(user)
+    audit.record(
+        session,
+        organization_id=principal.organization_id,
+        action="user.mfa_enrolment_started",
+        resource_type="user",
+        resource_id=user.id,
+        actor_user_id=principal.user_id,
+    )
+    return MfaEnrolmentResponse(
+        secret=enrolment.secret,
+        provisioning_uri=enrolment.provisioning_uri,
+        recovery_codes=list(enrolment.recovery_codes),
+    )
+
+
+@router.post("/mfa/confirm", response_model=MfaStatusResponse)
+def confirm_mfa(
+    payload: MfaCodeRequest,
+    session: DbSession = Depends(db_session),
+    principal: accounts.Principal = Depends(current_principal),
+) -> MfaStatusResponse:
+    """Enable MFA by proving the authenticator holds the secret."""
+
+    user = session.get(User, principal.user_id)
+    if user is None:
+        raise LookupError("User not found")
+
+    mfa.confirm_enrolment(user, payload.code)
+    audit.record(
+        session,
+        organization_id=principal.organization_id,
+        action="user.mfa_enabled",
+        resource_type="user",
+        resource_id=user.id,
+        actor_user_id=principal.user_id,
+    )
+    notifications.notify(
+        session,
+        organization_id=principal.organization_id,
+        user_id=principal.user_id,
+        kind="account.mfa_enabled",
+        title="Two-factor authentication enabled",
+        body="A verification code is now required to sign in to this account.",
+        resource_type="user",
+        resource_id=user.id,
+    )
+    return MfaStatusResponse(
+        enabled=True,
+        enrolment_pending=False,
+        recovery_codes_remaining=mfa.remaining_recovery_codes(user),
+    )
+
+
+@router.post("/mfa/recovery-codes", response_model=MfaEnrolmentResponse)
+def regenerate_recovery_codes(
+    payload: MfaCodeRequest,
+    session: DbSession = Depends(db_session),
+    principal: accounts.Principal = Depends(current_principal),
+) -> MfaEnrolmentResponse:
+    """Replace every recovery code. Requires a current second factor."""
+
+    user = session.get(User, principal.user_id)
+    if user is None:
+        raise LookupError("User not found")
+
+    codes = mfa.regenerate_recovery_codes(user, payload.code)
+    audit.record(
+        session,
+        organization_id=principal.organization_id,
+        action="user.mfa_recovery_codes_regenerated",
+        resource_type="user",
+        resource_id=user.id,
+        actor_user_id=principal.user_id,
+    )
+    return MfaEnrolmentResponse(secret="", provisioning_uri="", recovery_codes=list(codes))
+
+
+@router.post("/mfa/disable", response_model=MfaStatusResponse)
+def disable_mfa(
+    payload: MfaCodeRequest,
+    session: DbSession = Depends(db_session),
+    principal: accounts.Principal = Depends(current_principal),
+) -> MfaStatusResponse:
+    """Turn MFA off. Requires a current code — being signed in is not enough."""
+
+    user = session.get(User, principal.user_id)
+    if user is None:
+        raise LookupError("User not found")
+
+    mfa.disable(user, payload.code)
+    audit.record(
+        session,
+        organization_id=principal.organization_id,
+        action="user.mfa_disabled",
+        resource_type="user",
+        resource_id=user.id,
+        actor_user_id=principal.user_id,
+    )
+    notifications.notify(
+        session,
+        organization_id=principal.organization_id,
+        user_id=principal.user_id,
+        kind="account.mfa_disabled",
+        title="Two-factor authentication disabled",
+        body="This account no longer requires a verification code to sign in.",
+        resource_type="user",
+        resource_id=user.id,
+    )
+    return MfaStatusResponse(enabled=False, enrolment_pending=False, recovery_codes_remaining=0)

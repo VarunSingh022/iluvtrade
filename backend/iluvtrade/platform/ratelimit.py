@@ -23,10 +23,21 @@ every hit; a token bucket makes "10 per minute" an approximation.
 What this is **not**
 --------------------
 
-In-process. Two API workers each enforce the limit separately, so the effective
-limit is ``limit x workers``. That is stated rather than hidden, and
-:class:`RateLimitBackend` is the seam a Redis implementation plugs into —
-``docs/SECURITY.md`` records it. For a single-node deployment it is exact.
+**In-process, and therefore not distributed.** Two API workers each keep their
+own counters, so the effective limit across a deployment is
+``limit x workers``. That is stated rather than hidden, and it is the honest
+description: this is a single-process limiter that a multi-instance deployment
+must replace.
+
+:class:`RateLimitBackend` is the seam. :class:`SharedBackend` below documents
+exactly what a Redis (or Postgres) implementation has to provide, and
+:func:`describe_enforcement` reports which kind is actually running so a
+deployment can tell — rather than assuming the limits it configured are the
+limits it gets.
+
+No shared backend is implemented here. One cannot be written honestly without a
+running Redis to test the atomicity it depends on, and an untested
+``INCR``/``EXPIRE`` pair that races is worse than a limiter known to be local.
 
 Determinism
 -----------
@@ -85,12 +96,55 @@ class Policy:
 class RateLimitBackend(Protocol):
     """Where counters live. The seam a shared store implements."""
 
+    @property
+    def is_shared(self) -> bool:
+        """Whether counters are shared across processes.
+
+        ``False`` for anything in memory. Read by
+        :func:`describe_enforcement`, so a deployment can report what it
+        actually enforces instead of what it configured.
+        """
+        ...
+
     def hit(self, key: str, window_seconds: int, now: float) -> int:
-        """Record one hit and return the count within the current window."""
+        """Record one hit and return the count within the current window.
+
+        **Must be atomic.** A shared implementation that reads, increments and
+        writes in separate round trips will undercount under exactly the
+        concurrency a rate limit exists to handle. In Redis this is a single
+        ``INCR`` followed by an ``EXPIRE`` on first write, or one Lua script.
+        """
         ...
 
     def reset(self) -> None:
         """Forget everything. Tests and administrative clearing only."""
+        ...
+
+
+class SharedBackend(RateLimitBackend, Protocol):
+    """What a multi-instance deployment needs, written down but not built.
+
+    An implementation must provide, beyond :class:`RateLimitBackend`:
+
+    * **Atomic increment-and-expire.** One round trip, or a script. Two round
+      trips race.
+    * **Server-side expiry.** Keys must expire without the application sweeping
+      them, or a busy deployment accumulates one key per identity per window
+      forever.
+    * **Fail-open or fail-closed, chosen deliberately.** When the store is
+      unreachable, either every request is allowed (availability) or every one
+      is refused (safety). Both are defensible; silently doing one while the
+      operator assumes the other is not. :attr:`fail_open` states which.
+    * **A clock the store owns.** Window boundaries computed from each
+      application instance's clock drift apart; the store's own time does not.
+
+    None of this is implemented. Writing it without a Redis to test the
+    atomicity against would produce something that looks right and races.
+    """
+
+    @property
+    def fail_open(self) -> bool:
+        """Whether an unreachable store allows requests or refuses them."""
         ...
 
 
@@ -109,6 +163,12 @@ class InMemoryBackend:
     def __init__(self) -> None:
         self._counts: dict[str, tuple[int, int]] = {}
         self._lock = threading.Lock()
+
+    @property
+    def is_shared(self) -> bool:
+        """Never. These counters live in one process's memory."""
+
+        return False
 
     def hit(self, key: str, window_seconds: int, now: float) -> int:
         window = int(now // window_seconds)
@@ -204,3 +264,47 @@ def reset_limiter() -> None:
     global _LIMITER
     with _LIMITER_LOCK:
         _LIMITER = None
+
+
+@dataclass(frozen=True, slots=True)
+class Enforcement:
+    """What this process actually enforces, as opposed to what it configured."""
+
+    enabled: bool
+    shared: bool
+    backend: str
+    caveat: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "shared_across_instances": self.shared,
+            "backend": self.backend,
+            "caveat": self.caveat,
+        }
+
+
+def describe_enforcement(limiter: RateLimiter | None = None) -> Enforcement:
+    """Report the limiter's real scope, for a health check or a deployment doc.
+
+    Exists so "we rate limit logins to 10 a minute" cannot be believed without
+    also knowing it is 10 a minute *per process*.
+    """
+
+    limiter = limiter or get_limiter()
+    backend = limiter._backend
+    shared = bool(getattr(backend, "is_shared", False))
+    return Enforcement(
+        enabled=limiter.enabled,
+        shared=shared,
+        backend=type(backend).__name__,
+        caveat=(
+            ""
+            if shared
+            else (
+                "Counters are per-process. With N API workers the effective limit is "
+                "N x the configured limit. A multi-instance deployment needs a shared "
+                "backend; none is implemented."
+            )
+        ),
+    )

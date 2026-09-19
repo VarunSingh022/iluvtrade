@@ -24,6 +24,11 @@ from iluvtrade.alphalab_bridge import ALPHALAB_VERSION
 from iluvtrade.api import errors
 from iluvtrade.api.v1.router import api_v1
 from iluvtrade.backtests.worker import BacktestWorkerPool
+from iluvtrade.common.observability import (
+    configure_logging,
+    correlated,
+    set_context,
+)
 from iluvtrade.config import get_settings
 from iluvtrade.db.session import create_all
 
@@ -31,6 +36,30 @@ logger = logging.getLogger("iluvtrade")
 
 #: Built frontend, when one exists. Absent in a backend-only deployment.
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+
+
+class CorrelationMiddleware(BaseHTTPMiddleware):
+    """Give every request an identifier and put it on the response.
+
+    An inbound ``X-Request-ID`` is adopted rather than replaced, so a trace that
+    started at a load balancer or a client stays one trace. It is truncated and
+    sanitised first — it is caller-controlled text that ends up in log lines.
+
+    The id is echoed on the response so a user reporting a problem can quote it,
+    and an operator can find every line for that request with one query.
+    """
+
+    async def dispatch(
+        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        inbound = request.headers.get("x-request-id", "")
+        safe = "".join(c for c in inbound if c.isalnum() or c in "-_")[:64] or None
+
+        with correlated(safe) as identifier:
+            set_context(method=request.method, path=request.url.path)
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = identifier
+            return response
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -73,6 +102,7 @@ def create_app(*, start_workers: bool = True, create_tables: bool = True) -> Fas
     """Build the application."""
 
     settings = get_settings()
+    configure_logging(settings.log_level, structured=settings.structured_logging)
     pool = BacktestWorkerPool()
 
     @asynccontextmanager
@@ -114,7 +144,10 @@ def create_app(*, start_workers: bool = True, create_tables: bool = True) -> Fas
         openapi_url="/api/openapi.json",
     )
 
+    # Added last so it runs first: every other middleware's logging should
+    # already carry the correlation id.
     app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(CorrelationMiddleware)
     if not settings.is_production:
         # The dev frontend runs on its own origin. Credentials are allowed only
         # for that explicit origin list — never with a wildcard, which browsers
@@ -132,7 +165,16 @@ def create_app(*, start_workers: bool = True, create_tables: bool = True) -> Fas
 
     @app.get("/api/health", tags=["meta"])
     def health() -> JSONResponse:
-        """Liveness, and which engine version is actually loaded."""
+        """Liveness, and what this deployment actually enforces.
+
+        Deliberately more than "ok": the engine version, whether live trading is
+        possible, whether rate limits are shared across instances, and whether
+        any external notification channel is attached. Each is something an
+        operator would otherwise have to assume.
+        """
+
+        from iluvtrade.platform.notifications import registered_channels
+        from iluvtrade.platform.ratelimit import describe_enforcement
 
         return JSONResponse(
             {
@@ -141,6 +183,9 @@ def create_app(*, start_workers: bool = True, create_tables: bool = True) -> Fas
                 "environment": settings.environment,
                 "engine": {"name": "alphalab", "version": ALPHALAB_VERSION},
                 "live_trading_enabled": settings.live_trading_enabled,
+                "rate_limiting": describe_enforcement().to_dict(),
+                "notification_channels": list(registered_channels()),
+                "payment_provider": settings.payment_provider,
             }
         )
 

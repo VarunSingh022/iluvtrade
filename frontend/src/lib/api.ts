@@ -335,6 +335,14 @@ export interface Listing {
   published_at: string | null;
 }
 
+export interface BillingStatus {
+  provider: string;
+  moves_money: boolean;
+  state: "REAL_PAYMENT_PROCESSING_ENABLED" | "READY_FOR_PROVIDER_INTEGRATION";
+  notice: string;
+  payouts_settleable: boolean;
+}
+
 export interface Entitlement {
   id: string;
   listing_id: string;

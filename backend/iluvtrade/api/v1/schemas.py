@@ -35,6 +35,26 @@ class LoginRequest(Strict):
     email: EmailStr
     password: str = Field(min_length=1, max_length=256)
     organization_id: str | None = None
+    #: A TOTP code or a recovery code, when the account has MFA enabled.
+    mfa_code: str | None = Field(default=None, max_length=32)
+
+
+class MfaCodeRequest(Strict):
+    code: str = Field(min_length=6, max_length=32)
+
+
+class MfaEnrolmentResponse(BaseModel):
+    """Returned **once**. The secret and codes are never retrievable again."""
+
+    secret: str
+    provisioning_uri: str
+    recovery_codes: list[str]
+
+
+class MfaStatusResponse(BaseModel):
+    enabled: bool
+    enrolment_pending: bool
+    recovery_codes_remaining: int
 
 
 class SessionResponse(BaseModel):
@@ -53,6 +73,7 @@ class UserResponse(BaseModel):
     organization_name: str
     role: str
     live_trading_enabled: bool
+    mfa_enabled: bool
 
 
 # --- datasets --------------------------------------------------------------

@@ -32,7 +32,7 @@ from iluvtrade.db.models.data import (
     DataSource,
     SourceKind,
 )
-from iluvtrade.platform import audit
+from iluvtrade.platform import audit, notifications
 from iluvtrade.platform.accounts import Principal, slugify
 from iluvtrade.platform.tenancy import NotFoundError, require_owned, scoped
 
@@ -181,6 +181,29 @@ def _canonicalize(
 
     session.add(version)
     session.flush()
+
+    failed = version.status is DatasetVersionStatus.FAILED
+    notifications.notify(
+        session,
+        organization_id=principal.organization_id,
+        user_id=principal.user_id,
+        kind="dataset.failed" if failed else "dataset.ready",
+        title=(
+            f"{dataset.name} could not be processed"
+            if failed
+            else f"{dataset.name} v{version.version} is ready for review"
+        ),
+        body=(
+            (version.failure_reason or "No usable bars could be built from the file.")
+            if failed
+            else (
+                f"{version.row_count} row(s) accepted, {version.rejected_row_count} rejected. "
+                "Nothing can use it until you approve it."
+            )
+        ),
+        resource_type="dataset_version",
+        resource_id=version.id,
+    )
     audit.record(
         session,
         organization_id=principal.organization_id,

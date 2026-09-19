@@ -69,6 +69,11 @@ class BacktestJob(Base, IdMixin, OrgScopedMixin, TimestampMixin):
         String(36), ForeignKey("strategy_versions.id"), nullable=False
     )
 
+    #: The correlation id of the request that queued this job, so a worker's
+    #: log lines join to the HTTP call that submitted it. Nullable because a job
+    #: queued outside a request (a future scheduler) has no originating trace.
+    correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
     queued_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)

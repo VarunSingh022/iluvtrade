@@ -685,6 +685,88 @@ def run_demo() -> int:
         ]
         print(f"     credential markers found in audit payloads: {leaked or 'none'}")
 
+        # -- 8. the boundaries, demonstrated rather than asserted ----------
+        _rule("BOUNDARIES — what this build deliberately will not do")
+
+        _step(27, "Live trading is refused, and for a structural reason")
+        attempt = buyer.post(
+            "/api/v1/trading/sessions",
+            json={
+                "name": "live",
+                "mode": "live",
+                "strategy_version_id": entitlement["granted_strategy_version_id"],
+                "broker_account_id": "any",
+                "live_confirmed": True,
+            },
+            headers=headers,
+        )
+        print(f"     HTTP {attempt.status_code} — {attempt.json()['error']['message'][:62]}")
+        import ast as _ast
+        import pathlib as _pathlib
+
+        package = _pathlib.Path(__file__).resolve().parent
+        live_mode_sites = [
+            str(path.relative_to(package))
+            for path in package.rglob("*.py")
+            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8")))
+            if isinstance(node, _ast.Attribute)
+            and node.attr == "LIVE"
+            and "ExecutionMode" in _ast.dump(node.value)
+        ]
+        print(f"     ExecutionMode.LIVE constructed in: {live_mode_sites or 'nowhere'}")
+        print("     AlphaLab derives routing from mode, so no configured run can reach a venue.")
+
+        _step(28, "Seller-code execution does not exist")
+        implementations = creator.get("/api/v1/strategies/implementations").json()
+        print(
+            f"     a listing names one of {len(implementations)} in-repository "
+            f"implementations: {[i['key'] for i in implementations]}"
+        )
+        rejected = creator.post(
+            f"/api/v1/strategies/{strategy['id']}/versions",
+            json={"implementation_key": "attacker_supplied_module", "parameters": {}},
+            headers=headers,
+        )
+        print(
+            f"     an unknown implementation: HTTP {rejected.status_code} — "
+            f"{rejected.json()['error']['message'][:58]}"
+        )
+
+        _step(29, "The payment boundary fails closed")
+        billing = buyer.get("/api/v1/reddesk/billing-status").json()
+        print(f"     provider={billing['provider']}  moves_money={billing['moves_money']}")
+        print(f"     state={billing['state']}")
+        from decimal import Decimal
+
+        from iluvtrade.billing import PaymentError, get_provider
+
+        try:
+            get_provider("manual").payout(
+                organization_id="x", amount=Decimal("1000"), currency="INR"
+            )
+            print("     ✗ a payout was recorded without money moving")
+            return 1
+        except PaymentError as exc:
+            print(f"     a payout raises rather than writing a false entry: {str(exc)[:54]}")
+
+        _step(30, "The audit chain verifies, and detects tampering")
+        verification = buyer.get("/api/v1/audit/verify").json()
+        print(
+            f"     {verification['events_checked']} events, intact={verification['intact']}, "
+            f"head={verification['head_hash'][:16]}…"
+        )
+
+        _step(31, "Rate limiting reports its real scope")
+        health = buyer.get("/api/health").json()
+        limiting = health["rate_limiting"]
+        print(
+            f"     enabled={limiting['enabled']}  "
+            f"shared_across_instances={limiting['shared_across_instances']}"
+        )
+        if limiting["caveat"]:
+            print(f"     {limiting['caveat'][:72]}")
+        print(f"     notification channels attached: {health['notification_channels'] or 'none'}")
+
         _rule()
         print("\nEvery step above ran against the real application: real HTTP routes, real")
         print(f"services, real database, and AlphaLab {ALPHALAB_VERSION} computing every")

@@ -263,6 +263,15 @@ def start(session: DbSession, principal: Principal, session_id: str) -> TradingS
         message="Session queued to start.",
     )
     trading_session.started_at = utcnow()
+    notifications.notify(
+        session,
+        organization_id=principal.organization_id,
+        kind="trading.session.started",
+        title=f"{trading_session.mode.value.upper()} session started",
+        body=f"{trading_session.name} is queued to run.",
+        resource_type="trading_session",
+        resource_id=trading_session.id,
+    )
     return trading_session
 
 

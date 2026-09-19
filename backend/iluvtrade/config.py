@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     #: Generated per-process when unset, which logs out every session on restart
     #: — correct for development, and refused outright in production below.
     secret_key: str = Field(default_factory=lambda: secrets.token_urlsafe(48))
+    #: Previous secrets that may still *decrypt* stored credentials. Nothing is
+    #: ever encrypted under one. A rotation is: append the old key here, set the
+    #: new ``secret_key``, restart, rotate, then remove the old key — in that
+    #: order, because removing it first makes every stored credential unreadable.
+    retired_secret_keys: tuple[str, ...] = ()
     session_ttl_seconds: int = 60 * 60 * 12
     #: Argon2id parameters. Deliberately explicit rather than library defaults,
     #: so a change is a reviewable diff.
@@ -71,6 +76,22 @@ class Settings(BaseSettings):
     #: database and the mismatch surfaces as a query error later. Production
     #: runs ``alembic upgrade head`` instead, and this is forced off there.
     auto_create_tables: bool = True
+
+    # --- observability -----------------------------------------------------
+    log_level: str = "INFO"
+    #: JSON log lines. On by default because these are meant to be aggregated;
+    #: a developer reading a terminal can turn it off.
+    structured_logging: bool = True
+
+    # --- billing -----------------------------------------------------------
+    #: Which payment provider settles marketplace purchases.
+    #:
+    #: ``manual`` records a purchase without charging anything, which is what a
+    #: deployment with no merchant account can honestly do. It is the default
+    #: because the alternative — defaulting to a real provider that is not
+    #: configured — would fail every purchase. The UI reads
+    #: ``GET /reddesk/billing-status`` and says which is in play.
+    payment_provider: str = "manual"
 
     # --- rate limiting -----------------------------------------------------
     #: On by default. A deployment turns it off only deliberately; the test

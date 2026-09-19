@@ -2,7 +2,7 @@ import { useState } from "react";
 
 import { Badge, Banner, Card, ErrorBanner, Loading, Stat, StatusBadge, Tabs } from "../components/ui";
 import { ApiError, api } from "../lib/api";
-import type { BacktestJob, Entitlement, Listing, Strategy } from "../lib/api";
+import type { BacktestJob, BillingStatus, Entitlement, Listing, Strategy } from "../lib/api";
 import { count, money, percent, ratio, shortId, when } from "../lib/format";
 import { useAsync } from "../lib/useAsync";
 
@@ -11,6 +11,7 @@ export default function RedDeskPage() {
   const discover = useAsync<Listing[]>(() => api.get<Listing[]>("/reddesk/discover"), []);
   const mine = useAsync<Listing[]>(() => api.get<Listing[]>("/reddesk/my-listings"), []);
   const entitlements = useAsync<Entitlement[]>(() => api.get<Entitlement[]>("/reddesk/entitlements"), []);
+  const billing = useAsync<BillingStatus>(() => api.get<BillingStatus>("/reddesk/billing-status"), []);
   const [error, setError] = useState<string | undefined>();
   const [notice, setNotice] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
@@ -52,6 +53,19 @@ export default function RedDeskPage() {
 
       {error && <Banner tone="err">{error}</Banner>}
       {notice && <Banner tone="ok">{notice}</Banner>}
+
+      {billing.data && !billing.data.moves_money && (
+        <Banner tone="warn">
+          <strong>No payment processing.</strong> {billing.data.notice} The marketplace is ready
+          for a provider to be integrated; until one is, acquiring a listing grants the licence
+          without charging anything.
+        </Banner>
+      )}
+      {billing.data?.moves_money && (
+        <Banner tone="info">
+          <strong>Live payments.</strong> Purchases are charged by {billing.data.provider}.
+        </Banner>
+      )}
 
       <Tabs
         active={tab}
@@ -121,9 +135,14 @@ export default function RedDeskPage() {
                     </div>
                   </details>
 
-                  <div className="row end" style={{ marginTop: "0.6rem" }}>
+                  <div className="row end" style={{ marginTop: "0.6rem", alignItems: "center" }}>
+                    {billing.data && !billing.data.moves_money && (
+                      <span className="tiny faint">No charge — no payment provider configured</span>
+                    )}
                     <button className="primary" disabled={busy} onClick={() => void buy(listing)} type="button">
-                      Acquire
+                      {billing.data?.moves_money
+                        ? `Buy for ${listing.price.currency} ${listing.price.amount}`
+                        : "Acquire licence (no charge)"}
                     </button>
                   </div>
                 </Card>

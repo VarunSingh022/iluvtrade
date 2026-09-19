@@ -11,6 +11,7 @@ documents should agree with this page; where it does not, this page is correct.
 | **TESTED LOCALLY** | Exercised end to end on this machine against real dependencies |
 | **INTEGRATION-READY** | The boundary is complete and tested against a faithful local double; it has never touched the real external system |
 | **REQUIRES EXTERNAL CREDENTIALS** | Cannot be verified without a contract, account or subscription this build does not have |
+| **REQUIRES EXTERNAL INFRASTRUCTURE** | Needs a service to run against (Redis, an SMTP relay, a WORM store) that this build does not assume exists |
 | **DISABLED** | Present, deliberately switched off, and refused at runtime |
 | **NOT IMPLEMENTED** | Absent. No partial version exists |
 
@@ -27,15 +28,20 @@ operated, load-tested, penetration-tested, or run against a real venue.
 | Tenant isolation | IMPLEMENTED | Enforced by `scoped()`; 32-operation cross-tenant matrix test |
 | Role-based authorization | IMPLEMENTED | Negative tests per role |
 | CSRF protection | IMPLEMENTED | All 33 mutating routes asserted |
-| Rate limiting | IMPLEMENTED | In-process, per-principal; **not shared across workers** |
+| Rate limiting (single process) | IMPLEMENTED | Per-principal, injected clock, `429` + `Retry-After` |
+| Rate limiting (multi-instance) | REQUIRES EXTERNAL INFRASTRUCTURE | Counters are per-process; `SharedBackend` documents what Redis must provide. `GET /api/health` reports the real scope rather than the configured one |
 | Audit trail | IMPLEMENTED | Append-only, redacted at the writer |
 | Audit tamper-evidence | IMPLEMENTED | Per-tenant hash chain; see the limits in `SECURITY.md` |
-| Notifications (in-app) | IMPLEMENTED | |
-| Email / push delivery | NOT IMPLEMENTED | No email channel of any kind exists |
-| MFA | NOT IMPLEMENTED | |
+| Notifications (in-app) | IMPLEMENTED | 18-kind catalogue; `notify()` refuses an undeclared kind, and a test asserts nothing declared goes unsent |
+| Email / push delivery | REQUIRES EXTERNAL INFRASTRUCTURE | `NotificationChannel` is the seam; nothing is registered, and `GET /api/health` says so |
+| **MFA (TOTP)** | **IMPLEMENTED** | RFC 6238 via `pyotp`; two-step enrolment, replay refusal, single-use recovery codes, disable requires proof |
+| WebAuthn / passkeys | NOT IMPLEMENTED | TOTP was the one that could be done entirely locally |
+| **Credential key rotation** | **IMPLEMENTED** | Multi-key decrypt, re-seal under current, `iluvtrade rotate-credentials` |
 | Password reset | NOT IMPLEMENTED | Needs an email channel first |
 | User invitations | NOT IMPLEMENTED | Registration creates a personal workspace only |
-| Secret rotation | NOT IMPLEMENTED | Envelopes carry a key id so it *can* be added; see `SECURITY.md` |
+| **Correlation IDs** | **IMPLEMENTED** | One id spans HTTP → service → job → engine run → stored row |
+| **Structured logging** | **IMPLEMENTED** | JSON lines with secret redaction as a backstop |
+| Metrics / tracing / alerting | NOT IMPLEMENTED | Attachment points named in `OBSERVABILITY.md` |
 
 ## Data workspace
 
@@ -94,7 +100,8 @@ operated, load-tested, penetration-tested, or run against a real venue.
 | Refunds | IMPLEMENTED | Revokes the entitlement; fails closed if the provider refuses |
 | Creator payouts | IMPLEMENTED (recording only) | The ledger is written; **no money moves** |
 | Payment provider | DISABLED | Interface exists; `ManualProvider` records without charging and *raises* on payout |
-| Real payment integration | REQUIRES EXTERNAL CREDENTIALS | Merchant account, contract, webhooks, tax handling |
+| Payment state visible to the user | IMPLEMENTED | `GET /reddesk/billing-status`; the UI states which of the two postures is live before the button is clicked |
+| Real payment integration | REQUIRES EXTERNAL CREDENTIALS | Merchant account, contract, webhook endpoint with signature verification, tax handling |
 | Independent certification | NOT IMPLEMENTED | The reviewer is an admin of the creator's own org |
 | **Seller-code execution** | **NOT IMPLEMENTED** | See `SANDBOX_CONTRACT.md`. A listing names an in-repository implementation |
 
@@ -102,7 +109,7 @@ operated, load-tested, penetration-tested, or run against a real venue.
 
 | Capability | Status | Notes |
 |---|---|---|
-| Alembic migrations | IMPLEMENTED | Fresh and upgrade paths both tested; `alembic check` in CI-able form |
+| Alembic migrations | IMPLEMENTED | Four revisions. Fresh, upgrade and downgrade paths tested, **and every revision applied against a populated database** — the test that caught a partially-applying migration an empty-database run could not |
 | Startup `create_all` | IMPLEMENTED (development only) | Forced off in production |
 | SQLite | TESTED LOCALLY | Fine for one process |
 | PostgreSQL | NOT TESTED | The URL is configurable; nothing has run against it |
@@ -117,6 +124,7 @@ operated, load-tested, penetration-tested, or run against a real venue.
 | Confirmation on destructive actions | IMPLEMENTED | Inline two-step, states the consequence |
 | Live-trading visibility | IMPLEMENTED | Shown as disabled; the three gates are named |
 | Component/unit tests | IMPLEMENTED | 28 tests |
+| MFA enrolment screen | NOT IMPLEMENTED | The API is complete and tested; no UI yet |
 | End-to-end browser tests | NOT IMPLEMENTED | Verified manually |
 
 ## Not addressed at all
@@ -124,3 +132,12 @@ operated, load-tested, penetration-tested, or run against a real venue.
 Load testing, penetration testing, dependency CVE scanning in CI, log
 aggregation, metrics/tracing, alerting, backup automation, disaster recovery,
 data retention and erasure, and multi-node deployment.
+
+## The four things this build will not do, and why
+
+| | Why not |
+|---|---|
+| **Execute live orders** | The loop is unbuilt, and `ExecutionMode.LIVE` is constructed nowhere — so no configured run can reach a venue regardless of what a request contains. Three gates refuse a live session on top of that. |
+| **Run seller code** | The isolation boundary in `SANDBOX_CONTRACT.md` does not exist. A listing names an in-repository implementation; there is nothing to sandbox. |
+| **Move money** | `ManualProvider` records without charging and raises on payout. A false ledger entry is worse than an unavailable feature. |
+| **Claim audit immutability** | The hash chain detects row-level tampering. An attacker with write access can recompute it. That needs an external anchor; none exists. |

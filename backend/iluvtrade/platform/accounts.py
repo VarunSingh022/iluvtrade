@@ -25,7 +25,7 @@ from iluvtrade.db.models.platform import (
     User,
     UserStatus,
 )
-from iluvtrade.platform import audit, security
+from iluvtrade.platform import audit, mfa, security
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -152,6 +152,7 @@ def login(
     email: str,
     password: str,
     organization_id: str | None = None,
+    mfa_code: str | None = None,
     ip_address: str | None = None,
     user_agent: str | None = None,
 ) -> tuple[Session, str]:
@@ -159,6 +160,12 @@ def login(
 
     Returns the row and the **plaintext token**, which is the only time the
     token exists outside the client.
+
+    Raises:
+        AuthError: The credentials are wrong, or the account cannot sign in.
+        mfa.MfaRequired: The password was correct but a second factor is needed.
+            Deliberately a different exception, so a caller presents a challenge
+            instead of reporting bad credentials.
     """
 
     email = email.strip().lower()
@@ -182,6 +189,29 @@ def login(
             raise AuthError("Invalid email or password.")
     else:
         membership = _default_membership(session, user.id)
+
+    # The second factor is checked *after* the password and the membership, so a
+    # caller learns nothing about whether an account has MFA until they have
+    # already proven the password.
+    if mfa.is_enabled(user):
+        if not mfa_code:
+            raise mfa.MfaRequired(
+                "This account requires a verification code from your authenticator."
+            )
+        try:
+            mfa.verify_challenge(user, mfa_code)
+        except mfa.MfaError as exc:
+            audit.record(
+                session,
+                organization_id=membership.organization_id,
+                action="user.mfa_challenge_failed",
+                resource_type="user",
+                resource_id=user.id,
+                actor_user_id=user.id,
+                outcome="failure",
+                ip_address=ip_address,
+            )
+            raise AuthError("Invalid email, password, or verification code.") from exc
 
     if security.needs_rehash(user.password_hash):
         user.password_hash = security.hash_password(password)

@@ -29,9 +29,22 @@ The key id is a **truncated HMAC of the derived key**, not the secret and not
 derivable back to it. It identifies which key material sealed a blob without
 revealing anything about that material.
 
-Rotation itself is still unimplemented: changing ``ILUVTRADE_SECRET_KEY``
-invalidates every stored credential and every session. ``docs/SECURITY.md``
-states what a real rotation would additionally need.
+Rotation
+--------
+
+:func:`rotate_credential` re-seals one blob under the current key. It decrypts
+with whichever key sealed it — the current one, or one of the *retired* keys a
+deployment lists in ``ILUVTRADE_RETIRED_SECRET_KEYS`` — and re-encrypts under
+the current one.
+
+An operational rotation is therefore: add the old key to the retired list, set
+the new key, restart, run the rotation, and only then remove the old key from
+the list. Skipping the retired-list step makes every stored credential
+undecryptable, which is why :func:`decrypt_credentials` names that specific
+cause rather than reporting a generic failure.
+
+**Retired keys are never dropped automatically.** Removing one is the operator's
+decision, taken after :func:`rotation_status` reports nothing left under it.
 """
 
 from __future__ import annotations
@@ -49,11 +62,14 @@ from iluvtrade.config import get_settings
 __all__ = [
     "ENVELOPE_VERSION",
     "CredentialError",
+    "RotationOutcome",
     "SecretString",
     "decrypt_credentials",
     "encrypt_credentials",
     "envelope_info",
     "key_id",
+    "needs_rotation",
+    "rotate_credential",
 ]
 
 _NONCE_BYTES = 12
@@ -111,14 +127,38 @@ class SecretString:
         return f"…{self._value[-4:]}" if len(self._value) >= 8 else "…"
 
 
-def _key() -> bytes:
-    settings = get_settings()
+def _derive(secret: str) -> bytes:
     return HKDF(
         algorithm=hashes.SHA256(),
         length=_KEY_BYTES,
         salt=None,
         info=_INFO,
-    ).derive(settings.secret_key.encode("utf-8"))
+    ).derive(secret.encode("utf-8"))
+
+
+def _key() -> bytes:
+    """The key new ciphertext is sealed under."""
+
+    return _derive(get_settings().secret_key)
+
+
+def _retired_keys() -> list[bytes]:
+    """Keys that may still decrypt, in the order a deployment listed them.
+
+    Present only so a rotation can read what an older key sealed. Nothing is
+    ever encrypted under one.
+    """
+
+    return [_derive(secret) for secret in get_settings().retired_secret_keys if secret]
+
+
+def _keys_by_id() -> dict[bytes, bytes]:
+    """Every key this process can decrypt with, indexed by its id."""
+
+    keys = {key_id(k): k for k in _retired_keys()}
+    current = _key()
+    keys[key_id(current)] = current  # current wins a collision, which cannot happen
+    return keys
 
 
 def key_id(key: bytes | None = None) -> bytes:
@@ -181,15 +221,17 @@ def decrypt_credentials(blob: bytes, *, connection_id: str) -> dict[str, Any]:
             f"understands version {ENVELOPE_VERSION}. Reconnect the broker account."
         )
 
-    key = _key()
-    if stored_key_id != key_id(key):
+    available = _keys_by_id()
+    key = available.get(stored_key_id)
+    if key is None:
         # Named specifically rather than reported as a generic failure: this is
-        # the one cause an operator can act on, and it is the case a future
-        # rotation would handle by reaching for the old key instead of failing.
+        # the one cause an operator can act on, and the fix is exact.
         raise CredentialError(
-            "The stored broker credential was encrypted under a different application "
-            "key. Key rotation is not implemented, so the credential cannot be read. "
-            "Reconnect the broker account."
+            "The stored broker credential was sealed under a key this process does not "
+            "hold. Add the previous ILUVTRADE_SECRET_KEY to "
+            "ILUVTRADE_RETIRED_SECRET_KEYS and restart, then run a rotation. Until "
+            "then the credential cannot be read; reconnecting the broker account also "
+            "resolves it."
         )
 
     header = blob[:_HEADER_BYTES]
@@ -205,3 +247,54 @@ def decrypt_credentials(blob: bytes, *, connection_id: str) -> dict[str, Any]:
         ) from exc
     result: dict[str, Any] = json.loads(plaintext.decode("utf-8"))
     return result
+
+
+@dataclass(frozen=True, slots=True)
+class RotationOutcome:
+    """What a rotation did to one credential."""
+
+    rotated: bool
+    previous_key_id: str
+    current_key_id: str
+    reason: str = ""
+
+
+def needs_rotation(blob: bytes) -> bool:
+    """Whether ``blob`` is sealed under something other than the current key."""
+
+    try:
+        _, stored = envelope_info(blob)
+    except CredentialError:
+        return False
+    return stored != key_id()
+
+
+def rotate_credential(blob: bytes, *, connection_id: str) -> tuple[bytes, RotationOutcome]:
+    """Re-seal one credential under the current key.
+
+    Decrypts with whichever key sealed it and re-encrypts under the current one.
+    The plaintext exists only inside this function and is never returned,
+    logged, or written anywhere but the new ciphertext.
+
+    A blob already current is returned unchanged rather than re-encrypted: a
+    no-op rotation that still rewrites every row makes it impossible to tell,
+    afterwards, which credentials actually moved.
+    """
+
+    version, stored_key_id = envelope_info(blob)
+    current = key_id()
+    if version == ENVELOPE_VERSION and stored_key_id == current:
+        return blob, RotationOutcome(
+            rotated=False,
+            previous_key_id=stored_key_id.hex(),
+            current_key_id=current.hex(),
+            reason="already sealed under the current key",
+        )
+
+    payload = decrypt_credentials(blob, connection_id=connection_id)
+    resealed = encrypt_credentials(payload, connection_id=connection_id)
+    return resealed, RotationOutcome(
+        rotated=True,
+        previous_key_id=stored_key_id.hex(),
+        current_key_id=current.hex(),
+    )

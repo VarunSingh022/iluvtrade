@@ -224,6 +224,23 @@ def test_no_response_anywhere_contains_a_credential_field(client, headers) -> No
     assert not leaks, f"Credential-shaped fields appeared in responses: {leaks}"
 
 
+#: The response fields that are deliberately secret, and why.
+#:
+#: Both belong to MFA enrolment, which cannot work otherwise: the TOTP secret
+#: has to reach the user's authenticator and the recovery codes have to reach
+#: the user, and this response is the single moment either exists outside the
+#: server. The secret is then stored encrypted and the codes hashed, so neither
+#: can be served again — which is what makes the exception acceptable, and is
+#: asserted separately below.
+#:
+#: Two entries on one model, on purpose. A third — or a second model — is a
+#: design discussion, not a line to append.
+SECRET_FIELD_EXCEPTIONS = {
+    "MfaEnrolmentResponse.secret",
+    "MfaEnrolmentResponse.recovery_codes",
+}
+
+
 def test_no_response_schema_declares_a_credential_field(client) -> None:
     """Checked against the schema too, so an unexercised route is still covered."""
 
@@ -236,6 +253,8 @@ def test_no_response_schema_declares_a_credential_field(client) -> None:
         "token_hash",
         "encrypted_credentials",
         "secret",
+        "mfa_secret",
+        "recovery_codes",
     }
     offenders = []
     for name, schema in spec.get("components", {}).get("schemas", {}).items():
@@ -243,9 +262,52 @@ def test_no_response_schema_declares_a_credential_field(client) -> None:
         if name.endswith("Request"):
             continue
         for field in schema.get("properties") or {}:
-            if field in forbidden:
-                offenders.append(f"{name}.{field}")
-    assert not offenders, f"Response schemas declare credential fields: {offenders}"
+            qualified = f"{name}.{field}"
+            if field in forbidden and qualified not in SECRET_FIELD_EXCEPTIONS:
+                offenders.append(qualified)
+    assert not offenders, (
+        f"Response schemas declare credential fields: {offenders}. If one is genuinely "
+        "necessary, add it to SECRET_FIELD_EXCEPTIONS with the reason."
+    )
+
+
+def test_the_secret_field_exceptions_stay_minimal() -> None:
+    """An allowlist that grows quietly stops being one."""
+
+    assert len(SECRET_FIELD_EXCEPTIONS) <= 2, (
+        "More than two response fields returning secrets is a design problem, not an "
+        "allowlist entry."
+    )
+    models = {entry.split(".")[0] for entry in SECRET_FIELD_EXCEPTIONS}
+    assert models == {"MfaEnrolmentResponse"}, (
+        f"Only MFA enrolment may return a secret; found {models}."
+    )
+
+
+def test_the_one_secret_bearing_response_is_write_once(client, headers) -> None:
+    """The exception holds only because the value is never re-served."""
+
+    import pyotp
+
+    from tests.conftest import register
+
+    register(client, "exception@example.com")
+    body = client.post("/api/v1/auth/mfa/enrol", headers=headers).json()
+    once_only = [body["secret"], *body["recovery_codes"]]
+    client.post(
+        "/api/v1/auth/mfa/confirm",
+        json={"code": pyotp.TOTP(body["secret"]).now()},
+        headers=headers,
+    )
+
+    for method, path in _routes(client):
+        if method != "GET":
+            continue
+        response = client.get(_concrete(path))
+        if response.status_code >= 400:
+            continue
+        for value in once_only:
+            assert value not in response.text, f"{path} re-served a write-once value"
 
 
 # --- bounded queries --------------------------------------------------------

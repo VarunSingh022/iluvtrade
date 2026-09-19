@@ -11,6 +11,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -89,6 +90,21 @@ class User(Base, IdMixin, TimestampMixin):
     #: confirmation; all three must hold. See :mod:`iluvtrade.trading.live`.
     live_trading_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_login_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+
+    # --- two-factor authentication ----------------------------------------
+    #: The TOTP shared secret, encrypted at rest with the same envelope as a
+    #: broker credential — it is a credential, and storing it in the clear would
+    #: let a database disclosure mint valid codes forever.
+    mfa_secret: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    #: Set only once a code has been verified. Enrolment that flipped this on
+    #: issue would lock out a user whose authenticator never got the secret.
+    mfa_enabled_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    #: Argon2 hashes of single-use recovery codes, one JSON array. Hashed for
+    #: the same reason passwords are: they are password-equivalent.
+    mfa_recovery_hashes: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    #: The last TOTP counter accepted, so a code cannot be replayed inside its
+    #: own validity window.
+    mfa_last_counter: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     memberships: Mapped[list[Membership]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
