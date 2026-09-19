@@ -384,3 +384,61 @@ def test_the_secret_is_never_returned_after_enrolment(client, headers) -> None:
 
     for path in ("/api/v1/auth/mfa", "/api/v1/auth/me"):
         assert secret not in client.get(path).text
+
+
+# --- nothing about MFA reaches a log ----------------------------------------
+
+
+def test_neither_the_secret_nor_a_recovery_code_reaches_a_log_line(app, caplog) -> None:
+    """The whole enrolment, with logging captured at DEBUG.
+
+    A recovery code is password-equivalent and a TOTP secret mints codes
+    forever. Either one in an aggregated log is a credential in a system whose
+    access model is "whoever can read the logs".
+    """
+
+    import logging
+
+    from fastapi.testclient import TestClient
+
+    headers = {"X-Requested-With": "XMLHttpRequest"}
+    with caplog.at_level(logging.DEBUG), TestClient(app) as client:
+        register(client, "logs@example.com")
+        body = client.post("/api/v1/auth/mfa/enrol", headers=headers).json()
+        secret, codes = body["secret"], body["recovery_codes"]
+
+        client.post("/api/v1/auth/mfa/confirm", json={"code": _code(secret)}, headers=headers)
+        client.post("/api/v1/auth/logout", headers=headers)
+        client.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "logs@example.com",
+                "password": PASSWORD,
+                "mfa_code": codes[0],
+            },
+        )
+        # And a failure, which is where a well-meaning "log the input" lands.
+        client.post(
+            "/api/v1/auth/login",
+            json={"email": "logs@example.com", "password": PASSWORD, "mfa_code": "000000"},
+        )
+
+    captured = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret not in captured, "the TOTP secret appeared in a log line"
+    for code in codes:
+        assert code not in captured, "a recovery code appeared in a log line"
+    assert body["provisioning_uri"] not in captured, "the provisioning URI contains the secret"
+
+
+def test_the_provisioning_uri_is_the_only_place_the_secret_travels(client, headers) -> None:
+    """It has to carry the secret — that is what an authenticator scans.
+
+    Worth asserting explicitly because it means the URI is as sensitive as the
+    secret, and anything that logs or stores "just the URI" has stored the
+    secret.
+    """
+
+    register(client, "uri@example.com")
+    body = client.post("/api/v1/auth/mfa/enrol", headers=headers).json()
+    assert body["secret"] in body["provisioning_uri"]
+    assert body["provisioning_uri"].startswith("otpauth://totp/")

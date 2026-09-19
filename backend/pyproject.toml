@@ -27,6 +27,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The driver for the production database target. Not a hard dependency: a
+# SQLite deployment does not need it, and a package that refuses to install
+# without a PostgreSQL client library is a worse default for a laptop. But it
+# has to be installable from this file — the Dockerfile installed it and
+# pyproject did not, which made "pip install -e . && point at PostgreSQL" fail
+# with ModuleNotFoundError rather than with anything about the database.
+postgres = ["psycopg[binary]>=3.2,<4"]
 dev = [
   "pytest>=8.4,<10",
   "pytest-cov>=6.0,<8",

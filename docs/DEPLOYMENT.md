@@ -397,3 +397,108 @@ with the same seriousness as the database, and separately from it.
 
 Scheduling, retention, offsite replication, and a rehearsed disaster-recovery
 drill. The commands above are correct and tested; nothing runs them for you.
+
+---
+
+# Which database
+
+| | |
+|---|---|
+| **SQLite** | Supported for local development and single-user evaluation. **Refused in production** unless `ILUVTRADE_ALLOW_SQLITE_IN_PRODUCTION=true` |
+| **PostgreSQL** | The production target. **Never run against.** The driver is now installable (`pip install -e ".[postgres]"`) and CI has a job that migrates a real PostgreSQL 16 and runs the suite against it — see below |
+
+## Why SQLite is refused in production
+
+Not general distaste. This application writes concurrently from threads: the
+backtest worker pool, and one runner per live trading session. SQLite
+serialises writers, and dataset ingestion holds a write transaction for the
+length of the parse.
+
+That is measured, not assumed. Four simultaneous uploads on one machine produce
+`database is locked` — `tests/integration/test_concurrency_and_failure.py`
+demonstrates it rather than tuning around it, and asserts what a refused write
+must leave behind:
+
+* **Nothing partially committed.** Every stored dataset version has its source
+  row; the counts match exactly what succeeded.
+* **A retryable answer.** `503 DatabaseBusy` with `Retry-After`, saying nothing
+  was changed — not a generic 500, which would tell the user the opposite of
+  the truth.
+* **An intact audit chain.** A refused write leaves no gap and no duplicate
+  sequence.
+* **A retry that works**, producing a normal result.
+
+Only the contention case is remapped. Any other `OperationalError` is a genuine
+fault and still answers 500 with nothing specific.
+
+`busy_timeout` is already 5 s and journal mode is already WAL. Raising the
+timeout trades one failure mode for another — requests that hang instead of
+failing — so the setting stays where it is and the limitation is documented
+instead.
+
+## PostgreSQL compatibility: what has been checked without running it
+
+No PostgreSQL server or driver exists on the development machine, so **nothing
+here claims PostgreSQL works**. What follows is a source audit, with every item
+classified. `tests/integration/test_database_portability.py` pins the
+`COMPATIBLE` rows so they cannot drift before someone runs the real thing.
+
+| Area | Classification | Detail |
+|---|---|---|
+| Datetimes | COMPATIBLE | `UtcDateTime` normalises on write and returns UTC-aware on read, on any backend. It *refuses* a naive value rather than guessing a zone |
+| UUID keys | COMPATIBLE | `String(36)`, generated in Python. No sequence, no `autoincrement`, so nothing depends on a backend's identity behaviour |
+| Money | COMPATIBLE | `String(40)`, so a `Decimal` round-trips exactly. SQLite has no decimal type; a `Numeric` column would silently lose precision, and a test refuses one |
+| Floats | COMPATIBLE | Twelve columns, all metrics or epoch timestamps, none money. A test pins the list |
+| JSON | COMPATIBLE | Stored as `Text` and parsed by the application. No query indexes into it, so no `JSONB` is needed and none is used |
+| Enums | COMPATIBLE | `native_enum=False` everywhere → `VARCHAR` + `CHECK`. A native PostgreSQL enum would need a migration to add a value |
+| Binary | COMPATIBLE | `LargeBinary` → `BLOB` / `BYTEA` |
+| Cascade deletes | COMPATIBLE | Declared `ON DELETE CASCADE` on the constraint, so the database enforces it on both. SQLite additionally needs `PRAGMA foreign_keys=ON`, which is set for SQLite only |
+| PRAGMAs | COMPATIBLE | Attached in the `url.startswith("sqlite")` branch only. A PRAGMA sent to PostgreSQL is a syntax error at connect time |
+| Raw SQL | COMPATIBLE | Four statements, all in migrations, all plain `SELECT`/`UPDATE` with bound parameters. No `INSERT OR REPLACE`, no `ON CONFLICT`, no `rowid`, no `strftime` |
+| Migration 0002's timestamp read | COMPATIBLE | Raw SQL returns a `str` on SQLite and a `datetime` on PostgreSQL; `_microseconds()` already handles both |
+| `batch_alter_table` | COMPATIBLE | Alembic's SQLite table-rebuild workaround; on PostgreSQL it emits a plain `ALTER` |
+| Concurrent writes | SQLITE-SPECIFIC | The limitation above. PostgreSQL uses row-level locking and does not serialise writers |
+| State transitions | COMPATIBLE | A single conditional `UPDATE ... WHERE status IN (...)`, so the database picks the winner. Correct under both, and on PostgreSQL correct at real concurrency |
+| Constraint-violation behaviour | UNKNOWN UNTIL POSTGRES TEST | A failed `INSERT` aborts the whole transaction on PostgreSQL and not always on SQLite. Every request already rolls back on any exception, so the outcome should be identical — but "should be" is why this row exists |
+| Isolation and locking under load | UNKNOWN UNTIL POSTGRES TEST | The audit chain's read-head-then-insert serialises on a unique constraint. Correct in principle on both; unmeasured on PostgreSQL |
+| The driver | REQUIRES CHANGE → **fixed** | `psycopg` was installed by the Dockerfile and absent from `pyproject.toml`, so `pip install -e .` plus a PostgreSQL URL failed with `ModuleNotFoundError`. It is now the `postgres` extra |
+
+**The honest summary:** the schema contains no SQLite-only construct, and the
+two open questions are both about behaviour under concurrency rather than about
+syntax. The CI job below is what turns them into answers.
+
+---
+
+# Continuous integration
+
+`.github/workflows/ci.yml`. Four jobs:
+
+| Job | Runs |
+|---|---|
+| `frontend` | `npm ci`, typecheck, tests, production build |
+| `dependency-advisories` | `scripts/audit-dependencies.sh` — fails on an advisory nobody has assessed |
+| `backend` | ruff, ruff format, mypy, `check-config`, the AlphaLab boundary, the isolation suite, the full suite, `alembic upgrade`+`check`, and the demo |
+| `postgres` | `alembic upgrade head` and the full suite against a real PostgreSQL 16 service container |
+
+**It has never run.** There is no CI history for this repository, and the
+workflow is written, not proven.
+
+## Why the backend jobs may skip
+
+`alphalab==3.0.0` is not on PyPI, and this repository does not vendor the
+wheel. The backend jobs obtain it from the `ALPHALAB_WHEEL_URL` repository
+variable, or from a wheel committed to `deploy/wheels/`, and **skip with a
+warning** when neither is configured.
+
+Skipping rather than failing is deliberate. A pipeline that is permanently red
+for a reason nobody can fix on a pull request is a pipeline everyone learns to
+ignore, and then a real failure goes unnoticed too. The frontend and dependency
+jobs have no such dependency and always run.
+
+## What CI is never given
+
+No developer paths, no committed database, no broker credentials, no payment
+credentials, and no GitHub secrets — there are none in the workflow and none
+are needed. The only environment variables it sets are a throwaway key and
+`ILUVTRADE_ENVIRONMENT=test`, and the test suite creates a temporary database
+per test and **refuses to open the developer's**.

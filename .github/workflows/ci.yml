@@ -1,0 +1,246 @@
+name: CI
+
+# Every gate this project has, run on a machine that is not a developer's.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE WONDERING WHY THE BACKEND JOB SKIPS
+# ---------------------------------------------------------------------------
+#
+# `alphalab==3.0.0` is NOT on PyPI. It is built from its own repository, and
+# this repository does not vendor the wheel (see deploy/README.md). CI
+# therefore cannot install the backend from a clean checkout alone.
+#
+# The backend jobs obtain the wheel from one of two places and skip, loudly,
+# when neither is configured:
+#
+#   * `ALPHALAB_WHEEL_URL` — a repository *variable* pointing at a wheel the
+#     runner can fetch (an internal package index, a release asset).
+#   * A wheel committed to `deploy/wheels/` on a branch where that is
+#     acceptable.
+#
+# Skipping rather than failing is deliberate: a permanently red pipeline that
+# everyone has learned to ignore is worse than an honest "not run here". The
+# frontend job has no such dependency and always runs.
+#
+# ---------------------------------------------------------------------------
+# WHAT CI MUST NEVER TOUCH
+# ---------------------------------------------------------------------------
+#
+# No developer paths, no real database, no broker, no payment provider. The
+# test suite creates its own temporary database per test and refuses to open
+# the developer's (tests/conftest.py); the only environment variables set here
+# are a throwaway secret key and `test`, which is also what the suite defaults
+# to. There are no secrets in this file and none are needed.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A throwaway value. Not a secret, and deliberately not one: a real key in a
+  # workflow file is a leaked key.
+  ILUVTRADE_SECRET_KEY: ci-secret-key-not-for-production-0000000000
+  ILUVTRADE_ENVIRONMENT: test
+  # Explicitly off. CI must never reach a venue or a payment provider.
+  ILUVTRADE_LIVE_TRADING_ENABLED: "false"
+  ILUVTRADE_PAYMENT_PROVIDER: manual
+  ILUVTRADE_FETCH_ALLOW_LOOPBACK: "false"
+
+jobs:
+  frontend:
+    name: Frontend — typecheck, tests, production build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Tests
+        run: npm test
+      - name: Production build
+        run: npm run build
+
+  dependency-advisories:
+    name: Dependency advisories vs the assessed set
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - name: Fail on an advisory nobody has assessed
+        run: ./scripts/audit-dependencies.sh
+
+  backend:
+    name: Backend — lint, types, tests, migrations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Locate the AlphaLab wheel
+        id: engine
+        run: |
+          set -euo pipefail
+          mkdir -p deploy/wheels
+          if [ -n "${ALPHALAB_WHEEL_URL:-}" ]; then
+            echo "Fetching the engine wheel from ALPHALAB_WHEEL_URL"
+            curl -fsSL "$ALPHALAB_WHEEL_URL" -o deploy/wheels/alphalab-3.0.0-py3-none-any.whl
+          fi
+          if ls deploy/wheels/alphalab-3.0.0-py3-none-any.whl >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=AlphaLab wheel missing::alphalab==3.0.0 is not on PyPI and no wheel was provided. Set the ALPHALAB_WHEEL_URL repository variable, or commit the wheel to deploy/wheels/. Backend checks are being skipped, not passed."
+          fi
+        env:
+          ALPHALAB_WHEEL_URL: ${{ vars.ALPHALAB_WHEEL_URL }}
+
+      - name: Install
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install ../deploy/wheels/alphalab-3.0.0-py3-none-any.whl
+          pip install -e ".[dev]"
+
+      - name: Ruff
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        run: ruff check .
+
+      - name: Ruff format
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        run: ruff format --check .
+
+      - name: Mypy
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        run: mypy
+
+      - name: Configuration is safe for this environment
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        run: python -m iluvtrade.cli check-config
+
+      - name: AlphaLab boundary
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        run: pytest -q tests/unit/test_engine_boundary.py
+
+      - name: Test isolation — the suite cannot reach a real database
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        run: pytest -q tests/test_isolation.py
+
+      - name: Full test suite
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        run: pytest -q
+
+      - name: Alembic — models match migrations
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        # Against a scratch database in the runner's workspace, never a
+        # committed one. The path is relative so nothing here depends on a
+        # particular machine's layout.
+        run: |
+          export ILUVTRADE_DATABASE_URL="sqlite:///${RUNNER_TEMP}/ci-check.db"
+          alembic upgrade head
+          alembic check
+
+      - name: End-to-end demonstration
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        run: python -m iluvtrade.cli demo
+
+  postgres:
+    name: Migrations against PostgreSQL
+    runs-on: ubuntu-latest
+    # This is the job that turns "PostgreSQL: NOT TESTED" into an answer. It
+    # needs the same engine wheel, so it skips under the same condition.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: iluvtrade
+          POSTGRES_USER: iluvtrade
+          POSTGRES_PASSWORD: ci-not-a-secret
+        options: >-
+          --health-cmd "pg_isready -U iluvtrade"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Locate the AlphaLab wheel
+        id: engine
+        run: |
+          set -euo pipefail
+          mkdir -p deploy/wheels
+          if [ -n "${ALPHALAB_WHEEL_URL:-}" ]; then
+            curl -fsSL "$ALPHALAB_WHEEL_URL" -o deploy/wheels/alphalab-3.0.0-py3-none-any.whl
+          fi
+          if ls deploy/wheels/alphalab-3.0.0-py3-none-any.whl >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          ALPHALAB_WHEEL_URL: ${{ vars.ALPHALAB_WHEEL_URL }}
+
+      - name: Install, with the PostgreSQL driver
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install ../deploy/wheels/alphalab-3.0.0-py3-none-any.whl
+          pip install -e ".[dev,postgres]"
+
+      - name: Migrate a PostgreSQL database from empty to head
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        env:
+          ILUVTRADE_DATABASE_URL: postgresql+psycopg://iluvtrade:ci-not-a-secret@localhost:5432/iluvtrade
+        run: |
+          alembic upgrade head
+          alembic current
+          alembic check
+
+      - name: Run the suite against PostgreSQL
+        if: steps.engine.outputs.available == 'true'
+        working-directory: backend
+        env:
+          ILUVTRADE_DATABASE_URL: postgresql+psycopg://iluvtrade:ci-not-a-secret@localhost:5432/iluvtrade
+        # Expected to reveal dialect differences the SQLite run cannot. Its
+        # result is evidence either way; see docs/DEPLOYMENT.md.
+        run: pytest -q

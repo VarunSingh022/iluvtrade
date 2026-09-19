@@ -266,3 +266,100 @@ def test_an_override_actually_changes_the_enforced_policy() -> None:
     assert resolved["login"].limit == 3
     assert resolved["login"].window_seconds == 30
     assert POLICIES["login"].limit == 10, "the module default must not be mutated"
+
+
+# --- the matrix, in one place -----------------------------------------------
+
+#: Every production setting that is refused, as ``(label, overrides, variable)``.
+#:
+#: The individual tests above each explain one row. This table exists so the
+#: whole policy is readable at once, and so a row that stops being enforced
+#: fails here rather than only in the test that happens to cover it.
+REFUSAL_MATRIX: list[tuple[str, dict[str, object], str]] = [
+    ("create_all left on", {"auto_create_tables": True}, "ILUVTRADE_AUTO_CREATE_TABLES"),
+    ("SQLite unacknowledged", {"database_url": "sqlite:///x.db"}, "ILUVTRADE_DATABASE_URL"),
+    ("short secret key", {"secret_key": "short"}, "ILUVTRADE_SECRET_KEY"),
+    ("placeholder secret key", {"secret_key": "changeme"}, "ILUVTRADE_SECRET_KEY"),
+    (
+        "active key listed as retired",
+        {"retired_secret_keys": ("s" * 64,)},
+        "ILUVTRADE_RETIRED_SECRET_KEYS",
+    ),
+    ("wildcard origin", {"allowed_origins": ("*",)}, "ILUVTRADE_ALLOWED_ORIGINS"),
+    ("plaintext origin", {"allowed_origins": ("http://x.example",)}, "ILUVTRADE_ALLOWED_ORIGINS"),
+    ("loopback fetching", {"fetch_allow_loopback": True}, "ILUVTRADE_FETCH_ALLOW_LOOPBACK"),
+    ("rate limiting off", {"rate_limit_enabled": False}, "ILUVTRADE_RATE_LIMIT_ENABLED"),
+    (
+        "live trading without credentials",
+        {"live_trading_enabled": True},
+        "ILUVTRADE_LIVE_TRADING_ENABLED",
+    ),
+    ("unimplemented provider", {"payment_provider": "stripe"}, "ILUVTRADE_PAYMENT_PROVIDER"),
+]
+
+#: The escape hatches, and the setting that opens each. Every one requires
+#: naming the trade rather than quietly omitting the control.
+ESCAPE_HATCHES: list[tuple[str, dict[str, object]]] = [
+    (
+        "SQLite, acknowledged",
+        {"database_url": "sqlite:///x.db", "allow_sqlite_in_production": True},
+    ),
+    (
+        "rate limiting enforced elsewhere",
+        {"rate_limit_enabled": False, "rate_limit_enforced_externally": True},
+    ),
+    (
+        "live trading with credentials",
+        {"live_trading_enabled": True, "zerodha_api_key": "k", "zerodha_api_secret": "s"},
+    ),
+    ("same-origin deployment", {"allowed_origins": ()}),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "overrides", "variable"),
+    REFUSAL_MATRIX,
+    ids=[row[0] for row in REFUSAL_MATRIX],
+)
+def test_the_refusal_matrix(label: str, overrides: dict, variable: str) -> None:
+    problems = _problems(**overrides)
+    assert variable in problems, f"{label}: expected {variable} to be refused"
+
+
+@pytest.mark.parametrize(
+    ("label", "overrides"), ESCAPE_HATCHES, ids=[row[0] for row in ESCAPE_HATCHES]
+)
+def test_the_escape_hatch_matrix(label: str, overrides: dict) -> None:
+    assert _problems(**overrides) == {}, f"{label}: should be allowed once acknowledged"
+
+
+def test_development_defaults_cannot_silently_become_production_settings() -> None:
+    """Take the development defaults wholesale and call it production.
+
+    Every one of them should be refused. This is the scenario the whole matrix
+    exists for: someone sets ILUVTRADE_ENVIRONMENT=production and changes
+    nothing else.
+    """
+
+    settings = Settings(_env_file=None, environment="production")
+    refused = {p.variable for p in settings.deployment_problems()}
+    assert {
+        "ILUVTRADE_AUTO_CREATE_TABLES",
+        "ILUVTRADE_DATABASE_URL",
+        "ILUVTRADE_ALLOWED_ORIGINS",
+    } <= refused, f"only {refused} were refused"
+
+
+def test_the_environment_is_identifiable_at_runtime() -> None:
+    """An operator, and the health endpoint, must be able to tell which it is."""
+
+    for name, production, test in (
+        ("development", False, False),
+        ("test", False, True),
+        ("production", True, False),
+        ("PROD", True, False),
+    ):
+        settings = Settings(_env_file=None, environment=name)
+        assert settings.is_production is production
+        assert settings.is_test is test
+        assert settings.environment == name

@@ -347,3 +347,81 @@ def test_the_request_endpoint_is_rate_limited(app, monkeypatch, delivery) -> Non
         ]
     assert 429 in statuses
     _ = get_limiter
+
+
+# --- malformed input --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["", "short", "   ", "../../etc/passwd", "' OR '1'='1", "\x00", "a" * 5000],
+)
+def test_a_malformed_token_is_refused_without_reaching_the_database(client, token) -> None:
+    """Length and shape are checked by the request model, before any lookup."""
+
+    response = client.post(
+        "/api/v1/auth/password-reset/confirm",
+        json={"token": token, "new_password": NEW_PASSWORD},
+    )
+    assert response.status_code in (400, 422)
+    assert "root:" not in response.text
+    assert "Traceback" not in response.text
+
+
+def test_the_old_password_stops_working_immediately(client, delivery) -> None:
+    """Replacement, not addition."""
+
+    register(client, "replaced@example.com")
+    client.post("/api/v1/auth/password-reset/request", json={"email": "replaced@example.com"})
+    client.post(
+        "/api/v1/auth/password-reset/confirm",
+        json={"token": delivery.delivered[-1].token, "new_password": NEW_PASSWORD},
+    )
+
+    old = client.post(
+        "/api/v1/auth/login",
+        json={"email": "replaced@example.com", "password": PASSWORD},
+    )
+    assert old.status_code == 401
+    assert old.json()["error"]["code"] == "AuthError"
+
+    new = client.post(
+        "/api/v1/auth/login",
+        json={"email": "replaced@example.com", "password": NEW_PASSWORD},
+    )
+    assert new.status_code == 200
+
+
+def test_a_reset_does_not_disable_two_factor_authentication(app, headers, delivery) -> None:
+    """Otherwise a mailbox compromise defeats the second factor entirely.
+
+    Resetting a password is something an attacker with the inbox can do. If
+    that also turned MFA off, the second factor would protect nothing against
+    the exact adversary it exists for.
+    """
+
+    import pyotp
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        register(client, "keepmfa@example.com")
+        enrolment = client.post("/api/v1/auth/mfa/enrol", headers=headers).json()
+        client.post(
+            "/api/v1/auth/mfa/confirm",
+            json={"code": pyotp.TOTP(enrolment["secret"]).now()},
+            headers=headers,
+        )
+
+        client.post("/api/v1/auth/password-reset/request", json={"email": "keepmfa@example.com"})
+        client.post(
+            "/api/v1/auth/password-reset/confirm",
+            json={"token": delivery.delivered[-1].token, "new_password": NEW_PASSWORD},
+        )
+
+        # The new password alone is still not enough.
+        refused = client.post(
+            "/api/v1/auth/login",
+            json={"email": "keepmfa@example.com", "password": NEW_PASSWORD},
+        )
+        assert refused.status_code == 401
+        assert refused.json()["error"]["code"] == "MfaRequired"

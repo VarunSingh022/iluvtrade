@@ -114,7 +114,8 @@ operated, load-tested, penetration-tested, or run against a real venue.
 | Alembic migrations | IMPLEMENTED | Five revisions. Fresh, upgrade and downgrade paths tested, **and every revision applied against a populated database** — the test that caught a partially-applying migration an empty-database run could not |
 | Startup `create_all` | IMPLEMENTED (development only) | Forced off in production |
 | SQLite | TESTED LOCALLY | Fine for one process, and **refused in production** unless `ILUVTRADE_ALLOW_SQLITE_IN_PRODUCTION=true`. Four concurrent dataset ingestions on one machine produce `database is locked`; the test that demonstrates it is `test_concurrent_dataset_uploads_do_not_write_into_each_other` |
-| PostgreSQL | NOT TESTED | The URL is configurable and the compose file points at it; nothing has run against it |
+| PostgreSQL | NOT TESTED | No server or driver on this machine. A **source audit** classifies every backend-sensitive construct (`docs/DEPLOYMENT.md`): no SQLite-only construct exists, and the two open questions are both about behaviour under concurrency rather than syntax. `tests/integration/test_database_portability.py` pins the portable choices; the CI job would answer the rest |
+| PostgreSQL driver | IMPLEMENTED | `pip install -e ".[postgres]"`. It was installed by the Dockerfile and absent from `pyproject.toml`, so the documented production path failed with `ModuleNotFoundError` |
 | **Backup (SQLite)** | **TESTED LOCALLY** | `iluvtrade backup --verify` uses SQLite's online backup API — taken against a *live, running* deployment and restored from |
 | Backup (PostgreSQL) | NOT IMPLEMENTED | The command prints the `pg_dump` invocation rather than shelling out to a tool that may be absent or version-mismatched |
 
@@ -132,7 +133,7 @@ operated, load-tested, penetration-tested, or run against a real venue.
 | No browser storage of secrets | IMPLEMENTED | No `localStorage`/`sessionStorage` use at all |
 | Confirmation on destructive actions | IMPLEMENTED | Inline two-step, states the consequence |
 | Live-trading visibility | IMPLEMENTED | Shown as disabled; the three gates are named |
-| Component/unit tests | IMPLEMENTED | 52 tests |
+| Component/unit tests | IMPLEMENTED | 55 tests |
 | End-to-end browser tests | NOT IMPLEMENTED | Verified manually |
 
 ## Deployment
@@ -144,8 +145,9 @@ operated, load-tested, penetration-tested, or run against a real venue.
 | **Container image** | **IMPLEMENTED, NOT BUILT** | `Dockerfile` and `docker-compose.yml` exist and `deploy/entrypoint.sh` passes `sh -n`. **Docker is not installed on the machine this was developed on**, so the image has never been built and the compose stack has never been started. Nothing here should be read as a tested deployment |
 | Migration execution on deploy | IMPLEMENTED | `deploy/entrypoint.sh` runs `alembic upgrade head` explicitly and fails the start if it fails. `create_all` is refused in production |
 | **Dependency advisory gate** | **IMPLEMENTED** | `scripts/audit-dependencies.sh` fails on any npm advisory not already assessed in `SECURITY.md`. Verified to fail on an unassessed finding and pass otherwise |
-| **Concurrency and failure behaviour** | **TESTED LOCALLY** | Eight tests covering duplicate submission, concurrent session start, concurrent ingestion, engine failure, notification failure, database failure and the audit chain under concurrent writes. **This is not a load test** — a handful of threads against SQLite on one machine |
-| CI pipeline | NOT IMPLEMENTED | Every gate is a command; nothing runs them on a push |
+| **Concurrency and failure behaviour** | **TESTED LOCALLY** | Eleven tests. **Found a real defect**: `_transition` was a read-modify-write, and five simultaneous starts produced three successes — three runner threads feeding one portfolio. Now one conditional `UPDATE`. **This is not a load test** — a handful of threads against SQLite on one machine |
+| **Test isolation** | **IMPLEMENTED** | The suite refuses to open the developer's database, joins every background thread before teardown, and hashes the file across the run. Twelve tests, including a reproduction of the original failure sequence. Four consecutive full runs leave the file byte-identical |
+| **CI pipeline** | **IMPLEMENTED, NEVER RUN** | `.github/workflows/ci.yml` — four jobs covering both suites, every gate, the demo, and a PostgreSQL service container. There is no CI history for this repository, so it is written rather than proven. The backend jobs skip with a warning when the AlphaLab wheel is not configured, because a permanently red pipeline is one everybody ignores |
 | TLS termination | NOT IMPLEMENTED | Assumed to be a reverse proxy's job; HSTS is set in production |
 
 ## Not addressed at all

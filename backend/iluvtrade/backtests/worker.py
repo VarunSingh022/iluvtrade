@@ -40,7 +40,7 @@ from iluvtrade.strategies import service as strategy_service
 
 logger = logging.getLogger("iluvtrade.backtests.worker")
 
-__all__ = ["BacktestWorkerPool", "process_one", "requeue_orphans"]
+__all__ = ["BacktestWorkerPool", "process_one", "requeue_orphans", "stop_all_pools"]
 
 
 def _load_rows(version: DatasetVersion) -> list[dict[str, Any]]:
@@ -186,6 +186,29 @@ def requeue_orphans() -> int:
     return requeued
 
 
+#: Every pool that has been started and not yet stopped.
+#:
+#: Declared before the class, so the annotation is a string under
+#: ``from __future__ import annotations``.
+#:
+#: Worker threads are daemons, so a pool nobody stops simply keeps running —
+#: harmless in a process that is exiting, and not harmless in a test suite that
+#: is about to repoint the database underneath it. This registry is what makes
+#: "stop everything this application started" a thing anyone can actually do.
+_LIVE_POOLS: set[BacktestWorkerPool] = set()
+_POOLS_LOCK = threading.Lock()
+
+
+def stop_all_pools(timeout: float = 20.0) -> int:
+    """Stop and join every running pool. Returns how many were stopped."""
+
+    with _POOLS_LOCK:
+        pools = list(_LIVE_POOLS)
+    for pool in pools:
+        pool.stop(timeout=timeout)
+    return len(pools)
+
+
 class BacktestWorkerPool:
     """A small pool of daemon threads draining the queue."""
 
@@ -199,12 +222,15 @@ class BacktestWorkerPool:
         if self._threads:
             return
         requeue_orphans()
+        self._stop.clear()
         for index in range(self._size):
             thread = threading.Thread(
                 target=self._loop, name=f"backtest-worker-{index}", daemon=True
             )
             thread.start()
             self._threads.append(thread)
+        with _POOLS_LOCK:
+            _LIVE_POOLS.add(self)
         logger.info("Started %d backtest worker(s)", self._size)
 
     def _loop(self) -> None:
@@ -217,11 +243,19 @@ class BacktestWorkerPool:
                 self._stop.wait(self._poll)
 
     def stop(self, timeout: float = 5.0) -> None:
+        """Signal every worker to finish, then wait for it.
+
+        Idempotent, and deregisters the pool so
+        :func:`stop_all_pools` has nothing left to do.
+        """
+
         self._stop.set()
         deadline = time.monotonic() + timeout
         for thread in self._threads:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         self._threads.clear()
+        with _POOLS_LOCK:
+            _LIVE_POOLS.discard(self)
 
     def drain(self, timeout: float = 60.0) -> None:
         """Run queued jobs to completion inline. For tests and the CLI demo."""

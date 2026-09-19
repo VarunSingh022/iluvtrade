@@ -431,3 +431,109 @@ def test_every_invitation_action_is_audited(app, headers) -> None:
 
         # And no audit payload carries the token.
         assert issued["token"] not in owner.get("/api/v1/audit?limit=100").text
+
+
+def test_a_second_invitation_to_an_existing_member_is_refused_at_issue(app, headers) -> None:
+    """The outer guard: you cannot even mint a token for someone already in."""
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as owner, TestClient(app) as guest:
+        register(owner, "dup-owner@example.com")
+        register(guest, "dup-guest@example.com")
+
+        first = _invite(owner, headers, "dup-guest@example.com", "viewer")
+        assert (
+            guest.post(
+                "/api/v1/organizations/invitations/accept",
+                json={"token": first["token"]},
+                headers=headers,
+            ).status_code
+            == 200
+        )
+
+        refused = owner.post(
+            "/api/v1/organizations/invitations",
+            json={"email": "dup-guest@example.com", "role": "admin"},
+            headers=headers,
+        )
+        assert refused.status_code == 400
+        assert "already a member" in refused.json()["error"]["message"]
+
+
+def test_accepting_when_already_a_member_cannot_add_a_second_membership(app, headers) -> None:
+    """The inner guard, as defence in depth.
+
+    The check above means this branch is not reachable through the API today.
+    It is still the one that would matter if a membership ever arrived by
+    another route, so the membership is created directly here to exercise it —
+    and the assertion is that the role does **not** change, because silently
+    upgrading someone on a replayed token is the interesting failure.
+    """
+
+    from fastapi.testclient import TestClient
+
+    from iluvtrade.db.models.platform import Membership, Role
+    from iluvtrade.db.session import session_scope
+
+    with TestClient(app) as owner, TestClient(app) as guest:
+        owner_user = register(owner, "inner-owner@example.com")
+        guest_user = register(guest, "inner-guest@example.com")
+
+        issued = _invite(owner, headers, "inner-guest@example.com", "admin")
+
+        # The membership arrives by another route, at a lower role.
+        with session_scope() as session:
+            session.add(
+                Membership(
+                    organization_id=owner_user["organization_id"],
+                    user_id=guest_user["id"],
+                    role=Role.VIEWER,
+                )
+            )
+
+        again = guest.post(
+            "/api/v1/organizations/invitations/accept",
+            json={"token": issued["token"]},
+            headers=headers,
+        )
+        assert again.status_code == 400
+        assert "already a member" in again.json()["error"]["message"]
+
+        with session_scope() as session:
+            memberships = (
+                session.query(Membership)
+                .filter_by(
+                    user_id=guest_user["id"],
+                    organization_id=owner_user["organization_id"],
+                )
+                .all()
+            )
+            assert len(memberships) == 1
+            assert memberships[0].role is Role.VIEWER, (
+                "a replayed invitation upgraded an existing member's role"
+            )
+
+
+def test_an_invitation_is_bound_to_the_organization_that_issued_it(app, headers) -> None:
+    """A token cannot be redeemed into a different workspace."""
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as alice, TestClient(app) as bob, TestClient(app) as guest:
+        alice_user = register(alice, "alice-bind@example.com")
+        bob_user = register(bob, "bob-bind@example.com")
+        register(guest, "guest-bind@example.com")
+
+        issued = _invite(alice, headers, "guest-bind@example.com", "trader")
+        guest.post(
+            "/api/v1/organizations/invitations/accept",
+            json={"token": issued["token"]},
+            headers=headers,
+        )
+
+        workspaces = {w["organization_id"] for w in guest.get("/api/v1/auth/organizations").json()}
+        assert alice_user["organization_id"] in workspaces
+        assert bob_user["organization_id"] not in workspaces, (
+            "the invitation put the guest in a workspace it did not name"
+        )

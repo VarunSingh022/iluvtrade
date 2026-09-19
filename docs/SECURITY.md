@@ -452,3 +452,91 @@ The npm dependency set is also pinned by a test: `dependencies` must be exactly
 `react`, `react-dom`, `react-router-dom` and `qrcode-generator`. A fifth entry
 is one more package with script access to a signed-in session, which is a
 decision rather than a line to append.
+
+---
+
+# Two correctness defects found during the forensic pass
+
+Both are recorded here rather than only in a commit message, because both are
+the kind of bug that passes every test until the day it does not.
+
+## 1. The test suite wrote into the developer's real database
+
+**What happened.** On 2026-09-19 the suite wrote **33 rows** into
+`var/iluvtrade.db` — a user, an organization, a membership, a subscription, an
+auth session, a dataset with its source and version, a strategy and version, a
+trading session with its events, orders, fills and position, four notifications
+and ten audit events.
+
+**Root cause.** `SessionRunner.launch()` starts a **daemon** thread. Nothing
+waits for it. The per-test fixture, on teardown, cleared the settings cache and
+reset the engine — while a runner was still polling. The runner's next call to
+`get_session_factory()` re-resolved settings *without* the monkeypatched
+`ILUVTRADE_DATABASE_URL` and got the default: the developer's own file.
+
+It also produced a flake that looked unrelated, because a background thread's
+exception is reported by pytest against whichever test is running *next*.
+
+**Why it is a correctness bug and not a cleanup task.** A daemon thread that
+re-reads configuration after its caller is gone will pick up whatever the
+process defaults to. In a test that is the developer's database; in a
+deployment it would be whatever a reloaded configuration said, which is a
+different class of problem with the same shape.
+
+**Three mechanisms now stand in the way**, kept together because they fail
+differently:
+
+| | |
+|---|---|
+| **Prevention** | The test suite patches `create_engine` and **refuses** to build an engine for that path — before a connection opens, not after a row is written. An explicit `allows_real_database` fixture is the documented exception; nothing uses it |
+| **Containment** | Every application thread is stopped and joined **before** the settings cache is cleared. `SessionRunner.join_all()` and the new `stop_all_pools()` do this, and the fixture asserts nothing survived |
+| **Detection** | The file's SHA-256 is compared across the whole run, in case something reaches it by a route the guard does not recognise |
+
+`tests/test_isolation.py` exercises all three, and **reproduces the original
+failure sequence** — settings cache cleared, override removed, engine reset,
+then a call from a background thread — asserting it now raises.
+
+Four consecutive full runs leave the file byte-identical.
+
+**Cleanup.** The 33 rows were removed by primary key, inside one transaction,
+after a byte-identical backup was taken and a rehearsal on a copy. The
+partition was unambiguous: 82 rows belonged to the original demo organization,
+31 to the test one, **zero to neither**, and **zero rows referenced across the
+two**. Every one of the 85 original rows is present afterwards with an
+identical row hash. The per-tenant audit chain made this safe by construction —
+the demo chain's head hash is unchanged, because its hashes never referenced
+the other tenant's events.
+
+## 2. A session could be started more than once
+
+**What happened.** Five simultaneous `POST /trading/sessions/{id}/start`
+requests produced **three** successes. Three runner threads then fed bars into
+one portfolio, so the position would have been triple.
+
+**Root cause.** `_transition` was a read-modify-write:
+
+```python
+row = get(...)                      # SELECT   — all three read CREATED
+if row.status not in allowed_from:  # check    — all three pass
+    raise
+row.status = to                     # UPDATE   — all three write
+```
+
+Three separate steps with nothing between them. Every caller read `CREATED`
+before any of them wrote.
+
+**Fix.** The current status is now part of the `WHERE` clause of a single
+`UPDATE`, so the database picks the winner exactly once and a caller that
+matched no row is refused. This is the pattern the runner's own
+`STARTING → RUNNING` claim already used; it was simply missing here.
+
+**How it is now tested.** The threaded test caught the old implementation about
+**one run in six**, which is not a regression test worth relying on. Simulating
+the losing caller's stale view is no better — mutating the ORM object marks it
+dirty and SQLAlchemy flushes it before the next statement, so the simulation
+writes the very row it was pretending to have read.
+
+So the regression test watches the **SQL that actually reaches the database**
+and asserts the status change is one `UPDATE` whose `WHERE` carries the current
+status. It fails on the old implementation 5 times out of 5, and is not a race
+at all.

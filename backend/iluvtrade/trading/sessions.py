@@ -27,8 +27,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
+from sqlalchemy import update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session as DbSession
 
 from iluvtrade.alphalab_bridge import runconfig
@@ -231,13 +233,56 @@ def _transition(
     action: str,
     message: str,
 ) -> TradingSession:
+    """Move a session between states, atomically.
+
+    **A conditional UPDATE, not a read-modify-write.** The obvious version —
+    read the row, check the status, assign the new one — is wrong under
+    concurrency, and was wrong here: two simultaneous ``start`` requests both
+    read ``CREATED``, both passed the check, and both wrote ``STARTING``. Two
+    runner threads then fed bars into one portfolio, so the position was
+    double. A stress test caught it three times in five attempts.
+
+    The status is therefore part of the ``WHERE`` clause. The database decides
+    the winner, exactly once, and a caller that matched no row lost the race
+    and is refused — the same answer it would get for an invalid transition,
+    because from the caller's side those are the same thing: the session was
+    not in a state this action is allowed from.
+
+    Ownership is still resolved first, so a foreign id is a 404 rather than a
+    refusal that admits the session exists.
+    """
+
+    # Ownership and existence, before anything else.
     trading_session = get(session, principal, session_id)
-    if trading_session.status not in allowed_from:
+
+    result = session.execute(
+        update(TradingSession)
+        .where(
+            TradingSession.id == session_id,
+            TradingSession.organization_id == principal.organization_id,
+            TradingSession.status.in_(sorted(allowed_from, key=lambda s: s.value)),
+        )
+        .values(status=to)
+    )
+    # ``rowcount`` is on CursorResult; ``Session.execute`` is typed as the
+    # broader Result, which does not declare it. The cast is the narrowing,
+    # not a claim that it might be absent.
+    claimed = cast("CursorResult[Any]", result).rowcount
+
+    if claimed != 1:
+        # Re-read so the message names the state it actually found, which will
+        # be the winner's new state when this was a lost race.
+        session.expire(trading_session)
+        current = get(session, principal, session_id)
         raise SessionError(
-            f"A {trading_session.status.value} session cannot be {action}. "
+            f"A {current.status.value} session cannot be {action}. "
             f"Allowed from: {', '.join(sorted(s.value for s in allowed_from))}."
         )
-    trading_session.status = to
+
+    # The in-memory object still holds the old status; the UPDATE bypassed it.
+    session.expire(trading_session)
+    trading_session = get(session, principal, session_id)
+
     log_event(session, trading_session, kind=f"session.{action}", message=message)
     audit.record(
         session,

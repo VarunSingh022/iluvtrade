@@ -146,9 +146,14 @@ def test_concurrent_dataset_uploads_do_not_write_into_each_other(app) -> None:
 def test_starting_one_session_twice_at_once_yields_one_start(client) -> None:
     """Rules out: two runners advancing one session's portfolio.
 
-    ``CREATED -> STARTING`` is a conditional update, so exactly one caller can
-    make the transition. If both could, two threads would be feeding bars into
-    one account and the resulting position would be double.
+    This is a regression test for a **real defect**, not a hypothetical.
+    ``_transition`` used to read the row, check the status and assign the new
+    one — three separate steps. Five simultaneous starts produced three
+    successes: all of them read ``CREATED`` before any of them wrote. Three
+    runner threads then fed bars into one portfolio.
+
+    The status is now part of the ``WHERE`` clause of a single UPDATE, so the
+    database picks the winner exactly once.
     """
 
     register(client, "race@example.com")
@@ -178,6 +183,20 @@ def test_starting_one_session_twice_at_once_yields_one_start(client) -> None:
 
     assert statuses.count(200) == 1, f"exactly one start should succeed, got {statuses}"
     assert all(status in (200, 400, 409) for status in statuses)
+
+    # The durable signal, and the one that would have caught this earlier: a
+    # second start writes a second audit event. Counting them is how "two
+    # runners fed one portfolio" shows up after the fact.
+    started = [
+        event
+        for event in client.get("/api/v1/audit?limit=200").json()
+        if event["action"] == "trading.session.started" and event["resource_id"] == created["id"]
+    ]
+    assert len(started) == 1, f"{len(started)} start events for one session"
+
+    # And exactly one session-event log entry, for the same reason.
+    events = client.get(f"/api/v1/trading/sessions/{created['id']}/events").json()
+    assert sum(1 for e in events if e["kind"] == "session.started") == 1
 
 
 def test_a_halted_session_cannot_be_resumed_by_any_caller(client) -> None:
@@ -383,3 +402,183 @@ def test_concurrent_writes_leave_an_intact_audit_chain(client) -> None:
     # Every successful create is in the trail: none was lost to a race.
     actions = [event["action"] for event in client.get("/api/v1/audit?limit=200").json()]
     assert actions.count("strategy.created") == created
+
+
+# --- what a refused write leaves behind -------------------------------------
+
+
+def test_a_database_busy_refusal_commits_nothing_and_is_safely_retryable(app) -> None:
+    """The four things that make ``DatabaseBusy`` an acceptable answer.
+
+    SQLite serialises writers, so under concurrent ingestion some requests will
+    be refused. That is a documented limitation, not a defect — but it is only
+    acceptable if the refusal is *clean*. Four properties, each checked here:
+
+    1. **Nothing partially committed.** A dataset row without its version, or a
+       version without its source, would be a corrupt workspace.
+    2. **The client is told it can retry**, with ``Retry-After``.
+    3. **The audit chain is still verifiable.** A refused write must not leave a
+       gap or a duplicate sequence.
+    4. **The retry actually works**, and produces a normal result.
+    """
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        register(client, "busy@example.com")
+
+        def upload(index: int):
+            return client.post(
+                "/api/v1/datasets/upload",
+                files={"file": (f"b{index}.csv", make_csv(bars=25 + index), "text/csv")},
+                data={"name": f"busy-{index}"},
+                headers=HEADERS,
+            )
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            responses = [f.result() for f in [pool.submit(upload, i) for i in range(6)]]
+
+        refused = [r for r in responses if r.status_code >= 400]
+        accepted = [r for r in responses if r.status_code < 400]
+        assert accepted, "every write was refused; that is a different problem"
+
+        # 2. A refusal is retryable and says so.
+        for response in refused:
+            assert response.status_code == 503
+            body = response.json()["error"]
+            assert body["code"] == "DatabaseBusy"
+            assert "nothing was changed" in body["message"].lower()
+            assert response.headers.get("Retry-After")
+
+        # 1. Nothing partial. Every stored version belongs to a stored dataset,
+        #    and the counts match exactly what succeeded.
+        datasets = client.get("/api/v1/datasets").json()
+        versions = [v for d in datasets for v in d["versions"]]
+        assert len(versions) == len(accepted)
+        for dataset in datasets:
+            for version in dataset["versions"]:
+                detail = client.get(f"/api/v1/datasets/versions/{version['id']}")
+                assert detail.status_code == 200
+                assert detail.json()["source"]["content_hash"], (
+                    "a version exists whose source row was never written"
+                )
+
+        # 3. The audit chain survived the refusals.
+        verification = client.get("/api/v1/audit/verify").json()
+        assert verification["intact"] is True, verification
+
+        # 4. Retrying a refused upload succeeds and behaves normally.
+        if refused:
+            retried = upload(99)
+            assert retried.status_code < 400, retried.text
+            assert retried.json()["row_count"] == 25 + 99
+            assert client.get("/api/v1/audit/verify").json()["intact"] is True
+
+
+def test_the_busy_refusal_is_the_documented_one_not_an_internal_error(app) -> None:
+    """Deterministic, and distinguishable from a real fault.
+
+    An ``OperationalError`` that is *not* contention still falls through to the
+    500 handler, where the client learns nothing specific. Only the lock case
+    is remapped, and this pins that distinction.
+    """
+
+    from fastapi.testclient import TestClient
+    from sqlalchemy.exc import OperationalError
+
+    from iluvtrade.platform import notifications
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        register(client, "busy2@example.com")
+
+        def locked(*_a: object, **_k: object) -> int:
+            raise OperationalError("SELECT 1", {}, Exception("database is locked"))
+
+        def broken(*_a: object, **_k: object) -> int:
+            raise OperationalError("SELECT 1", {}, Exception("disk I/O error"))
+
+        import pytest as _pytest
+
+        with _pytest.MonkeyPatch.context() as patch:
+            patch.setattr(notifications, "unread_count", locked)
+            busy = client.get("/api/v1/dashboard")
+        assert busy.status_code == 503
+        assert busy.json()["error"]["code"] == "DatabaseBusy"
+
+        with _pytest.MonkeyPatch.context() as patch:
+            patch.setattr(notifications, "unread_count", broken)
+            fault = client.get("/api/v1/dashboard")
+        assert fault.status_code == 500
+        assert fault.json()["error"]["code"] == "InternalError"
+        assert "disk I/O" not in fault.text, "an internal detail reached the client"
+
+
+def test_the_state_transition_is_one_conditional_update(client) -> None:
+    """The same defect, asserted deterministically against the emitted SQL.
+
+    The threaded test above reproduces the race only when the timing lines up —
+    it caught the old implementation about one run in six, which is not a
+    regression test worth relying on. Simulating the losing thread's stale view
+    is no better: mutating the ORM object marks it dirty, SQLAlchemy flushes it
+    before the next statement, and the simulation writes the very row it was
+    pretending to have read.
+
+    So this watches what actually goes to the database. An atomic transition is
+    a single UPDATE whose WHERE clause carries the **current** status; a
+    read-modify-write is a SELECT, a decision in Python, and an UPDATE keyed
+    only by id. The two are distinguishable in the SQL, and only one of them is
+    safe under concurrency.
+    """
+
+    from sqlalchemy import event
+
+    from iluvtrade.db.session import get_engine
+
+    register(client, "sql@example.com")
+    dataset_version_id, strategy_version_id = _ready(client)
+    created = client.post(
+        "/api/v1/trading/sessions",
+        json={
+            "name": "SQL",
+            "mode": "paper",
+            "dataset_version_id": dataset_version_id,
+            "strategy_version_id": strategy_version_id,
+            "starting_cash": "100000",
+        },
+        headers=HEADERS,
+    ).json()
+
+    statements: list[str] = []
+
+    def record(_conn, _cursor, statement, _params, _context, _many):
+        statements.append(" ".join(statement.split()))
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        assert (
+            client.post(
+                f"/api/v1/trading/sessions/{created['id']}/start", headers=HEADERS
+            ).status_code
+            == 200
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    updates = [
+        statement
+        for statement in statements
+        if statement.upper().startswith("UPDATE TRADING_SESSIONS")
+    ]
+    assert updates, "no UPDATE reached trading_sessions"
+
+    guarded = [
+        statement for statement in updates if "SET status" in statement and "status IN" in statement
+    ]
+    assert guarded, (
+        "the status change was issued as an UPDATE keyed only by id:\n  "
+        + "\n  ".join(updates)
+        + "\nThat is a read-modify-write: two callers can both read CREATED, "
+        "both pass the check in Python, and both write. The current status "
+        "must be part of the WHERE clause so the database picks one winner."
+    )
