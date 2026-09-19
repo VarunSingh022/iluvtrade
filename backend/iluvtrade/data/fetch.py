@@ -79,11 +79,68 @@ class FetchResult:
     redirect_chain: tuple[str, ...]
 
 
+#: Ranges that must never be reached, stated explicitly.
+#:
+#: The stdlib's ``is_private`` is **not** sufficient on its own: what it covers
+#: changes between Python versions. On 3.12, ``100.64.0.0/10`` (RFC 6598
+#: carrier-grade NAT — routable-looking, and real internal infrastructure at
+#: many ISPs and clouds) and ``192.88.99.0/24`` (RFC 7526 6to4 relay anycast)
+#: are both reported as *public*. Relying on the flags alone means the set of
+#: addresses this application will connect to silently changes with an
+#: interpreter upgrade.
+#:
+#: So the flags are used **and** this list, and the union is refused.
+_DENIED_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
+    # IPv4
+    ipaddress.ip_network("0.0.0.0/8"),  # "this network"
+    ipaddress.ip_network("10.0.0.0/8"),  # RFC1918
+    ipaddress.ip_network("100.64.0.0/10"),  # RFC6598 shared address space
+    ipaddress.ip_network("127.0.0.0/8"),  # loopback
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local, incl. cloud metadata
+    ipaddress.ip_network("172.16.0.0/12"),  # RFC1918
+    ipaddress.ip_network("192.0.0.0/24"),  # IETF protocol assignments
+    ipaddress.ip_network("192.0.2.0/24"),  # TEST-NET-1
+    ipaddress.ip_network("192.88.99.0/24"),  # RFC7526 6to4 relay anycast
+    ipaddress.ip_network("192.168.0.0/16"),  # RFC1918
+    ipaddress.ip_network("198.18.0.0/15"),  # benchmarking
+    ipaddress.ip_network("198.51.100.0/24"),  # TEST-NET-2
+    ipaddress.ip_network("203.0.113.0/24"),  # TEST-NET-3
+    ipaddress.ip_network("224.0.0.0/4"),  # multicast
+    ipaddress.ip_network("240.0.0.0/4"),  # reserved
+    # IPv6
+    ipaddress.ip_network("::/128"),  # unspecified
+    ipaddress.ip_network("::1/128"),  # loopback
+    ipaddress.ip_network("fc00::/7"),  # unique local
+    ipaddress.ip_network("fe80::/10"),  # link-local
+    ipaddress.ip_network("ff00::/8"),  # multicast
+    ipaddress.ip_network("2001:db8::/32"),  # documentation
+    ipaddress.ip_network("64:ff9b::/96"),  # IPv4/IPv6 translation
+)
+
+
 def _is_public_address(address: str) -> bool:
+    """Whether an address is one this application may connect to.
+
+    An **IPv4-mapped IPv6 address** (``::ffff:10.0.0.1``) is unwrapped before
+    the check. Without that, every private IPv4 range could be reached by
+    writing it in IPv6 notation — the check would look at the v6 form, find it
+    in none of the v6 ranges, and allow it.
+    """
+
     try:
         parsed = ipaddress.ip_address(address)
     except ValueError:
         return False
+
+    if isinstance(parsed, ipaddress.IPv6Address):
+        if parsed.ipv4_mapped is not None:
+            parsed = parsed.ipv4_mapped
+        elif parsed.sixtofour is not None:
+            parsed = parsed.sixtofour
+
+    if any(parsed in network for network in _DENIED_NETWORKS):
+        return False
+
     return not (
         parsed.is_private
         or parsed.is_loopback
@@ -105,6 +162,14 @@ def validate_url(url: str, settings: Settings) -> str:
     host = (parsed.hostname or "").lower()
     if not host:
         raise FetchError("The URL has no host.")
+    if parsed.username is not None or parsed.password is not None or "@" in (parsed.netloc or ""):
+        # ``https://data.example.com@evil.example.com/`` points at *evil*, and a
+        # human reviewing an allowlist entry reads the first host. Refusing
+        # userinfo outright removes the ambiguity rather than resolving it.
+        raise FetchError(
+            "A data-source URL may not contain userinfo (a '@' before the host). "
+            "Such a URL does not point where it appears to."
+        )
     if parsed.port is not None and parsed.port not in settings.fetch_allowed_ports:
         raise FetchError(
             f"Port {parsed.port} is not permitted for data fetching. Allowed: "

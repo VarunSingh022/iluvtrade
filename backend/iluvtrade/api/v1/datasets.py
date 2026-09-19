@@ -7,7 +7,7 @@ import json
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session as DbSession
 
-from iluvtrade.api.deps import current_principal, db_session, require_trader
+from iluvtrade.api.deps import current_principal, db_session, rate_limit, require_trader
 from iluvtrade.api.v1.schemas import (
     CleaningPolicyModel,
     DatasetResponse,
@@ -74,7 +74,7 @@ async def _read_upload(upload: UploadFile) -> bytes:
     return b"".join(chunks)
 
 
-@router.post("/inspect")
+@router.post("/inspect", dependencies=[Depends(rate_limit("ingest"))])
 async def inspect(
     file: UploadFile = File(...),
     _principal: Principal = Depends(current_principal),
@@ -88,7 +88,12 @@ async def inspect(
     return ingest.inspect_bytes(await _read_upload(file))
 
 
-@router.post("/upload", response_model=DatasetVersionDetail, status_code=201)
+@router.post(
+    "/upload",
+    response_model=DatasetVersionDetail,
+    status_code=201,
+    dependencies=[Depends(rate_limit("ingest"))],
+)
 async def upload(
     file: UploadFile = File(...),
     dataset_name: str | None = Form(default=None),
@@ -114,7 +119,12 @@ async def upload(
     return _detail(session, outcome.version)
 
 
-@router.post("/fetch", response_model=DatasetVersionDetail, status_code=201)
+@router.post(
+    "/fetch",
+    response_model=DatasetVersionDetail,
+    status_code=201,
+    dependencies=[Depends(rate_limit("fetch"))],
+)
 def fetch(
     payload: FetchDatasetRequest,
     session: DbSession = Depends(db_session),

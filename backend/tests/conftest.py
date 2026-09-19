@@ -23,19 +23,30 @@ os.environ.setdefault("ILUVTRADE_ENVIRONMENT", "test")
 
 @pytest.fixture(autouse=True)
 def _isolated_storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
-    """Point the database and blob storage at a fresh temporary directory."""
+    """Point the database and blob storage at a fresh temporary directory.
+
+    Rate limiting is **off** by default here. Otherwise a test that registers
+    six accounts would trip the registration policy and fail for a reason
+    unrelated to what it is testing. ``tests/security/test_rate_limiting.py``
+    turns it back on explicitly, which is also the only place its behaviour is
+    asserted — so the control is tested, and nothing else is throttled by it.
+    """
 
     from iluvtrade.config import get_settings
     from iluvtrade.db.session import reset_engine
+    from iluvtrade.platform.ratelimit import reset_limiter
 
     workspace = tempfile.mkdtemp(prefix="iluvtrade-test-")
     monkeypatch.setenv("ILUVTRADE_DATABASE_URL", f"sqlite:///{workspace}/test.db")
     monkeypatch.setenv("ILUVTRADE_STORAGE_ROOT", f"{workspace}/storage")
+    monkeypatch.setenv("ILUVTRADE_RATE_LIMIT_ENABLED", "false")
     get_settings.cache_clear()
     reset_engine()
+    reset_limiter()
     yield workspace
     get_settings.cache_clear()
     reset_engine()
+    reset_limiter()
 
 
 @pytest.fixture

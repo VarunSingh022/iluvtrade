@@ -14,21 +14,23 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session as DbSession
 
-from iluvtrade.billing import Charge, ChargeStatus, get_provider
+from iluvtrade.billing import Charge, ChargeStatus, Refund, get_provider
 from iluvtrade.db.base import utcnow
 from iluvtrade.db.models.backtest import BacktestRun
 from iluvtrade.db.models.broker import BrokerKind
 from iluvtrade.db.models.platform import Role
 from iluvtrade.db.models.reddesk import (
     BillingCadence,
+    CreatorPayout,
     Entitlement,
+    EntitlementStatus,
     Listing,
     ListingStatus,
     ListingVersion,
@@ -50,6 +52,8 @@ __all__ = [
     "discover",
     "publish_listing",
     "purchase",
+    "record_payout",
+    "refund",
     "submit_listing",
     "validate_listing",
 ]
@@ -707,3 +711,170 @@ def review(
     session.add(row)
     session.flush()
     return row
+
+
+def refund(
+    session: DbSession,
+    principal: Principal,
+    *,
+    purchase_id: str,
+    reason: str,
+) -> tuple[Purchase, list[Entitlement]]:
+    """Refund a purchase and revoke every entitlement it granted.
+
+    Revocation is the point. A refunded purchase that left a working licence
+    behind is a strategy being run for free — and worse, the buyer has no
+    indication their access is no longer legitimate.
+
+    The provider is asked first. If it refuses, nothing is changed: recording a
+    refund that did not happen puts a false entry in a financial ledger, which
+    is the failure :class:`~iluvtrade.billing.ManualProvider` exists to avoid
+    elsewhere.
+    """
+
+    principal.require(Role.ADMIN)
+    purchase = require_owned(session, Purchase, purchase_id, principal.organization_id)
+
+    if purchase.status is PurchaseStatus.REFUNDED:
+        held = list(
+            session.execute(
+                scoped(Entitlement, principal.organization_id).where(
+                    Entitlement.source_purchase_id == purchase.id
+                )
+            ).scalars()
+        )
+        return purchase, held
+    if purchase.status is not PurchaseStatus.PAID:
+        raise ListingError(f"A {purchase.status.value} purchase cannot be refunded.")
+
+    outcome = get_provider(purchase.provider).refund(
+        Refund(
+            reference=purchase.provider_reference or purchase.id,
+            amount=Decimal(purchase.amount),
+            reason=reason[:400],
+        )
+    )
+    if outcome.status is ChargeStatus.FAILED:
+        raise ListingError(f"The provider refused the refund: {outcome.message}")
+
+    purchase.status = PurchaseStatus.REFUNDED
+    revoked: list[Entitlement] = []
+    for entitlement in session.execute(
+        scoped(Entitlement, principal.organization_id).where(
+            Entitlement.source_purchase_id == purchase.id
+        )
+    ).scalars():
+        if entitlement.status is EntitlementStatus.ACTIVE:
+            entitlements.revoke(
+                session,
+                entitlement.id,
+                reason=f"Purchase refunded: {reason}",
+                actor_user_id=principal.user_id,
+            )
+        revoked.append(entitlement)
+
+    audit.record(
+        session,
+        organization_id=principal.organization_id,
+        action="reddesk.purchase.refunded",
+        resource_type="purchase",
+        resource_id=purchase.id,
+        actor_user_id=principal.user_id,
+        payload={
+            "amount": purchase.amount,
+            "currency": purchase.currency,
+            "provider": purchase.provider,
+            "provider_reference": outcome.reference,
+            "entitlements_revoked": len(revoked),
+            "reason": reason,
+        },
+    )
+    notifications.notify(
+        session,
+        organization_id=principal.organization_id,
+        kind="reddesk.refunded",
+        severity="warning",
+        title="Purchase refunded",
+        body=(
+            f"{purchase.currency} {purchase.amount} refunded. "
+            f"{len(revoked)} entitlement(s) revoked."
+        ),
+        resource_type="purchase",
+        resource_id=purchase.id,
+    )
+    session.flush()
+    return purchase, revoked
+
+
+def record_payout(
+    session: DbSession,
+    principal: Principal,
+    *,
+    period_start: datetime,
+    period_end: datetime,
+) -> CreatorPayout:
+    """Total what this creator organization is owed for a period.
+
+    **Records what is owed; does not pay it.** Settlement needs a provider that
+    moves money, and :class:`~iluvtrade.billing.ManualProvider` raises rather
+    than pretending. The row exists so the ledger is auditable either way, and
+    its ``status`` stays ``pending`` until something actually settles it.
+
+    Only ``PAID`` purchases count. A refunded one contributes nothing, which is
+    why this is computed rather than incremented as sales arrive.
+    """
+
+    principal.require(Role.ADMIN)
+
+    listings = [
+        row.id for row in session.execute(scoped(Listing, principal.organization_id)).scalars()
+    ]
+    gross = Decimal("0")
+    fees = Decimal("0")
+    currency = "INR"
+    counted = 0
+
+    if listings:
+        purchases = session.execute(
+            select(Purchase).where(
+                Purchase.listing_id.in_(listings),
+                Purchase.status == PurchaseStatus.PAID,
+                Purchase.created_at >= period_start,
+                Purchase.created_at < period_end,
+            )
+        ).scalars()
+        for purchase in purchases:
+            gross += Decimal(purchase.amount)
+            fees += Decimal(purchase.platform_fee)
+            currency = purchase.currency
+            counted += 1
+
+    payout = CreatorPayout(
+        organization_id=principal.organization_id,
+        period_start=period_start,
+        period_end=period_end,
+        gross_amount=str(gross),
+        platform_fee=str(fees),
+        net_amount=str(gross - fees),
+        currency=currency,
+        purchase_count=counted,
+        status="pending",
+    )
+    session.add(payout)
+    session.flush()
+    audit.record(
+        session,
+        organization_id=principal.organization_id,
+        action="reddesk.payout.recorded",
+        resource_type="creator_payout",
+        resource_id=payout.id,
+        actor_user_id=principal.user_id,
+        payload={
+            "gross": str(gross),
+            "net": str(gross - fees),
+            "currency": currency,
+            "purchases": counted,
+            "settled": False,
+        },
+    )
+    return payout

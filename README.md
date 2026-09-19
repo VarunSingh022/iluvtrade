@@ -7,6 +7,11 @@ Upload market data, see exactly what the importer made of it, run a reproducible
 backtest on a real quantitative engine, publish the strategy for others to
 license, and deploy an exact version to paper trading.
 
+> **Not production-ready.** Live trading is disabled, the Zerodha connector has
+> never touched the venue, no money moves, and seller code cannot be executed.
+> [docs/STATUS.md](docs/STATUS.md) states the status of every capability in one
+> table — read it before believing anything else here.
+
 ---
 
 ## The one architectural rule
@@ -14,26 +19,47 @@ license, and deploy an exact version to paper trading.
 **AlphaLab is the engine. iluvtrade orchestrates it and never reimplements it.**
 
 ```
-                            iluvtrade.com
-                                  │
-        ┌─────────────────────────┼─────────────────────────┐
-        │                         │                         │
-   Platform core              AlphaLab                  RedDesk
-   ──────────────             ────────                  ───────
-   users, orgs                market data               listings
-   auth, sessions             strategy runtime          creators
-   roles, audit               allocation, risk          licensing
-   notifications              OMS, execution            purchases
-   billing                    portfolio accounting      entitlements
-   broker accounts            analytics                 reviews
-                                  │
-                           Broker Gateway
-                     (alphalab.broker.BrokerProtocol)
-                                  │
-                        ┌─────────┴─────────┐
-                     Paper               Zerodha
-              (AlphaLab simulator)   (Kite Connect v3)
+                              Browser
+                        (React + TypeScript)
+                                 │  HttpOnly cookie + X-Requested-With
+                                 ▼
+                          iluvtrade API
+                     (FastAPI, /api/v1, typed)
+             auth · tenancy · rate limit · CSRF · audit chain
+                                 │
+        ┌────────────────────────┼────────────────────────┐
+        ▼                        ▼                        ▼
+  Application services     Background work           RedDesk
+  ───────────────────      ───────────────           ───────
+  identity / tenancy       backtest workers          listings
+  datasets / research      session runners           entitlements
+  strategies / versions    (in-process pools)        purchases · refunds
+  brokers / trading                                  payouts (recorded)
+        │                        │                        │
+        └────────────────────────┼────────────────────────┘
+                                 ▼
+                         AlphaLab bridge
+              (the ONLY place `import alphalab` appears)
+                instruments · market · runconfig
+                engine · results · broker vocab
+                                 │
+                                 ▼
+                        AlphaLab v3.0.0
+        market data · strategy dispatch · allocation · risk
+        OMS · execution · portfolio accounting · analytics
+                                 │
+                         Broker boundary
+                   (alphalab.broker.BrokerProtocol)
+                                 │
+                   ┌─────────────┴─────────────┐
+                 Paper                     Zerodha
+          (AlphaLab simulator)        (Kite Connect v3)
+              IMPLEMENTED            INTEGRATION-READY —
+                                     never run against the venue
 ```
+
+**AlphaLab is the canonical quantitative authority.** Every number this product
+displays was computed by it.
 
 Three authorities, and nothing crosses them:
 
@@ -70,10 +96,13 @@ python3 -m venv .venv
 # 2. Configuration
 cp ../.env.example ../.env    # then set ILUVTRADE_SECRET_KEY
 
-# 3. Frontend
+# 3. Schema
+./.venv/bin/alembic upgrade head
+
+# 4. Frontend
 cd ../frontend && npm install && npm run build
 
-# 4. Run
+# 5. Run
 cd ../backend && ./.venv/bin/python -m iluvtrade.cli serve
 ```
 
@@ -118,9 +147,12 @@ Stated plainly, because a trading platform that overstates itself is dangerous.
 - **The data workspace.** Schema detection, validation, cleaning, the quality
   report and the approval gate. Every rejected row carries its line number and
   reason; every changed value carries its before and after.
-- **Tenant isolation, credential encryption, SSRF defence, CSRF defence, path
-  traversal defence, strategy-version immutability, order idempotency.** 102
-  tests.
+- **Security controls.** Tenant isolation (a 32-operation cross-tenant matrix),
+  role-based authorization, credential encryption bound to its connection,
+  SSRF defence with an explicit address deny-list, CSRF on all 33 mutating
+  routes, path-traversal refusal, strategy-version immutability, order
+  idempotency, per-principal rate limiting, and a per-tenant audit hash chain.
+- **258 backend tests and 28 frontend tests.**
 
 ### Real boundary, not yet run against the outside world
 
@@ -153,6 +185,7 @@ Stated plainly, because a trading platform that overstates itself is dangerous.
 
 | Document | What it covers |
 |---|---|
+| [STATUS.md](docs/STATUS.md) | **What is implemented, tested, disabled or absent — read this first** |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The three authorities, the AlphaLab boundary, data flow, persistence |
 | [GETTING_STARTED.md](docs/GETTING_STARTED.md) | Install, configure, run, develop |
 | [API.md](docs/API.md) | Every endpoint, the error envelope, authentication |
@@ -161,6 +194,7 @@ Stated plainly, because a trading platform that overstates itself is dangerous.
 | [BROKERS.md](docs/BROKERS.md) | The broker boundary, Zerodha, what is unverified |
 | [TRADING.md](docs/TRADING.md) | Paper sessions, the live gap, risk controls, the kill switch |
 | [SECURITY.md](docs/SECURITY.md) | Controls, threat model, and what is deferred |
+| [SANDBOX_CONTRACT.md](docs/SANDBOX_CONTRACT.md) | The contract a seller-code sandbox must satisfy — unbuilt, specified |
 | [COMPLIANCE.md](docs/COMPLIANCE.md) | Compliance boundaries and external dependencies |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Running it somewhere real, and what has to change first |
 
@@ -170,14 +204,25 @@ Stated plainly, because a trading platform that overstates itself is dangerous.
 
 ```bash
 cd backend
-./.venv/bin/ruff check iluvtrade tests     # lint
+./.venv/bin/ruff check iluvtrade tests
 ./.venv/bin/ruff format --check iluvtrade tests
-./.venv/bin/mypy                            # 71 files, strict-ish
-PYTHONPATH=$PWD ./.venv/bin/python -m pytest -q
+./.venv/bin/mypy
+PYTHONPATH=$PWD ./.venv/bin/python -m pytest -q          # 258 tests
+./.venv/bin/alembic check                                 # models vs migrations
 
 cd ../frontend
 npm run typecheck
+npm test                                                  # 28 tests
 npm run build
+```
+
+Targeted suites:
+
+```bash
+cd backend
+PYTHONPATH=$PWD ./.venv/bin/python -m pytest -m security -q
+PYTHONPATH=$PWD ./.venv/bin/python -m pytest -m integration -q
+PYTHONPATH=$PWD ./.venv/bin/python -m pytest tests/unit/test_engine_boundary.py -q
 ```
 
 ## Licence

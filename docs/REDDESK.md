@@ -78,13 +78,29 @@ payment processor, which is what a local deployment can honestly do. The ledger
 fields are written correctly either way, so switching providers does not restate
 history.
 
-`iluvtrade/billing/` defines the provider interface. Integrating a real one
-needs a merchant account, a contract, webhook endpoints with signature
-verification, and — for an Indian marketplace paying creators — tax handling
-this repository does not attempt.
+`iluvtrade/billing/` defines the provider interface: `charge`, `refund`,
+`payout`, plus `moves_money` so a deployment can report honestly on whether its
+revenue figures represent collected money or recorded intent. `get_provider()`
+**refuses an unknown name** rather than falling back to `manual` — a deployment
+that configured a real provider and typo'd its name must not silently record
+purchases as settled.
 
-**Creator payouts are recorded, not paid.** `CreatorPayout` makes the ledger
-auditable. Actually moving money is an external dependency.
+Integrating a real provider needs a merchant account, a contract, webhook
+endpoints with signature verification, and — for an Indian marketplace paying
+creators — tax handling this repository does not attempt.
+
+**Refunds revoke.** `marketplace.refund()` asks the provider first and changes
+nothing if it refuses — recording a refund that did not happen is a false ledger
+entry. On success the purchase becomes `REFUNDED` and **every entitlement it
+granted is revoked**, because a refunded purchase that left a working licence
+behind is a strategy being run for free, and the buyer has no indication their
+access is no longer legitimate.
+
+**Creator payouts are recorded, not paid.** `marketplace.record_payout()` totals
+what is owed for a period from `PAID` purchases only — a refunded one
+contributes nothing, which is why it is computed rather than incremented as
+sales arrive. The row's `status` stays `pending` until something actually
+settles it, and `ManualProvider.payout()` **raises** rather than pretending.
 
 **Review is not independent.** In this deployment the reviewer is an
 administrator of the creator's own organization. That is coherent for a

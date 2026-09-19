@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
+import { ConfirmButton } from "../components/Confirm";
 import { Badge, Banner, Card, ErrorBanner, Loading, ScoreMeter, Stat, StatusBadge, Tabs } from "../components/ui";
 import { ApiError, api } from "../lib/api";
 import type { DatasetVersionDetail } from "../lib/api";
@@ -65,7 +66,13 @@ export default function DatasetDetailPage() {
           <button onClick={() => navigate("/datasets")} type="button">Back</button>
           {data.status === "pending_approval" && (
             <>
-              <button onClick={() => void act("reject")} disabled={busy} type="button">Reject</button>
+              <ConfirmButton
+                label="Reject"
+                confirmLabel="Reject this version"
+                consequence="It can never be used for research or trading."
+                disabled={busy}
+                onConfirm={() => act("reject")}
+              />
               <button className="primary" onClick={() => void act("approve")} disabled={busy} type="button">
                 Approve for research
               </button>

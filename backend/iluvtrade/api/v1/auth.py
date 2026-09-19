@@ -5,7 +5,12 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy.orm import Session as DbSession
 
-from iluvtrade.api.deps import SESSION_COOKIE, current_principal, db_session
+from iluvtrade.api.deps import (
+    SESSION_COOKIE,
+    current_principal,
+    db_session,
+    rate_limit_anonymous,
+)
 from iluvtrade.api.v1.schemas import (
     LoginRequest,
     RegisterRequest,
@@ -55,7 +60,12 @@ def _set_cookie(response: Response, token: str) -> None:
     )
 
 
-@router.post("/register", response_model=SessionResponse, status_code=201)
+@router.post(
+    "/register",
+    response_model=SessionResponse,
+    status_code=201,
+    dependencies=[Depends(rate_limit_anonymous("register"))],
+)
 def register(
     payload: RegisterRequest,
     request: Request,
@@ -87,7 +97,11 @@ def register(
     )
 
 
-@router.post("/login", response_model=SessionResponse)
+@router.post(
+    "/login",
+    response_model=SessionResponse,
+    dependencies=[Depends(rate_limit_anonymous("login"))],
+)
 def login(
     payload: LoginRequest,
     request: Request,

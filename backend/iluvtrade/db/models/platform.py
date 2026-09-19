@@ -139,15 +139,39 @@ class Session(Base, IdMixin, TimestampMixin):
 
 
 class AuditEvent(Base, IdMixin, OrgScopedMixin):
-    """An append-only record of something that happened.
+    """An append-only, tamper-evident record of something that happened.
 
     Written by :func:`iluvtrade.platform.audit.record` and never updated or
     deleted by application code. ``payload`` is redacted at the writer, not here:
     nothing that could carry a credential is handed to this table.
+
+    **The chain.** Each event carries ``sequence`` (per organization, starting
+    at 1), ``previous_hash`` and ``event_hash``, where the hash covers the
+    event's own content *and* its predecessor's hash. Altering a payload,
+    deleting an event or reordering two of them all break verification, because
+    every later hash depends on every earlier one.
+
+    The chain is **per organization**, not global. A global chain would mean one
+    tenant's writes interleave into another's verification, so verifying tenant
+    A would require reading tenant B's events — which is exactly the coupling
+    the rest of the schema is built to avoid.
+
+    What this is not: proof against an attacker who can rewrite the whole table.
+    Someone with write access can recompute the entire chain. It detects
+    *tampering with individual rows*, which is the realistic case — a bad
+    ``UPDATE``, a partial restore, a deletion to hide one action. See
+    ``docs/SECURITY.md``.
     """
 
     __tablename__ = "audit_events"
-    __table_args__ = (Index("ix_audit_org_created", "organization_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_audit_org_created", "organization_id", "created_at"),
+        # The chain is read in sequence order constantly; and the uniqueness is
+        # what makes "no two events claim the same position" a database fact
+        # rather than something the writer is trusted to maintain.
+        UniqueConstraint("organization_id", "sequence", name="uq_audit_sequence"),
+        Index("ix_audit_org_sequence", "organization_id", "sequence"),
+    )
 
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
     actor_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
@@ -157,6 +181,14 @@ class AuditEvent(Base, IdMixin, OrgScopedMixin):
     outcome: Mapped[str] = mapped_column(String(16), nullable=False, default="success")
     ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+    #: Position in this organization's chain, from 1.
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The predecessor's ``event_hash``; the genesis constant for the first.
+    previous_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: SHA-256 over the canonical serialization of this event plus
+    #: ``previous_hash``.
+    event_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
 
 
 class NotificationSeverity(enum.StrEnum):

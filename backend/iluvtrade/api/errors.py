@@ -24,6 +24,7 @@ from iluvtrade.brokers.crypto import CredentialError
 from iluvtrade.brokers.service import BrokerError
 from iluvtrade.data.ingest import IngestError
 from iluvtrade.platform.accounts import AuthError, RegistrationError
+from iluvtrade.platform.ratelimit import RateLimitError
 from iluvtrade.platform.security import WeakPasswordError
 from iluvtrade.platform.tenancy import NotFoundError, TenancyError
 from iluvtrade.reddesk.entitlements import EntitlementError
@@ -85,6 +86,27 @@ def install(app: FastAPI) -> None:
             return handler
 
         app.add_exception_handler(exception_type, _make())
+
+    @app.exception_handler(RateLimitError)
+    async def _rate_limited(_request: Request, exc: RateLimitError) -> JSONResponse:
+        """429 with ``Retry-After``.
+
+        The header is the point: a client that backs off correctly needs to be
+        told how long, and a bare 429 invites an immediate retry loop.
+        """
+
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={
+                "error": {
+                    "code": "RateLimited",
+                    "message": str(exc),
+                    "policy": exc.policy,
+                    "retry_after_seconds": exc.retry_after_seconds,
+                }
+            },
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception(_request: Request, exc: StarletteHTTPException) -> JSONResponse:

@@ -63,6 +63,21 @@ class Settings(BaseSettings):
     #: control nobody can adjust gets disabled wholesale instead.
     fetch_allowed_ports: tuple[int, ...] = (80, 443, 8000, 8080, 8443)
 
+    #: Whether the application creates tables at startup.
+    #:
+    #: ``create_all`` is right for development and tests and **wrong** for
+    #: anything holding data: it creates what is missing and silently ignores
+    #: what has drifted, so a column added to a model never reaches an existing
+    #: database and the mismatch surfaces as a query error later. Production
+    #: runs ``alembic upgrade head`` instead, and this is forced off there.
+    auto_create_tables: bool = True
+
+    # --- rate limiting -----------------------------------------------------
+    #: On by default. A deployment turns it off only deliberately; the test
+    #: suite turns it off per-test so unrelated tests are not throttled, and the
+    #: rate-limit tests turn it back on explicitly.
+    rate_limit_enabled: bool = True
+
     # --- jobs ------------------------------------------------------------
     backtest_worker_count: int = 2
     backtest_timeout_seconds: float = 300.0
@@ -86,6 +101,18 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment.lower() in {"production", "prod"}
+
+    @property
+    def should_create_tables(self) -> bool:
+        """Never in production, whatever the setting says.
+
+        A deployment that set this by accident would get a schema created
+        around whatever the models happen to say, bypassing the migration
+        history entirely — which is how a production database ends up in a
+        state no revision describes.
+        """
+
+        return self.auto_create_tables and not self.is_production
 
 
 @lru_cache(maxsize=1)

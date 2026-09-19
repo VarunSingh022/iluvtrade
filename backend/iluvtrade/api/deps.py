@@ -8,6 +8,7 @@ coherent, so it is stated here rather than left implicit.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from typing import Any
 
 from fastapi import Cookie, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session as DbSession
@@ -15,11 +16,15 @@ from sqlalchemy.orm import Session as DbSession
 from iluvtrade.db.models.platform import Role
 from iluvtrade.db.session import get_session_factory
 from iluvtrade.platform.accounts import AuthError, Principal, resolve_principal
+from iluvtrade.platform.ratelimit import POLICIES, get_limiter
 
 __all__ = [
     "SESSION_COOKIE",
+    "client_identity",
     "current_principal",
     "db_session",
+    "rate_limit",
+    "rate_limit_anonymous",
     "require_admin",
     "require_trader",
 ]
@@ -98,3 +103,61 @@ def _require(principal: Principal, role: Role) -> None:
         principal.require(role)
     except PermissionError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+
+def client_identity(request: Request) -> str:
+    """A best-effort identity for an *unauthenticated* caller.
+
+    Prefers ``X-Forwarded-For``'s first entry, because this runs behind a proxy
+    in any real deployment and ``request.client`` would otherwise be the proxy —
+    making every anonymous caller share one bucket.
+
+    A forwarded header is client-controlled and therefore spoofable. That is
+    accepted here because the alternative is worse: without it, one proxy IP
+    means one shared login budget for every user, and a single attacker
+    exhausts it for everybody. The header is only ever a rate-limit key, never
+    an authorization input. A deployment that needs this to be trustworthy
+    configures its proxy to overwrite rather than append the header.
+    """
+
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    return request.client.host if request.client else "unknown"
+
+
+def rate_limit(policy_name: str) -> Any:
+    """A dependency limiting an *authenticated* caller, keyed by user.
+
+    Keyed by user rather than organization so one member cannot exhaust a
+    colleague's budget, and not by IP so a shared office network is not one
+    bucket.
+    """
+
+    policy = POLICIES[policy_name]
+
+    def dependency(principal: Principal = Depends(current_principal)) -> Principal:
+        get_limiter().check(policy, principal.user_id)
+        return principal
+
+    return dependency
+
+
+def rate_limit_anonymous(policy_name: str) -> Any:
+    """A dependency limiting an *unauthenticated* caller, keyed by address.
+
+    Used on login and registration, where there is no principal yet — which is
+    exactly where credential guessing happens.
+    """
+
+    policy = POLICIES[policy_name]
+
+    def dependency(request: Request) -> None:
+        get_limiter().check(policy, client_identity(request))
+
+    return dependency

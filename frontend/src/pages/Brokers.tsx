@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { ConfirmButton } from "../components/Confirm";
 import { Badge, Banner, Card, ErrorBanner, Field, Loading, StatusBadge } from "../components/ui";
 import { ApiError, api } from "../lib/api";
 import type { BrokerConnection, SupportedBroker } from "../lib/api";
@@ -47,6 +48,9 @@ export default function BrokersPage() {
   }
 
   async function authorize(account: BrokerConnection) {
+    // The ``request_token`` is single-use and expires in minutes; Zerodha
+    // delivers it in a redirect query string by design. It is not the access
+    // token, which is exchanged server-side and never reaches the browser.
     const token = window.prompt("Paste the request_token from Zerodha's redirect:");
     if (!token) return;
     setBusy(true);
@@ -159,7 +163,13 @@ export default function BrokersPage() {
                           </>
                         )}
                         {account.state === "connected" && account.broker !== "paper" && (
-                          <button className="small" disabled={busy} onClick={() => void disconnect(account)} type="button">Disconnect</button>
+                          <ConfirmButton
+                            label="Disconnect"
+                            confirmLabel="Disconnect and destroy credential"
+                            consequence="The stored access token is deleted and cannot be recovered."
+                            disabled={busy}
+                            onConfirm={() => disconnect(account)}
+                          />
                         )}
                       </div>
                     </td>

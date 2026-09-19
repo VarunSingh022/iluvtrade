@@ -151,6 +151,24 @@ read-then-write: the API launches a runner on `/start` and a caller may also
 drive a session synchronously, and two runners over one session interleave their
 projections into a book that matches neither run.
 
+## Cross-cutting request concerns
+
+Applied as dependencies rather than middleware, so each is visible on the route
+that needs it and absent from the ones that do not:
+
+| Concern | Where | Coverage |
+|---|---|---|
+| Authentication | `deps.current_principal` | all 67 routes but health, register, login |
+| Authorization | `deps.require_trader` / `require_admin` | per route |
+| Tenancy | `tenancy.scoped` / `require_owned` | every tenant-scoped read |
+| CSRF | `deps.current_principal` | all 33 mutating routes |
+| Rate limiting | `deps.rate_limit` / `rate_limit_anonymous` | login, register, ingest, fetch, backtest, broker auth, marketplace, session |
+| Error shape | `api.errors` | every exception, including framework-raised ones |
+
+Each is asserted **against the whole route table** rather than a sample, in
+`tests/security/test_api_contract.py`. A route added later is covered without
+anyone remembering to extend the tests.
+
 ## Persistence
 
 | Store | Holds | Why |
@@ -165,6 +183,9 @@ hole that looks like working code. Postgres for anything beyond one machine.
 `UtcDateTime` normalises every timestamp at the column boundary, because SQLite
 has no timezone-aware storage and a naive value read back is the first thing to
 break a comparison against `utcnow()`.
+
+**Alembic owns the schema**; `create_all` is a development convenience and is
+forced off in production. See `DEPLOYMENT.md`.
 
 ## Versioned identity
 

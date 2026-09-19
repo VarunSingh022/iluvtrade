@@ -13,7 +13,9 @@ Postgres database and a persistent volume.
 | `ILUVTRADE_ENVIRONMENT=production` | Turns on `Secure` cookies and HSTS, turns off dev CORS. |
 | Postgres instead of SQLite | SQLite serialises writers; the worker pool and the API contend. |
 | A reverse proxy terminating TLS | The app sets HSTS but does not terminate TLS itself. |
-| Rate limiting at the proxy | Nothing in the app throttles login attempts. |
+| A shared rate-limit store, or a single worker | The application limiter is per-process, so N workers means N x the limit. |
+| Rate limiting at the proxy too | The application limits per principal; the proxy should limit per address. |
+| `alembic upgrade head` before every start | The schema is the migrations', and production will not create tables. |
 | A backup of the storage root | Canonical datasets and run artifacts are files, and losing them makes every run unreproducible. |
 
 ## Configuration
@@ -48,13 +50,46 @@ certificate. Behind a proxy, forward `X-Forwarded-*` and run uvicorn with
 
 ## Schema
 
-`create_all()` runs at startup and is right for development and small
-deployments. For anything where data matters, generate a migration with Alembic
-(`backend/migrations/` is scaffolded) and disable `create_tables`:
+**Alembic owns the schema.** Run migrations before starting the application:
 
-```python
-app = create_app(create_tables=False)
+```bash
+cd backend && ./.venv/bin/alembic upgrade head
 ```
+
+`create_all()` still runs at startup in development, because iterating on models
+without a migration for every change is the point of development. It is
+**forced off in production** by `Settings.should_create_tables` regardless of
+configuration — a production database whose schema was created from whatever the
+models happened to say is one no revision describes.
+
+Revisions:
+
+| Revision | What |
+|---|---|
+| `0001_baseline` | the schema as of the first commit |
+| `0002_audit_chain` | adds the audit hash chain and **backfills existing rows** |
+
+Bringing an existing pre-migration database forward:
+
+```bash
+./.venv/bin/alembic stamp 0001_baseline   # it already has this schema
+./.venv/bin/alembic upgrade head          # applies the chain and backfills
+```
+
+Both paths — fresh and upgrade — are covered by
+`tests/integration/test_migrations.py`, including a downgrade. `alembic check`
+asserts the models have not drifted from the migrations, which is the failure
+that otherwise surfaces only after deployment.
+
+### After changing a model
+
+```bash
+./.venv/bin/alembic revision --autogenerate -m "what changed"
+```
+
+Read the generated file before committing it. Autogenerate does not detect
+renames (it emits a drop and an add, which loses data) and does not know when a
+column needs a backfill.
 
 ## Scaling, and its limits
 

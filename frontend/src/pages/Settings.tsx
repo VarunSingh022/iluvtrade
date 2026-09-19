@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { ConfirmButton } from "../components/Confirm";
 import { Banner, Card, ErrorBanner, Field, Loading } from "../components/ui";
 import { ApiError, api, health } from "../lib/api";
 import type { HealthResponse, Notification, User } from "../lib/api";
@@ -72,13 +73,24 @@ export default function SettingsPage() {
               {user.live_trading_enabled ? "enabled" : "disabled"}
             </span>
           </div>
-          <button
-            disabled={busy}
-            onClick={() => void save({ live_trading_enabled: !user.live_trading_enabled })}
-            type="button"
-          >
-            {user.live_trading_enabled ? "Disable on my account" : "Enable on my account"}
-          </button>
+          {user.live_trading_enabled ? (
+            <button
+              disabled={busy}
+              onClick={() => void save({ live_trading_enabled: false })}
+              type="button"
+            >
+              Disable on my account
+            </button>
+          ) : (
+            <ConfirmButton
+              label="Enable on my account"
+              confirmLabel="Enable live trading for my account"
+              consequence="This is one of three gates. With all three open, orders reach a real venue."
+              tone="default"
+              disabled={busy}
+              onConfirm={() => save({ live_trading_enabled: true })}
+            />
+          )}
           {!status.data?.live_trading_enabled && (
             <p className="tiny faint" style={{ marginTop: "0.5rem", marginBottom: 0 }}>
               Even with this on, live sessions stay refused until an administrator enables live

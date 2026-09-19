@@ -33,7 +33,8 @@ parsing prose.
 | 404 | absent, **or another tenant's** — deliberately indistinguishable |
 | 409 | a conflict with immutable state, such as editing a published version |
 | 413 | upload too large |
-| 422 | the body did not validate |
+| 422 | the body did not validate; `error.fields` names the offending fields |
+| 429 | rate limited; carries `Retry-After` and `error.policy` |
 
 ## Endpoints
 
@@ -135,7 +136,16 @@ endpoint.
 | GET | `/positions` · `/orders` | across sessions, tagged with mode |
 | GET | `/dashboard` | |
 | GET | `/notifications` · POST `/notifications/read-all` | |
-| GET | `/audit` | admin only |
+| GET | `/audit` | admin only; each event carries its chain fields |
+| GET | `/audit/verify` | admin only; recomputes the chain and reports every break |
+
+## Rate limits
+
+Login, registration, ingestion, fetching, backtest submission, broker token
+exchange, marketplace writes and session starts are rate limited. A refusal is
+`429` in the same envelope, with `error.policy`, `error.retry_after_seconds` and
+a `Retry-After` header. Limits count failed calls too. See `SECURITY.md` for the
+table.
 
 ## Conventions
 

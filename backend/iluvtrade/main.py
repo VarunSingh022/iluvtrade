@@ -77,8 +77,17 @@ def create_app(*, start_workers: bool = True, create_tables: bool = True) -> Fas
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        if create_tables:
+        if create_tables and settings.should_create_tables:
             create_all()
+            logger.info("Created any missing tables (development mode).")
+        elif create_tables:
+            # Reached when a production deployment left ``create_tables`` on.
+            # Saying so is better than silently doing nothing: the operator
+            # needs to know the schema is the migrations' responsibility.
+            logger.info(
+                "Skipping table creation: this is a production environment, where the "
+                "schema is owned by Alembic. Run 'alembic upgrade head' before starting."
+            )
         if start_workers:
             pool.start()
         logger.info(

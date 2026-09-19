@@ -28,7 +28,7 @@ from iluvtrade.db.models.trading import (
     SessionStatus,
     TradingSession,
 )
-from iluvtrade.platform import notifications
+from iluvtrade.platform import audit, notifications
 from iluvtrade.platform.accounts import Principal
 from iluvtrade.platform.tenancy import scoped
 
@@ -237,6 +237,21 @@ def read_all(
     }
 
 
+@router.get("/audit/verify")
+def verify_audit_chain(
+    session: DbSession = Depends(db_session),
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    """Recompute this organization's audit chain and report any break.
+
+    ADMIN only, like the trail itself. Scoped to the caller's organization —
+    the chain is per-tenant, so verifying it never reads another tenant's rows.
+    """
+
+    principal.require(Role.ADMIN)
+    return audit.verify_chain(session, principal.organization_id).to_dict()
+
+
 @router.get("/audit", response_model=list[AuditEventResponse])
 def audit_log(
     limit: int = 100,
@@ -261,6 +276,9 @@ def audit_log(
             resource_id=row.resource_id,
             outcome=row.outcome,
             payload=json.loads(row.payload_json or "{}"),
+            sequence=row.sequence,
+            previous_hash=row.previous_hash,
+            event_hash=row.event_hash,
         )
         for row in rows
     ]

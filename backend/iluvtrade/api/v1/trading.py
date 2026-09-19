@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DbSession
 
-from iluvtrade.api.deps import current_principal, db_session, require_trader
+from iluvtrade.api.deps import current_principal, db_session, rate_limit, require_trader
 from iluvtrade.api.v1.schemas import (
     CreateSessionRequest,
     KillSwitchRequest,
@@ -86,7 +86,12 @@ def list_sessions(
     return [_session(row) for row in sessions.list_sessions(session, principal, mode=parsed)]
 
 
-@router.post("/sessions", response_model=TradingSessionResponse, status_code=201)
+@router.post(
+    "/sessions",
+    response_model=TradingSessionResponse,
+    status_code=201,
+    dependencies=[Depends(rate_limit("session"))],
+)
 def create_session(
     payload: CreateSessionRequest,
     session: DbSession = Depends(db_session),
@@ -123,7 +128,11 @@ def get_session(
     return _session(sessions.get(session, principal, session_id))
 
 
-@router.post("/sessions/{session_id}/start", response_model=TradingSessionResponse)
+@router.post(
+    "/sessions/{session_id}/start",
+    response_model=TradingSessionResponse,
+    dependencies=[Depends(rate_limit("session"))],
+)
 def start(
     session_id: str,
     session: DbSession = Depends(db_session),

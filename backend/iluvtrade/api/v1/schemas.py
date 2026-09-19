@@ -392,6 +392,11 @@ class AuditEventResponse(BaseModel):
     resource_id: str | None
     outcome: str
     payload: dict[str, Any]
+    #: Chain position and links, exposed so a reader can verify independently
+    #: rather than having to trust the server's own verification endpoint.
+    sequence: int
+    previous_hash: str
+    event_hash: str
 
 
 class UpdateSettingsRequest(Strict):

@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session as DbSession
 
-from iluvtrade.api.deps import current_principal, db_session, require_trader
+from iluvtrade.api.deps import current_principal, db_session, rate_limit, require_trader
 from iluvtrade.api.v1.schemas import (
     BacktestJobResponse,
     BacktestResultResponse,
@@ -36,7 +36,12 @@ def _job(job: BacktestJob, *, deduplicated: bool = False) -> BacktestJobResponse
     )
 
 
-@router.post("", response_model=BacktestJobResponse, status_code=202)
+@router.post(
+    "",
+    response_model=BacktestJobResponse,
+    status_code=202,
+    dependencies=[Depends(rate_limit("backtest"))],
+)
 def submit(
     payload: SubmitBacktestRequest,
     session: DbSession = Depends(db_session),

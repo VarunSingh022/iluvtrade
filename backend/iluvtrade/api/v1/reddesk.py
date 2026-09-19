@@ -5,7 +5,13 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session as DbSession
 
-from iluvtrade.api.deps import current_principal, db_session, require_admin, require_trader
+from iluvtrade.api.deps import (
+    current_principal,
+    db_session,
+    rate_limit,
+    require_admin,
+    require_trader,
+)
 from iluvtrade.api.v1.schemas import (
     CreateListingRequest,
     EntitlementResponse,
@@ -77,7 +83,7 @@ def my_listings(
     return [marketplace.summarise(session, row) for row in rows]
 
 
-@router.post("/listings", status_code=201)
+@router.post("/listings", status_code=201, dependencies=[Depends(rate_limit("marketplace"))])
 def create_listing(
     payload: CreateListingRequest,
     session: DbSession = Depends(db_session),
@@ -188,7 +194,7 @@ def withdraw(
     )
 
 
-@router.post("/purchases", status_code=201)
+@router.post("/purchases", status_code=201, dependencies=[Depends(rate_limit("marketplace"))])
 def purchase(
     payload: PurchaseRequest,
     session: DbSession = Depends(db_session),

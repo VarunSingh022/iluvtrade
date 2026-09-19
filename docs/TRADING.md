@@ -28,10 +28,20 @@ book — asserted in `tests/integration/test_workflow.py`.
 honours stop/pause/kill between records, projects the engine's state every 25
 records and on every fill, and logs every refusal.
 
-**Live sessions do not run.** Three gates refuse creation, and the paper runner
-refuses a live session outright rather than executing it against the simulator —
-which would produce simulated fills labelled as live, the worst possible failure
-mode.
+**Live sessions do not run**, and the reason is structural rather than a check
+that could be forgotten: `ExecutionMode.LIVE` is **never constructed anywhere in
+this repository**, and `routing=` is never assigned. AlphaLab derives routing
+from the mode — `LIVE` routes `EXTERNAL`, every other mode routes `SIMULATED` —
+and `RunConfig` forces the pipeline's routing to agree with its own mode. So no
+run this application configures can reach a venue, whatever a request contains.
+`tests/security/test_live_trading_gates.py` asserts both absences against the
+source.
+
+On top of that: three gates refuse creation, a fourth refuses a paper broker
+backing a live session, no route accepts or mutates `mode`, and the paper runner
+refuses a `LIVE` row outright rather than executing it against the simulator —
+which would produce simulated fills labelled as live, the worst available
+failure.
 
 ## The live gap, precisely
 

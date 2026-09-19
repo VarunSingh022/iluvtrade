@@ -11,7 +11,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session as DbSession
 
-from iluvtrade.api.deps import current_principal, db_session, require_trader
+from iluvtrade.api.deps import current_principal, db_session, rate_limit, require_trader
 from iluvtrade.api.v1.schemas import AuthorizeZerodhaRequest, CreateBrokerAccountRequest
 from iluvtrade.brokers import service
 from iluvtrade.brokers.zerodha import VERIFIED_AGAINST_LIVE_VENUE
@@ -76,7 +76,10 @@ def create_account(
     return service.view(account, account.connection).to_dict()
 
 
-@router.post("/{account_id}/zerodha/login-url")
+@router.post(
+    "/{account_id}/zerodha/login-url",
+    dependencies=[Depends(rate_limit("broker_auth"))],
+)
 def zerodha_login_url(
     account_id: str,
     session: DbSession = Depends(db_session),
@@ -91,7 +94,10 @@ def zerodha_login_url(
     return {"login_url": service.begin_zerodha_authorization(session, principal, account_id)}
 
 
-@router.post("/{account_id}/zerodha/authorize")
+@router.post(
+    "/{account_id}/zerodha/authorize",
+    dependencies=[Depends(rate_limit("broker_auth"))],
+)
 def authorize_zerodha(
     account_id: str,
     payload: AuthorizeZerodhaRequest,

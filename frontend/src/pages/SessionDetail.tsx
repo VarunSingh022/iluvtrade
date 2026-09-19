@@ -42,7 +42,13 @@ export default function SessionDetailPage() {
   }
 
   async function kill() {
-    const reason = window.prompt("Why is this session being halted? The reason is recorded.");
+    // The prompt doubles as the confirmation: cancelling it aborts, and a
+    // reason is required rather than optional, because a halted session is
+    // terminal and the operator's reason is what the next person reads.
+    const reason = window.prompt(
+      "Halting is permanent — this session cannot be resumed.\n\n" +
+        "Why is it being halted? The reason is recorded and audited.",
+    );
     if (!reason) return;
     setBusy(true);
     try {

@@ -15,7 +15,8 @@
     "isolatedModules": true,
     "noEmit": true,
     "allowImportingTsExtensions": false,
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    "types": ["vitest/globals", "@testing-library/jest-dom"]
   },
   "include": ["src"]
 }

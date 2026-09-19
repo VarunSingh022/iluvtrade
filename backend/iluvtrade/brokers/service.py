@@ -184,6 +184,15 @@ def begin_zerodha_authorization(session: DbSession, principal: Principal, accoun
     """
 
     principal.require(Role.TRADER)
+    # Ownership is resolved *before* anything else is checked. Reversing these
+    # two lets a caller probing another tenant's account id learn something —
+    # here, whether this deployment has Zerodha credentials configured — from a
+    # resource they have no right to address. Every refusal for a foreign id
+    # must be the same "not found".
+    account = require_owned(session, BrokerAccount, account_id, principal.organization_id)
+    if account.broker is not BrokerKind.ZERODHA:
+        raise BrokerError("That account is not a Zerodha account.")
+
     settings = get_settings()
     if not settings.zerodha_api_key or not settings.zerodha_api_secret:
         raise BrokerError(
@@ -191,9 +200,6 @@ def begin_zerodha_authorization(session: DbSession, principal: Principal, accoun
             "must set ILUVTRADE_ZERODHA_API_KEY and ILUVTRADE_ZERODHA_API_SECRET, which "
             "requires a Kite Connect subscription and a registered app."
         )
-    account = require_owned(session, BrokerAccount, account_id, principal.organization_id)
-    if account.broker is not BrokerKind.ZERODHA:
-        raise BrokerError("That account is not a Zerodha account.")
 
     connection = account.connection
     if connection is not None:
@@ -224,12 +230,14 @@ def authorize_zerodha(
     """
 
     principal.require(Role.TRADER)
+    # Ownership first, for the reason given in begin_zerodha_authorization.
+    account = require_owned(session, BrokerAccount, account_id, principal.organization_id)
+    connection = account.connection
+
     settings = get_settings()
     if not settings.zerodha_api_key or not settings.zerodha_api_secret:
         raise BrokerError("This deployment has no Zerodha API credentials configured.")
 
-    account = require_owned(session, BrokerAccount, account_id, principal.organization_id)
-    connection = account.connection
     if connection is None:
         raise BrokerError("That account has no connection record.")
     if connection.authorization_attempts >= MAX_AUTHORIZATION_ATTEMPTS:

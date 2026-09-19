@@ -55,10 +55,54 @@ The strongest control in the application, and the one most carefully enforced.
 `tests/security/test_broker_secrets.py` checks every broker endpoint's response
 body for credential markers, and asserts the crypto properties directly.
 
-**Not implemented: key rotation.** Changing `ILUVTRADE_SECRET_KEY` invalidates
-every session and every stored broker credential. A real rotation needs
-versioned key material, a re-encryption pass and a window where both keys
-decrypt. It is not built and is not pretended to be.
+### Key versioning
+
+Every credential envelope is `version(1) || key_id(8) || nonce(12) ||
+ciphertext`, and the header is authenticated as GCM additional data alongside
+the connection id — so neither the version nor the key id can be altered without
+the decryption failing.
+
+The key id is a truncated SHA-256 of the *derived* key: it says which key sealed
+a blob without revealing anything about that key.
+
+This is **not rotation**. Nothing re-encrypts anything, and changing
+`ILUVTRADE_SECRET_KEY` still invalidates every stored credential — but the
+stored blobs are now self-describing, which is the thing rotation cannot be
+added without. Adding the header later would have required a migration over
+every credential, guessing which key each one used.
+
+A blob sealed under a different key now fails with a *specific* message naming
+that as the cause, rather than a generic decryption failure.
+
+**Still not implemented: rotation itself.** It needs a second active key, a
+re-encryption pass, and a window in which both keys decrypt.
+
+## Rate limiting
+
+Per-**principal**, not per-IP. A proxy limits by address and is the right place
+for volumetric abuse; it cannot tell two users behind one office NAT apart,
+which is exactly the case where an account-level limit matters. Both belong in
+a real deployment; neither replaces the other.
+
+| Policy | Limit | Guards against |
+|---|---|---|
+| `login` | 10 / minute / address | credential guessing |
+| `register` | 5 / hour / address | account-farming |
+| `ingest` | 30 / minute / user | CPU and disk exhaustion |
+| `fetch` | 10 / minute / user | using the server as an outbound proxy |
+| `backtest` | 60 / minute / user | occupying every worker |
+| `broker_auth` | 10 / 5 minutes / user | tripping the venue's own limits |
+| `marketplace` | 60 / minute / user | durable-record spam |
+| `session` | 30 / minute / user | thread exhaustion |
+
+A refusal is `429` with `Retry-After`, in the same error envelope as everything
+else. The count includes *failed* calls: a policy that only counted successes
+would not stop abuse.
+
+**The limiter is in-process.** Two API workers each enforce the limit
+separately, so the effective limit is `limit x workers`. That is stated rather
+than hidden. `RateLimitBackend` is the seam a Redis implementation plugs into;
+for a single-node deployment the limits are exact.
 
 ## Data ingestion
 
@@ -73,11 +117,22 @@ layered:
 | Host allowlist, empty by default | everything, until an administrator names a host |
 | Port allowlist | an allowlisted host being used to reach SSH or a database on it |
 | **DNS-resolution address check** | a public hostname resolving to `169.254.169.254`, `10.0.0.0/8`, loopback, link-local |
+| **Explicit CIDR deny-list** | ranges the stdlib misses — see below |
+| IPv4-mapped IPv6 unwrapping | `::ffff:169.254.169.254` reaching the metadata service |
+| Userinfo refusal | `https://data.example.com@evil.example.com/`, which points at *evil* |
 | Manual redirects, every hop re-validated | the classic bypass: an allowed host redirecting to the metadata service |
 | Streamed size ceiling | a lying `Content-Length` |
 | Decompression ceiling | a zip bomb |
 | Content-type check | importing a login page as if it were data |
 | Timeout | a hanging socket |
+
+The deny-list is not belt-and-braces; it is load-bearing. Python's
+`ipaddress.is_private` **does not** cover `100.64.0.0/10` (RFC 6598
+carrier-grade NAT — routable-looking, and real internal infrastructure at many
+ISPs and clouds) or `192.88.99.0/24` on Python 3.12, and what it covers changes
+between versions. Relying on the flags alone would mean the set of addresses
+this application connects to silently changes with an interpreter upgrade. Both
+gaps were found by a test and both are now explicitly denied.
 
 ### Uploads
 
@@ -100,6 +155,47 @@ while providing none, so the feature that would need it does not exist.
 
 To support seller code, that boundary has to come first. It is the single
 largest piece of deferred work in this repository.
+
+## Audit tamper-evidence
+
+Each event is hashed over its own canonical form and its predecessor's hash:
+
+```
+event_hash = SHA-256( canonical(event) || previous_hash )
+```
+
+Serialization is canonical — fixed field order, sorted keys, explicit nulls,
+timestamps as integer microseconds — so the same event hashes identically on any
+machine and survives a database round-trip with different sub-second precision.
+
+The chain is **per organization**. A global chain would require reading one
+tenant's events to verify another's, which is the coupling the rest of the
+schema exists to avoid.
+
+`(organization_id, sequence)` is unique, so two events cannot claim one position
+— not even transiently. `GET /api/v1/audit/verify` recomputes a chain and
+reports every break, and each audit response carries its own `sequence`,
+`previous_hash` and `event_hash` so a reader can verify independently rather
+than trusting the server's own check.
+
+### What it detects
+
+An altered payload, action or outcome; a deleted event; two events reordered;
+an inserted event; a hash that does not match its content; a hash recomputed for
+one event without recomputing every later one.
+
+### What it does not
+
+**This is not a WORM store and is not equivalent to one.** An attacker with
+write access to the table can recompute the entire chain and leave it
+consistent. Nothing self-contained can prevent that — it needs the head
+published somewhere the attacker does not control: an external append-only
+store, a transparency log, or a periodic signed anchor. None of those exists
+here.
+
+A chain **backfilled by migration** proves even less about the period before the
+backfill: it hashes the rows as they stood at migration time. The migration says
+so in its output rather than leaving it to be discovered.
 
 ## Application hardening
 
@@ -135,14 +231,15 @@ largest piece of deferred work in this repository.
 | Gap | What it needs |
 |---|---|
 | **Sandboxed strategy execution** | container or gVisor isolation, resource limits, an import allowlist. The largest single piece of deferred work. |
-| **Secret rotation** | versioned key material and a re-encryption pass |
-| **Rate limiting** | nothing throttles login or API calls; a reverse proxy or a middleware with a shared store |
+| **Secret rotation** | a second active key and a re-encryption pass. Envelopes already carry a key id, so this no longer needs a migration first |
+| **Shared rate-limit state** | the limiter is per-process; a Redis backend behind `RateLimitBackend` would make limits exact across workers |
 | **MFA** | no second factor on any account |
 | **Email verification and password reset** | there is no email channel at all |
 | **Webhook signature verification** | no webhooks exist yet; a payment provider will need HMAC verification and replay protection |
-| **Audit log tamper-evidence** | the trail is append-only by convention, not by hash chaining or an append-only store |
+| **External audit anchoring** | the hash chain detects row-level tampering but not a full rewrite; anchoring the head externally is what would |
 | **Dependency scanning in CI** | no automated CVE checking |
 | **Penetration testing** | none has been performed |
+| **Load testing** | none has been performed |
 
 ## Reporting
 
