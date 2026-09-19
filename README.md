@@ -163,7 +163,7 @@ Stated plainly, because a trading platform that overstates itself is dangerous.
   secret key, `create_all` left on, a plaintext CORS origin or rate limiting
   disabled does not start. `iluvtrade check-config` reports the same assessment
   without starting anything.
-- **498 backend tests and 55 frontend tests.**
+- **501 backend tests and 55 frontend tests.**
 
 ### Real boundary, not yet run against the outside world
 
@@ -232,7 +232,7 @@ cd backend
 ./.venv/bin/ruff check iluvtrade tests
 ./.venv/bin/ruff format --check iluvtrade tests
 ./.venv/bin/mypy
-PYTHONPATH=$PWD ./.venv/bin/python -m pytest -q          # 498 tests
+PYTHONPATH=$PWD ./.venv/bin/python -m pytest -q          # 501 tests
 ./.venv/bin/alembic check                                 # models vs migrations
 ./.venv/bin/python -m iluvtrade.cli check-config          # unsafe settings
 

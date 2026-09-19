@@ -962,6 +962,61 @@ def run_demo() -> int:
         print("     identical for both, and decided before the address is looked up")
         print("     a 202 that never arrives would be worse: the user would wait for nothing")
 
+        # -- brokers -----------------------------------------------------
+        _rule("BROKERS — connection state, and what is honestly unverified")
+
+        _step(42, "Which venues this deployment has a connector for")
+        for venue in check(buyer.get("/api/v1/brokers/supported"), 200, "supported brokers"):
+            # "verified" means the connector has been exercised against the
+            # thing it actually talks to. For paper that is AlphaLab's
+            # simulator, which is not a venue — saying "verified against the
+            # live venue" there would overstate it in the opposite direction.
+            verified = (
+                "exercised against its execution target"
+                if venue["verified_against_live_venue"]
+                else "NEVER RUN AGAINST THE REAL VENUE"
+            )
+            print(f"     {venue['broker']:9} {venue['name']:32} {verified}")
+        print("     the connector reports its own provenance, so the UI cannot imply")
+        print("     a proven integration where there is none")
+
+        _step(43, "Connect a paper broker account and read its state")
+        account = check(
+            buyer.post(
+                "/api/v1/brokers",
+                json={"broker": "paper", "label": "Demo paper account"},
+                headers=headers,
+            ),
+            201,
+            "create broker account",
+        )
+        print(
+            f"     account={account['account_id'][:8]}  broker={account['broker']}  "
+            f"state={account['state']}"
+        )
+        print(f"     credential hint: {account['credential_hint'] or 'none stored'}")
+        print(f"     verified against a live venue: {account['verified_against_live_venue']}")
+
+        _step(44, "No broker response carries a credential")
+        exposed = [
+            marker
+            for marker in ("access_token", "api_secret", "encrypted_credentials", "request_token")
+            if marker in buyer.get("/api/v1/brokers").text
+        ]
+        print(f"     credential-shaped fields in the broker listing: {exposed or 'none'}")
+        if exposed:
+            leaked.extend(exposed)
+
+        _step(45, "Disconnect, and the state says so")
+        disconnected = check(
+            buyer.post(f"/api/v1/brokers/{account['account_id']}/disconnect", headers=headers),
+            200,
+            "disconnect",
+        )
+        print(f"     state={disconnected['state']}  connected_at={disconnected['connected_at']}")
+        print("     a live Zerodha connection would need a Kite Connect subscription,")
+        print("     a registered app and a funded account — none of which exist here")
+
         _rule()
         print("\nEvery step above ran against the real application: real HTTP routes, real")
         print(f"services, real database, and AlphaLab {ALPHALAB_VERSION} computing every")

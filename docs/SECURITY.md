@@ -540,3 +540,63 @@ So the regression test watches the **SQL that actually reaches the database**
 and asserts the status change is one `UPDATE` whose `WHERE` carries the current
 status. It fails on the old implementation 5 times out of 5, and is not a race
 at all.
+
+---
+
+# Three packaging defects found by the pre-publication pass
+
+None is a vulnerability. All three are the same shape: **something worked only
+because the development environment already happened to be in the right
+state**, and no test could see it because every test ran in that environment.
+
+## 1. The package could not be installed
+
+`pyproject.toml` declared `readme = "../README.md"`. Hatchling refuses a readme
+outside the project directory, so `pip install -e ".[dev]"` — the command in
+`DEPLOYMENT.md`, in the Dockerfile and in CI — failed at metadata generation.
+
+Nothing noticed because `pytest` sets `pythonpath = ["."]` and every command
+was run from `backend/`, where the working directory is on `sys.path`. The
+package had never been installed; the `iluvtrade` console script declared in
+`[project.scripts]` did not exist.
+
+Fixed by removing the key. The evidence that it is fixed is a clean virtual
+environment: the install succeeds, the console script runs, `import iluvtrade`
+works from another directory, and the suite passes 501 there.
+
+## 2. `email-validator` was an undeclared dependency
+
+`EmailStr` raises `ImportError` — not a validation error — when
+`email-validator` is absent. Registration, login, invitations and password
+reset all carry an email field, so **every one of those endpoints would fail at
+request time** on a clean install.
+
+It was present in the development environment by accident. Installing into a
+clean one produced 153 errors from 498 tests.
+
+Fixed by declaring `pydantic[email]` rather than bare `pydantic`.
+
+This is the second undeclared dependency to ship (`pyotp` was the first), so
+there is now a structural guard: `tests/unit/test_dependency_declaration.py`
+walks every import in the package and fails on one that is not declared. It
+would have caught `pyotp`. It **cannot** catch this one — nothing here imports
+`email_validator`, pydantic does — and the test says so rather than implying
+otherwise. Only a clean-environment install reveals a transitive gap, which is
+what CI's `pip install -e ".[dev]"` on a fresh runner is for.
+
+## 3. `types-requests` was declared and never installed
+
+Nothing imports `requests`; mypy is clean without it. A dependency that is
+absent from every environment is one nobody would notice breaking. Removed.
+
+## Why this matters more than the defects themselves
+
+Every gate was green throughout. 498 tests, ruff, mypy, Alembic, the demo — all
+passing, in an environment where the application could not have been installed
+and would have failed on its first registration request.
+
+A test suite tells you the code is consistent with itself. It does not tell you
+the *package* is installable, and no amount of adding tests inside that
+environment would have. The two things that found these were building a wheel
+from only the paths the Dockerfile copies, and installing into an empty
+virtual environment.

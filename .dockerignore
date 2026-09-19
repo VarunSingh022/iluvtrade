@@ -1,0 +1,69 @@
+# What must NOT reach the Docker build context.
+#
+# This file is load-bearing, not hygiene. Without it two things go wrong, and
+# the second one breaks the build:
+#
+# 1. The context is ~366 MB — .git, backend/.venv, frontend/node_modules, the
+#    developer's var/*.db files and .env — all uploaded to the daemon on every
+#    build, and .env is a secret that has no business being in a build context.
+#
+# 2. `COPY frontend/ ./` runs *after* `npm ci`, so the host's node_modules
+#    overwrites the one just installed. On a macOS host that means
+#    @esbuild/darwin-arm64 and @rollup/rollup-darwin-arm64 land in a linux
+#    image. The layer-caching intent — dependencies first, sources second — is
+#    defeated at the same time.
+#
+# Note the asymmetry with .gitignore: deploy/wheels/*.whl is git-ignored and
+# must be *present* here, because the AlphaLab wheel is not on PyPI and the
+# image cannot be built without it.
+
+# --- secrets ----------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- the developer's own data ------------------------------------------------
+var/
+*.db
+*.db-wal
+*.db-shm
+
+# --- installed dependencies and build output --------------------------------
+**/node_modules
+**/.venv
+**/venv
+frontend/dist
+backend/build
+backend/dist
+**/*.egg-info
+
+# --- caches and bytecode -----------------------------------------------------
+**/__pycache__
+**/*.py[cod]
+**/.mypy_cache
+**/.pytest_cache
+**/.ruff_cache
+**/.coverage
+**/htmlcov
+**/*.tsbuildinfo
+
+# --- history and tooling -----------------------------------------------------
+.git
+.github
+.gitignore
+.claude
+
+# --- not needed at runtime ---------------------------------------------------
+# The image runs the application; it does not run the suite. Tests reach the
+# image through CI, which runs them before anything is built.
+backend/tests
+docs
+scripts
+README.md
+
+# --- editors / os ------------------------------------------------------------
+.DS_Store
+.idea
+.vscode

@@ -6,7 +6,16 @@ build-backend = "hatchling.build"
 name = "iluvtrade"
 version = "0.1.0"
 description = "iluvtrade.com — the application platform around AlphaLab, with the RedDesk strategy marketplace."
-readme = "../README.md"
+# No `readme` key. It used to be "../README.md", which hatchling refuses:
+# "Readme path must be within the project directory". That made
+# `pip install -e .` fail outright — so the package had never actually been
+# installed, and everything worked only because pytest puts the working
+# directory on sys.path and every command was run from `backend/`. The Docker
+# build's `pip install ./backend` would have failed the same way.
+#
+# The alternative is a second README inside backend/ duplicating the root one.
+# This package is proprietary and is not published to an index, so the long
+# description earns nothing; the root README is where the documentation lives.
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
 authors = [{ name = "Varun Kumar Singh" }]
@@ -17,7 +26,13 @@ dependencies = [
   "uvicorn[standard]>=0.32,<1",
   "sqlalchemy>=2.0,<3",
   "alembic>=1.14,<2",
-  "pydantic>=2.9,<3",
+  # The [email] extra, not bare pydantic. `EmailStr` raises ImportError without
+  # `email-validator`, so a fresh install per the documented instructions
+  # produced an application whose registration, login, invitation and
+  # password-reset endpoints all failed — every route with an email field. It
+  # happened to be present in the development environment, which is why nothing
+  # noticed until the package was installed into a clean one.
+  "pydantic[email]>=2.9,<3",
   "pydantic-settings>=2.6,<3",
   "python-multipart>=0.0.12",
   "argon2-cffi>=23.1,<26",
@@ -39,7 +54,9 @@ dev = [
   "pytest-cov>=6.0,<8",
   "mypy>=1.13,<2",
   "ruff>=0.8,<1",
-  "types-requests",
+  # No "types-requests": nothing imports `requests`, it was never installed,
+  # and mypy is clean without it. A declared dependency that is absent from
+  # every environment is one nobody would notice breaking.
 ]
 
 [project.scripts]

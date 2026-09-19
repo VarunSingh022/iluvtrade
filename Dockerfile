@@ -59,8 +59,11 @@ RUN test -f /tmp/wheels/alphalab-3.0.0-py3-none-any.whl \
 COPY backend/pyproject.toml backend/alembic.ini ./backend/
 COPY backend/iluvtrade/ ./backend/iluvtrade/
 COPY backend/migrations/ ./backend/migrations/
-# psycopg for PostgreSQL, which is what production should be pointed at.
-RUN pip install "psycopg[binary]>=3.2,<4" && pip install ./backend
+# One command, one source of truth: the PostgreSQL driver comes from the
+# package's own `postgres` extra rather than a version pinned separately here.
+# Two pins for one dependency drift apart, and the one in a Dockerfile nobody
+# has built drifts silently.
+RUN pip install "./backend[postgres]"
 
 COPY --from=frontend /build/dist/ ./frontend/dist/
 COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh

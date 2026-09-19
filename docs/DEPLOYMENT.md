@@ -173,8 +173,18 @@ not.
 
 ## Path 1 — local, and exercised
 
-Every step here was run, in this order, during the audit. The output quoted is
-what it produced.
+Every step here was run, in this order. The output quoted is what it produced.
+
+> **Corrected during the pre-publication pass.** An earlier version of this
+> page claimed this path had been exercised. The *server*, the *migrations* and
+> the *demo* had been — but always from the source tree, with the working
+> directory on `sys.path`. `pip install -e ".[dev]"` had never actually been
+> run, and it **failed**: `pyproject.toml` declared `readme = "../README.md"`,
+> which hatchling refuses because it is outside the project directory. The
+> package had therefore never been installed, and the `iluvtrade` console
+> script did not exist. Both are fixed, and the steps below were then run in a
+> clean virtual environment — including the full suite, which passes 501 there
+> as it does in the development environment.
 
 ### 1. Install
 
@@ -193,6 +203,17 @@ python3.12 -m venv .venv
 `pip install alphalab==3.0.0` fails with "No matching distribution found". This
 is the single most common way a fresh setup stalls, which is why it is stated
 before the step that needs it rather than after.
+
+Verify the install actually took, rather than assuming it did:
+
+```bash
+cd /tmp && .../backend/.venv/bin/python -c "import iluvtrade; print(iluvtrade.__file__)"
+.../backend/.venv/bin/iluvtrade check-config
+```
+
+Running from another directory is the point. Inside `backend/`, an import
+succeeds whether or not the package is installed, because the working directory
+is on the path — which is exactly how a broken install went unnoticed.
 
 ### 2. Configure
 
@@ -289,10 +310,29 @@ production; see `STATUS.md`.
 
 ## Path 2 — containers, written but never built
 
-`Dockerfile`, `docker-compose.yml` and `deploy/entrypoint.sh` exist. The
-entrypoint passes `sh -n`. **The image has never been built and the stack has
-never been started**, because Docker is not installed on the machine this was
-developed on. Treat it as a starting point that needs a first real build.
+`Dockerfile`, `docker-compose.yml`, `.dockerignore` and `deploy/entrypoint.sh`
+exist. The entrypoint passes `sh -n`. **The image has never been built and the
+stack has never been started**, because Docker is not installed on the machine
+this was developed on. Treat it as a starting point that needs a first real
+build.
+
+Static verification during the pre-publication pass found two defects in it,
+both now fixed:
+
+* **No `.dockerignore`.** The build context was ~366 MB — `.git`,
+  `backend/.venv`, `frontend/node_modules`, the developer's `var/*.db` files
+  and `.env`. Worse, `COPY frontend/ ./` runs *after* `npm ci`, so the host's
+  `node_modules` overwrote the one just installed: on a macOS host that puts
+  `@esbuild/darwin-arm64` and `@rollup/rollup-darwin-arm64` into a Linux image.
+  The context is now 1.1 MB and the layer-caching intent works.
+* **`pip install ./backend` would have failed** at metadata generation, for the
+  same `readme = "../README.md"` reason as the local install. The wheel now
+  builds from exactly the paths the Dockerfile copies, with a byte-identical
+  hash to one built from the full checkout.
+
+Neither was found by running anything. Both were found by checking the file
+against what it would actually do — which is all that is available without
+Docker, and is why "written" and "verified" are different words on this page.
 
 Before building, place the AlphaLab wheel where the Dockerfile expects it:
 
