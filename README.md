@@ -155,7 +155,15 @@ Stated plainly, because a trading platform that overstates itself is dangerous.
   per-principal rate limiting, and a per-tenant audit hash chain.
 - **Traceability.** One correlation id spans an HTTP request, the job it
   queued, the AlphaLab run that executed it and the row that stored the result.
-- **353 backend tests and 28 frontend tests.**
+- **Accounts as a product.** TOTP two-factor with a real enrolment screen,
+  organization invitations, workspace switching, and password reset whose token
+  infrastructure is complete and whose *delivery* refuses rather than
+  pretending.
+- **Configuration that fails closed.** A production deployment with an unset
+  secret key, `create_all` left on, a plaintext CORS origin or rate limiting
+  disabled does not start. `iluvtrade check-config` reports the same assessment
+  without starting anything.
+- **433 backend tests and 52 frontend tests.**
 
 ### Real boundary, not yet run against the outside world
 
@@ -169,8 +177,15 @@ Stated plainly, because a trading platform that overstates itself is dangerous.
   implementation records a settled purchase without moving money, and *raises*
   rather than recording a payout. The marketplace UI states which posture is
   live before the button is clicked. See [docs/PAYMENTS.md](docs/PAYMENTS.md).
-- **Email and push.** `NotificationChannel` is the seam; nothing is registered,
-  and `GET /api/health` reports that rather than implying delivery.
+- **Email and push.** `NotificationChannel` is the seam for notifications and
+  `DeliveryProvider` for password reset; nothing is registered, and both say so
+  at the surface. Password reset answers **503**, not a `202` for a message that
+  will never arrive. An invitation hands its token to the *inviter* to pass on.
+- **Containers.** `Dockerfile`, `docker-compose.yml` and an entrypoint that runs
+  migrations explicitly. **Never built** — Docker is not installed on the
+  machine this was developed on, and claiming otherwise would be a guess. The
+  local path in [DEPLOYMENT.md](docs/DEPLOYMENT.md) *has* been exercised end to
+  end.
 - **Multi-instance rate limiting.** Counters are per-process, so N workers means
   N x the limit. `GET /api/health` reports the real scope.
 
@@ -217,13 +232,17 @@ cd backend
 ./.venv/bin/ruff check iluvtrade tests
 ./.venv/bin/ruff format --check iluvtrade tests
 ./.venv/bin/mypy
-PYTHONPATH=$PWD ./.venv/bin/python -m pytest -q          # 353 tests
+PYTHONPATH=$PWD ./.venv/bin/python -m pytest -q          # 433 tests
 ./.venv/bin/alembic check                                 # models vs migrations
+./.venv/bin/python -m iluvtrade.cli check-config          # unsafe settings
 
 cd ../frontend
 npm run typecheck
-npm test                                                  # 28 tests
+npm test                                                  # 52 tests
 npm run build
+
+cd ..
+./scripts/audit-dependencies.sh                           # npm advisories vs assessed
 ```
 
 Targeted suites:
@@ -233,6 +252,8 @@ cd backend
 PYTHONPATH=$PWD ./.venv/bin/python -m pytest -m security -q
 PYTHONPATH=$PWD ./.venv/bin/python -m pytest -m integration -q
 PYTHONPATH=$PWD ./.venv/bin/python -m pytest tests/unit/test_engine_boundary.py -q
+PYTHONPATH=$PWD ./.venv/bin/python -m pytest tests/security/test_api_surface.py -q
+PYTHONPATH=$PWD ./.venv/bin/python -m pytest tests/integration/test_concurrency_and_failure.py -q
 ```
 
 ## Licence

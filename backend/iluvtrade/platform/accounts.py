@@ -300,4 +300,75 @@ def logout(session: DbSession, principal: Principal) -> None:
 
 
 def memberships_for(session: DbSession, user_id: str) -> list[Membership]:
-    return list(session.execute(select(Membership).where(Membership.user_id == user_id)).scalars())
+    """Every workspace this user belongs to.
+
+    Deliberately **not** scoped through :func:`~iluvtrade.platform.tenancy.scoped`:
+    the question spans tenants by definition — "which organizations may this
+    person act in?" — and is asked at login and when switching. It is keyed by
+    the authenticated user's own id and returns nothing about anyone else.
+    """
+
+    return list(
+        session.execute(
+            select(Membership).where(Membership.user_id == user_id).order_by(Membership.created_at)
+        ).scalars()
+    )
+
+
+def switch_organization(
+    session: DbSession,
+    principal: Principal,
+    *,
+    organization_id: str,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> tuple[Session, str]:
+    """Open a session in another organization the caller already belongs to.
+
+    A session names exactly one organization and every authorization decision
+    reads it, so "switching" cannot be a mutation of the current row — that
+    would let one token act in two tenants over its lifetime, and any audit
+    event already written under the old one would become ambiguous. The old
+    session is revoked and a new one issued.
+
+    Membership is re-checked here rather than trusted from the request. The
+    organization id is caller-supplied, and this is the only place it is turned
+    into authority.
+    """
+
+    membership = session.execute(
+        select(Membership).where(
+            Membership.user_id == principal.user_id,
+            Membership.organization_id == organization_id,
+        )
+    ).scalar_one_or_none()
+    if membership is None:
+        # Not "forbidden": whether an organization exists is not something a
+        # non-member is entitled to learn.
+        raise AuthError("No such workspace.")
+
+    logout(session, principal)
+
+    token = security.new_session_token()
+    settings = get_settings()
+    row = Session(
+        user_id=principal.user_id,
+        organization_id=organization_id,
+        token_hash=security.hash_token(token),
+        expires_at=utcnow() + timedelta(seconds=settings.session_ttl_seconds),
+        ip_address=ip_address,
+        user_agent=(user_agent or "")[:400] or None,
+    )
+    session.add(row)
+    audit.record(
+        session,
+        organization_id=organization_id,
+        action="user.organization_switched",
+        resource_type="session",
+        resource_id=row.id,
+        actor_user_id=principal.user_id,
+        ip_address=ip_address,
+        payload={"from_organization_id": principal.organization_id},
+    )
+    session.flush()
+    return row, token

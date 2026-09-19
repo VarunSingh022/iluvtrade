@@ -1,0 +1,16 @@
+# npm advisories that have been assessed. See docs/SECURITY.md, "Dependency risk",
+# for the reasoning behind each. A package appearing here is NOT a statement that
+# it is harmless — it is a statement that somebody worked out what it means here.
+#
+# scripts/audit-dependencies.sh fails on anything not in this list.
+
+# --- development tooling; never reaches the production bundle ---------------
+vitest              # test runner
+@vitest/mocker      # via vitest
+vite-node           # via vitest
+vite                # dev server and build tool
+esbuild             # via vite
+
+# --- shipped in the bundle; assessed as not reachable in this application ----
+react-router        # open redirect via a user-controlled `to`; none exists here
+react-router-dom    # via react-router

@@ -60,6 +60,7 @@ __all__ = [
     "RateLimitBackend",
     "RateLimitError",
     "RateLimiter",
+    "effective_policies",
     "get_limiter",
     "reset_limiter",
 ]
@@ -194,10 +195,21 @@ class RateLimiter:
         clock: Callable[[], float] | None = None,
         *,
         enabled: bool = True,
+        policies: dict[str, Policy] | None = None,
     ) -> None:
         self._backend = backend if backend is not None else InMemoryBackend()
         self._clock = clock if clock is not None else time.time
         self.enabled = enabled
+        #: The policies this limiter enforces, after any deployment override.
+        #: Held here rather than read from the module global at each check, so
+        #: a request is limited by the configuration the process started with
+        #: rather than by whatever a later import mutated.
+        self.policies = dict(policies) if policies is not None else dict(POLICIES)
+
+    def policy(self, name: str) -> Policy:
+        """The effective policy for ``name``."""
+
+        return self.policies[name]
 
     def check(self, policy: Policy, identity: str) -> None:
         """Record a hit for ``identity`` under ``policy``, or refuse.
@@ -228,6 +240,14 @@ POLICIES: dict[str, Policy] = {
     # not need ten attempts a minute, and an attacker does.
     "login": Policy("login", limit=10, window_seconds=60),
     "register": Policy("register", limit=5, window_seconds=3600),
+    # Password reset is anonymous and keyed by address, so it is both an
+    # enumeration oracle and a way to flood someone's inbox. Tight on purpose.
+    "password_reset": Policy("password_reset", limit=5, window_seconds=900),
+    # Guessing a reset token is not feasible, but a slow drip is still worth
+    # refusing, and the limit costs a legitimate user nothing.
+    "password_reset_confirm": Policy("password_reset_confirm", limit=10, window_seconds=900),
+    # Inviting is cheap for the inviter and creates a durable offer of access.
+    "invitation": Policy("invitation", limit=20, window_seconds=3600),
     # Ingestion is expensive in CPU and disk, and fetching reaches the network.
     "ingest": Policy("ingest", limit=30, window_seconds=60),
     "fetch": Policy("fetch", limit=10, window_seconds=60),
@@ -245,6 +265,27 @@ _LIMITER: RateLimiter | None = None
 _LIMITER_LOCK = threading.Lock()
 
 
+def effective_policies(overrides: dict[str, tuple[int, int]]) -> dict[str, Policy]:
+    """:data:`POLICIES` with a deployment's overrides applied.
+
+    An override naming a policy that does not exist is an error rather than an
+    ignored line. A typo'd ``ILUVTRADE_RATE_LIMIT_OVERRIDES=lgoin=5/60`` would
+    otherwise read as "logins are limited to 5" while enforcing the default 10
+    — the worst of both, since the operator believes a limit they do not have.
+    """
+
+    unknown = sorted(set(overrides) - set(POLICIES))
+    if unknown:
+        raise KeyError(
+            f"Rate-limit override(s) for unknown polic(ies): {', '.join(unknown)}. "
+            f"Known: {', '.join(sorted(POLICIES))}."
+        )
+    resolved = dict(POLICIES)
+    for name, (limit, window) in overrides.items():
+        resolved[name] = Policy(name, limit=limit, window_seconds=window)
+    return resolved
+
+
 def get_limiter() -> RateLimiter:
     """The process-wide limiter, built from settings on first use."""
 
@@ -254,7 +295,11 @@ def get_limiter() -> RateLimiter:
             if _LIMITER is None:
                 from iluvtrade.config import get_settings
 
-                _LIMITER = RateLimiter(enabled=get_settings().rate_limit_enabled)
+                settings = get_settings()
+                _LIMITER = RateLimiter(
+                    enabled=settings.rate_limit_enabled,
+                    policies=effective_policies(settings.rate_limit_overrides_parsed()),
+                )
     return _LIMITER
 
 

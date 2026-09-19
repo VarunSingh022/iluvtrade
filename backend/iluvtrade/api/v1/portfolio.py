@@ -17,7 +17,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session as DbSession
 
 from iluvtrade.api.deps import current_principal, db_session
-from iluvtrade.api.v1.schemas import AuditEventResponse, NotificationResponse
+from iluvtrade.api.v1.schemas import (
+    AuditEventResponse,
+    AuditVerificationResponse,
+    NotificationResponse,
+)
 from iluvtrade.db.models.backtest import BacktestJob, JobStatus
 from iluvtrade.db.models.data import DatasetVersion, DatasetVersionStatus
 from iluvtrade.db.models.platform import AuditEvent, Role
@@ -237,11 +241,11 @@ def read_all(
     }
 
 
-@router.get("/audit/verify")
+@router.get("/audit/verify", response_model=AuditVerificationResponse)
 def verify_audit_chain(
     session: DbSession = Depends(db_session),
     principal: Principal = Depends(current_principal),
-) -> dict:
+) -> AuditVerificationResponse:
     """Recompute this organization's audit chain and report any break.
 
     ADMIN only, like the trail itself. Scoped to the caller's organization —
@@ -249,7 +253,9 @@ def verify_audit_chain(
     """
 
     principal.require(Role.ADMIN)
-    return audit.verify_chain(session, principal.organization_id).to_dict()
+    return AuditVerificationResponse.model_validate(
+        audit.verify_chain(session, principal.organization_id).to_dict()
+    )
 
 
 @router.get("/audit", response_model=list[AuditEventResponse])

@@ -37,8 +37,10 @@ operated, load-tested, penetration-tested, or run against a real venue.
 | **MFA (TOTP)** | **IMPLEMENTED** | RFC 6238 via `pyotp`; two-step enrolment, replay refusal, single-use recovery codes, disable requires proof |
 | WebAuthn / passkeys | NOT IMPLEMENTED | TOTP was the one that could be done entirely locally |
 | **Credential key rotation** | **IMPLEMENTED** | Multi-key decrypt, re-seal under current, `iluvtrade rotate-credentials` |
-| Password reset | NOT IMPLEMENTED | Needs an email channel first |
-| User invitations | NOT IMPLEMENTED | Registration creates a personal workspace only |
+| **Password reset — token infrastructure** | **IMPLEMENTED** | 256-bit token, HMAC at rest, one hour, single use, supersedes any outstanding one, revokes every session on use, identical answer for a known and an unknown address |
+| **Password reset — delivery** | **REQUIRES EXTERNAL INFRASTRUCTURE** | `DeliveryProvider` is the seam; the only implementation refuses. `POST /auth/password-reset/request` answers **503**, not a 202 that never arrives. `iluvtrade issue-password-reset` is the operator path, and it works |
+| **Organization invitations** | **IMPLEMENTED** | Hashed one-time token, seven-day expiry, revocable, single use, bound to the invited address, role fixed at creation and never read from the accepting request |
+| **Organization switching** | **IMPLEMENTED** | A session names one organization; switching issues a new one and revokes the old |
 | **Correlation IDs** | **IMPLEMENTED** | One id spans HTTP → service → job → engine run → stored row |
 | **Structured logging** | **IMPLEMENTED** | JSON lines with secret redaction as a backstop |
 | Metrics / tracing / alerting | NOT IMPLEMENTED | Attachment points named in `OBSERVABILITY.md` |
@@ -65,7 +67,7 @@ operated, load-tested, penetration-tested, or run against a real venue.
 | Reproducibility | IMPLEMENTED | Replay matches order-id for order-id |
 | Risk-refusal reporting | IMPLEMENTED | Refusals are never silent |
 | Distributed workers | NOT IMPLEMENTED | `claim_next` takes the lock one would need |
-| Backtest cancellation mid-run | IMPLEMENTED | Honoured between records |
+| Backtest cancellation mid-run | IMPLEMENTED | Honoured between records; reachable from the UI |
 
 ## Trading
 
@@ -109,34 +111,54 @@ operated, load-tested, penetration-tested, or run against a real venue.
 
 | Capability | Status | Notes |
 |---|---|---|
-| Alembic migrations | IMPLEMENTED | Four revisions. Fresh, upgrade and downgrade paths tested, **and every revision applied against a populated database** — the test that caught a partially-applying migration an empty-database run could not |
+| Alembic migrations | IMPLEMENTED | Five revisions. Fresh, upgrade and downgrade paths tested, **and every revision applied against a populated database** — the test that caught a partially-applying migration an empty-database run could not |
 | Startup `create_all` | IMPLEMENTED (development only) | Forced off in production |
-| SQLite | TESTED LOCALLY | Fine for one process |
-| PostgreSQL | NOT TESTED | The URL is configurable; nothing has run against it |
+| SQLite | TESTED LOCALLY | Fine for one process, and **refused in production** unless `ILUVTRADE_ALLOW_SQLITE_IN_PRODUCTION=true`. Four concurrent dataset ingestions on one machine produce `database is locked`; the test that demonstrates it is `test_concurrent_dataset_uploads_do_not_write_into_each_other` |
+| PostgreSQL | NOT TESTED | The URL is configurable and the compose file points at it; nothing has run against it |
+| **Backup (SQLite)** | **TESTED LOCALLY** | `iluvtrade backup --verify` uses SQLite's online backup API — taken against a *live, running* deployment and restored from |
+| Backup (PostgreSQL) | NOT IMPLEMENTED | The command prints the `pg_dump` invocation rather than shelling out to a tool that may be absent or version-mismatched |
 
 ## Frontend
 
 | Capability | Status | Notes |
 |---|---|---|
 | 15 screens | IMPLEMENTED | |
+| **MFA enrolment, challenge and disable** | **IMPLEMENTED** | QR plus a manual key, recovery codes shown once, disable requires a current code. Login shows a code challenge instead of reporting a wrong password |
+| **Team management** | **IMPLEMENTED** | Members, invitations, join by code, workspace switching |
+| **Password reset screen** | **IMPLEMENTED** | Reads whether delivery exists and says so instead of offering a link that goes nowhere |
+| **Audit chain verification** | **IMPLEMENTED** | The verify endpoint existed and no screen called it |
+| **Session expiry** | **IMPLEMENTED** | A 401 anywhere returns the user to sign-in rather than leaving the shell around a broken screen |
 | Route guard | IMPLEMENTED | Unauthenticated renders only the login screen |
 | No browser storage of secrets | IMPLEMENTED | No `localStorage`/`sessionStorage` use at all |
 | Confirmation on destructive actions | IMPLEMENTED | Inline two-step, states the consequence |
 | Live-trading visibility | IMPLEMENTED | Shown as disabled; the three gates are named |
-| Component/unit tests | IMPLEMENTED | 28 tests |
-| MFA enrolment screen | NOT IMPLEMENTED | The API is complete and tested; no UI yet |
+| Component/unit tests | IMPLEMENTED | 52 tests |
 | End-to-end browser tests | NOT IMPLEMENTED | Verified manually |
+
+## Deployment
+
+| Capability | Status | Notes |
+|---|---|---|
+| **Production configuration validation** | **IMPLEMENTED** | `Settings.deployment_problems()` names every unsafe production combination and `get_settings()` refuses to return them, so a misconfigured deployment fails at startup rather than two hours later on the first login. `iluvtrade check-config` reports the same thing without starting |
+| **Local install → migrate → run → health → shutdown** | **TESTED LOCALLY** | Exercised end to end during this audit: a fresh database migrated to head, the server started, an account was registered over HTTP, the SPA was served, a backup was taken from the live database and restored from, and the process was shut down cleanly |
+| **Container image** | **IMPLEMENTED, NOT BUILT** | `Dockerfile` and `docker-compose.yml` exist and `deploy/entrypoint.sh` passes `sh -n`. **Docker is not installed on the machine this was developed on**, so the image has never been built and the compose stack has never been started. Nothing here should be read as a tested deployment |
+| Migration execution on deploy | IMPLEMENTED | `deploy/entrypoint.sh` runs `alembic upgrade head` explicitly and fails the start if it fails. `create_all` is refused in production |
+| **Dependency advisory gate** | **IMPLEMENTED** | `scripts/audit-dependencies.sh` fails on any npm advisory not already assessed in `SECURITY.md`. Verified to fail on an unassessed finding and pass otherwise |
+| **Concurrency and failure behaviour** | **TESTED LOCALLY** | Eight tests covering duplicate submission, concurrent session start, concurrent ingestion, engine failure, notification failure, database failure and the audit chain under concurrent writes. **This is not a load test** — a handful of threads against SQLite on one machine |
+| CI pipeline | NOT IMPLEMENTED | Every gate is a command; nothing runs them on a push |
+| TLS termination | NOT IMPLEMENTED | Assumed to be a reverse proxy's job; HSTS is set in production |
 
 ## Not addressed at all
 
-Load testing, penetration testing, dependency CVE scanning in CI, log
-aggregation, metrics/tracing, alerting, backup automation, disaster recovery,
-data retention and erasure, and multi-node deployment.
+Load testing, penetration testing, log aggregation, metrics/tracing, alerting,
+automated backup scheduling, disaster-recovery rehearsal, data retention and
+erasure, and multi-node deployment.
 
-## The four things this build will not do, and why
+## The five things this build will not do, and why
 
 | | Why not |
 |---|---|
+| **Send email** | No channel is configured and none is simulated. `DeliveryProvider` is the seam; the only implementation raises. This shapes two features rather than hiding behind them: password reset **refuses with 503** instead of returning a 202 that never arrives, and an invitation hands its token to the *inviter* to pass on. A 202 nobody acts on is worse than a refusal — the user waits, retries, and concludes the account is broken, while the logs say everything succeeded. |
 | **Execute live orders** | The loop is unbuilt, and `ExecutionMode.LIVE` is constructed nowhere — so no configured run can reach a venue regardless of what a request contains. Three gates refuse a live session on top of that. |
 | **Run seller code** | The isolation boundary in `SANDBOX_CONTRACT.md` does not exist. A listing names an in-repository implementation; there is nothing to sandbox. |
 | **Move money** | `ManualProvider` records without charging and raises on payout. A false ledger entry is worse than an unavailable feature. |

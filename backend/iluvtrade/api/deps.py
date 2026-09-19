@@ -139,10 +139,15 @@ def rate_limit(policy_name: str) -> Any:
     bucket.
     """
 
-    policy = POLICIES[policy_name]
+    # Looked up now so a typo is an ImportError at startup, but resolved again
+    # at call time so a deployment's override actually takes effect — the
+    # policy object captured here is the default, not necessarily the one in
+    # force.
+    _ = POLICIES[policy_name]
 
     def dependency(principal: Principal = Depends(current_principal)) -> Principal:
-        get_limiter().check(policy, principal.user_id)
+        limiter = get_limiter()
+        limiter.check(limiter.policy(policy_name), principal.user_id)
         return principal
 
     return dependency
@@ -155,9 +160,10 @@ def rate_limit_anonymous(policy_name: str) -> Any:
     exactly where credential guessing happens.
     """
 
-    policy = POLICIES[policy_name]
+    _ = POLICIES[policy_name]
 
     def dependency(request: Request) -> None:
-        get_limiter().check(policy, client_identity(request))
+        limiter = get_limiter()
+        limiter.check(limiter.policy(policy_name), client_identity(request))
 
     return dependency

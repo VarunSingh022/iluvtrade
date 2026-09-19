@@ -288,3 +288,167 @@ so in its output rather than leaving it to be discovered.
 
 Security issues should go to the repository owner privately, not through a
 public issue.
+
+---
+
+# Release-candidate additions
+
+The sections below were added during the release-candidate audit. Each records
+a decision, not just a feature.
+
+## Production configuration fails closed
+
+`Settings.deployment_problems()` enumerates the production settings that are
+unsafe, and `get_settings()` refuses to return them. A misconfigured production
+deployment does not start.
+
+It replaces a check that **could never fire**. The previous guard read
+`if settings.is_production and not settings.secret_key` — but `secret_key` has
+a `default_factory`, so an unset key is a perfectly valid random string and the
+condition was always false. Production would have started with a per-process
+key: every session dropped on restart, and every stored broker credential and
+TOTP secret sealed under a key that no longer exists.
+
+What is refused, and why each one matters:
+
+| Setting | Refused when | Because |
+|---|---|---|
+| `ILUVTRADE_SECRET_KEY` | unset, under 32 characters, or a placeholder | It derives the session HMAC *and* the credential-encryption key |
+| `ILUVTRADE_RETIRED_SECRET_KEYS` | contains the active key | The rotation silently becomes a no-op |
+| `ILUVTRADE_AUTO_CREATE_TABLES` | on | `create_all` ignores drift; Alembic owns the production schema |
+| `ILUVTRADE_DATABASE_URL` | SQLite, without an explicit acknowledgement | Threaded workers and session runners write concurrently |
+| `ILUVTRADE_ALLOWED_ORIGINS` | `*`, or any non-https origin | This API allows credentials |
+| `ILUVTRADE_FETCH_ALLOW_LOOPBACK` | on | It is the SSRF escape hatch that exists for tests |
+| `ILUVTRADE_RATE_LIMIT_ENABLED` | off, with nothing claiming to enforce limits elsewhere | Unlimited password guessing |
+| `ILUVTRADE_LIVE_TRADING_ENABLED` | on, with no broker credentials | Every live session would fail at the venue |
+| `ILUVTRADE_PAYMENT_PROVIDER` | not an implemented provider | Better than discovering it at the first purchase |
+
+Two of these have deliberate escape hatches — SQLite, and disabling in-process
+rate limiting — and both require setting a variable that *names the trade*
+(`ILUVTRADE_ALLOW_SQLITE_IN_PRODUCTION`, `ILUVTRADE_RATE_LIMIT_ENFORCED_EXTERNALLY`).
+Turning a control off should be a statement about where it went, not a quiet
+omission.
+
+`iluvtrade check-config` reports the same assessment without starting the
+application, and `deploy/entrypoint.sh` runs it before every start.
+
+### A related defect: the documented syntax did not work
+
+`.env.example` documented `ILUVTRADE_FETCH_ALLOWED_HOSTS` as comma-separated.
+pydantic-settings parses a complex field from the environment as JSON, so
+following the documentation was a **startup crash** — on the SSRF allowlist,
+which is the setting an operator most needs to be able to change. Both forms
+are now accepted, and a parametrised test covers comma-separated, whitespace-
+padded, JSON and empty.
+
+## Two-factor authentication in the browser
+
+The backend was complete before this audit; nothing in the product reached it.
+
+Three rules the UI keeps:
+
+1. **Nothing is persisted.** The secret and the recovery codes live in React
+   state for the length of the enrolment and are gone on navigation — no
+   `localStorage`, no `sessionStorage`, no URL. A test asserts both stores are
+   empty after enrolment.
+2. **The secret is never shown again**, because the server cannot show it: it
+   is stored encrypted and no endpoint returns it.
+3. **Turning MFA off requires a current code.** The server enforces it; the UI
+   says why, rather than presenting a bare button.
+
+The QR code is rendered from the module matrix as React `<rect>` elements
+rather than through the library's `createImgTag`/`createSvgTag`, which return
+markup strings and would mean `dangerouslySetInnerHTML` on the one page that
+displays a one-time secret.
+
+### The login challenge is distinguishable, twice
+
+A correct password on an MFA-enabled account answers **401 with
+`error.code == "MfaRequired"`** and an `X-MFA-Required` header.
+
+Both, on purpose. A cross-origin client cannot read a response header unless
+CORS exposes it — and it did not, until this audit added `expose_headers` — and
+a proxy is free to strip one. The body always arrives. Without a distinguishable
+answer the UI tells someone with a working password that it is wrong, and the
+account becomes unreachable through the app.
+
+## Password reset
+
+Everything except delivery is implemented and tested: a 256-bit token from
+`secrets`, stored only as an HMAC under the application secret, valid for one
+hour, usable once, superseding any outstanding token, and revoking **every
+session on the account** when used — which is the point of a reset rather than
+a settings-page password change.
+
+`POST /auth/password-reset/request` answers **503**, identically for a known and
+an unknown address, because the refusal is decided before the address is looked
+up. It is therefore not an enumeration oracle. A `202 Accepted` would have been
+the easy thing to return and would have been a lie.
+
+`iluvtrade issue-password-reset <email>` is the operator path. It needs shell
+access on the application host — which already implies database access — and it
+writes the same audit event a delivered reset would. It was exercised end to end
+against a running server during this audit.
+
+## Invitations
+
+Three things together stop a leaked invitation token from being a membership:
+the token is hashed at rest, accepting requires being **signed in**, and the
+signed-in account's email must match the address the invitation names. The role
+is fixed at creation and there is no field on the accept request that could
+carry one; an inviter also cannot grant a role above their own.
+
+Every refusal — unknown, expired, revoked, already used, wrong address — returns
+the same message. Which one it was is information about someone else's
+workspace.
+
+## Vulnerability classes kept absent by construction
+
+`tests/security/test_code_execution_surface.py` parses the application's own
+source with `ast` and fails when a construct appears:
+
+| Rules out | Check |
+|---|---|
+| Arbitrary code execution | No `eval`, `exec`, `compile`, `__import__` |
+| Unsafe deserialization | No `pickle`, `marshal`, `dill`, `shelve`, `yaml` |
+| Command injection | No `subprocess`, `os.system`, `os.popen` |
+| SQL injection | No f-string or concatenation passed to `execute`/`text` |
+| XSS | No `dangerouslySetInnerHTML`, `innerHTML`, `new Function`, `document.write` |
+| Path traversal | No filesystem call outside `storage.py`, whose `resolve()` refuses a key that escapes the root |
+
+A grep proves nothing about tomorrow. These fail on the commit that introduces
+the construct.
+
+## Dependency risk
+
+`scripts/audit-dependencies.sh` compares `npm audit` against
+`scripts/accepted-advisories.txt` and fails on anything not yet assessed. Seven
+advisories are currently open; the assessment is what makes them acceptable, not
+their presence on a list.
+
+**Development tooling — never reaches the browser.** `vitest` (critical),
+`vite` (high), `esbuild`, `@vitest/mocker`, `vite-node`. Every one is in
+`devDependencies`. The vulnerabilities are "a website you visit can talk to your
+dev server" and "the Vitest UI server can read files" — real, and scoped to a
+developer's machine, not to a deployment.
+
+**Shipped in the bundle — assessed as not reachable here.**
+`react-router` / `react-router-dom` (moderate), with two advisories:
+
+* *Arbitrary constructor injection via `deserializeErrors()` in SSR hydration.*
+  This application has no SSR. It uses `BrowserRouter`, not
+  `createBrowserRouter`, and never hydrates server-rendered error state.
+* *Open redirect via a backslash in `<Link>` and `useNavigate`.* Exploitable
+  only when a route target is built from user-controlled input. Every `to=` and
+  `navigate()` in this codebase is a literal path or a server-generated UUID;
+  there is no free-text path anywhere.
+
+The fix for both is a **major** version bump (`react-router-dom` 6 → 7), taken
+at the end of a release-candidate audit, to close advisories that are not
+reachable. That trade was not worth making. It is recorded here so the decision
+is visible and can be revisited — not omitted so the report looks clean.
+
+The npm dependency set is also pinned by a test: `dependencies` must be exactly
+`react`, `react-dom`, `react-router-dom` and `qrcode-generator`. A fifth entry
+is one more package with script access to a signed-in session, which is a
+decision rather than a line to append.

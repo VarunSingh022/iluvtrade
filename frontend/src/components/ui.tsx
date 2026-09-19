@@ -85,9 +85,16 @@ export function ScoreMeter({ score }: { score: number | null }) {
 
 export function Tabs({ tabs, active, onChange }: { tabs: { id: string; label: string }[]; active: string; onChange: (id: string) => void }) {
   return (
-    <div className="tabs">
+    <div className="tabs" role="tablist">
       {tabs.map((tab) => (
-        <button key={tab.id} className={`tab ${tab.id === active ? "active" : ""}`} onClick={() => onChange(tab.id)} type="button">
+        <button
+          key={tab.id}
+          role="tab"
+          aria-selected={tab.id === active}
+          className={`tab ${tab.id === active ? "active" : ""}`}
+          onClick={() => onChange(tab.id)}
+          type="button"
+        >
           {tab.label}
         </button>
       ))}
@@ -95,11 +102,23 @@ export function Tabs({ tabs, active, onChange }: { tabs: { id: string; label: st
   );
 }
 
+/**
+ * A labelled form control.
+ *
+ * The label **wraps** the control rather than sitting beside it. Implicit
+ * association needs no generated id, works for any child, and is what makes
+ * the label clickable and the control reachable by its name — to a screen
+ * reader, and to a test asking for the field by the name a person sees. The
+ * previous form rendered a bare `<label>` next to the input, which associated
+ * nothing: the text was visually a label and programmatically decoration.
+ */
 export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
     <div className="field">
-      <label>{label}</label>
-      {children}
+      <label>
+        <span className="label-text">{label}</span>
+        {children}
+      </label>
       {hint && <div className="tiny faint" style={{ marginTop: 2 }}>{hint}</div>}
     </div>
   );

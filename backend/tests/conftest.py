@@ -21,6 +21,37 @@ os.environ.setdefault("ILUVTRADE_SECRET_KEY", "test-secret-key-not-for-productio
 os.environ.setdefault("ILUVTRADE_ENVIRONMENT", "test")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _the_developers_database_is_never_touched() -> Iterator[None]:
+    """Fail the run if the suite writes to the real local database.
+
+    Every test gets a temporary database, so this should be impossible — and it
+    happened anyway. A trading-session runner is a daemon thread that outlives
+    the request that started it. When a test finished and the fixture below
+    cleared the settings cache and reset the engine, a still-polling runner
+    called ``get_session_factory()`` again, re-read settings *without* the
+    monkeypatched URL, and wrote into ``var/iluvtrade.db`` — the developer's own
+    data.
+
+    The fix is joining runners before the reset (see below). This is the guard
+    that proves the fix holds, because the failure is silent: nothing in a
+    passing test run would ever mention it.
+    """
+
+    from iluvtrade.config import REPO_ROOT
+
+    default = REPO_ROOT / "var" / "iluvtrade.db"
+    before = default.stat().st_mtime_ns if default.exists() else None
+    yield
+    after = default.stat().st_mtime_ns if default.exists() else None
+    assert before == after, (
+        f"The test suite wrote to {default}, which is the developer's real "
+        "database. Something escaped the per-test temporary database — most "
+        "likely a background thread that outlived its test and re-resolved "
+        "settings after the fixture reset them."
+    )
+
+
 @pytest.fixture(autouse=True)
 def _isolated_storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     """Point the database and blob storage at a fresh temporary directory.
@@ -44,6 +75,15 @@ def _isolated_storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     reset_engine()
     reset_limiter()
     yield workspace
+
+    # Session runners are daemon threads, so nothing waits for them. Repointing
+    # the database while one is still polling makes it raise "no such table"
+    # from a background thread — which pytest reports against whichever test is
+    # running *next*, turning a leak in one test into a flake in another.
+    from iluvtrade.trading.runner import RUNNER
+
+    RUNNER.join_all(timeout=15)
+
     get_settings.cache_clear()
     reset_engine()
     reset_limiter()

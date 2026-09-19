@@ -50,12 +50,24 @@ async function request<T>(method: string, path: string, body?: unknown, isForm =
 
   if (!response.ok) {
     const envelope = (payload as { error?: { code?: string; message?: string; fields?: { field: string; message: string }[] } } | null)?.error;
-    throw new ApiError(
+    const error = new ApiError(
       response.status,
       envelope?.code ?? "HTTPError",
       envelope?.message ?? `Request failed with ${response.status}.`,
       envelope?.fields,
     );
+    // A session that expired mid-visit would otherwise surface as a 401 on
+    // whichever screen happened to be open, with the shell still rendered
+    // around it and nothing returning the user to sign in. Announced once,
+    // here, so every screen inherits the behaviour.
+    //
+    // `MfaRequired` is excluded: it is also a 401, but the caller is *not*
+    // signed in yet and is mid-login. Clearing the user there would wipe the
+    // login form the moment the challenge appeared.
+    if (response.status === 401 && error.code !== "MfaRequired" && !path.startsWith("/auth/login")) {
+      window.dispatchEvent(new CustomEvent("iluvtrade:session-expired"));
+    }
+    throw error;
   }
   return payload as T;
 }
@@ -81,6 +93,19 @@ export interface HealthResponse {
   environment: string;
   engine: { name: string; version: string };
   live_trading_enabled: boolean;
+  /**
+   * What this deployment actually enforces, as opposed to what it configured.
+   * Declared here because Settings renders it: an undeclared field that a
+   * screen reads is a contract nobody is checking.
+   */
+  rate_limiting: {
+    enabled: boolean;
+    shared_across_instances: boolean;
+    backend: string;
+    caveat: string;
+  };
+  notification_channels: string[];
+  payment_provider: string;
 }
 
 export interface User {
@@ -91,12 +116,94 @@ export interface User {
   organization_name: string;
   role: string;
   live_trading_enabled: boolean;
+  mfa_enabled: boolean;
 }
 
 export interface SessionResponse {
   token: string;
   expires_at: string;
   user: User;
+}
+
+// --- two-factor authentication ---------------------------------------------
+
+export interface MfaStatus {
+  enabled: boolean;
+  enrolment_pending: boolean;
+  recovery_codes_remaining: number;
+}
+
+/**
+ * Returned exactly once, by enrolment.
+ *
+ * Nothing in the app may persist any of this: the secret goes to the
+ * authenticator app by being scanned or typed, the recovery codes go to the
+ * user by being written down. Both live in React state for the length of the
+ * enrolment and are gone on navigation — never localStorage, never a URL,
+ * never a log.
+ */
+export interface MfaEnrolment {
+  secret: string;
+  provisioning_uri: string;
+  recovery_codes: string[];
+}
+
+// --- organizations ----------------------------------------------------------
+
+export interface MembershipSummary {
+  organization_id: string;
+  organization_name: string;
+  role: string;
+  is_current: boolean;
+}
+
+export interface Member {
+  user_id: string;
+  email: string;
+  display_name: string;
+  role: string;
+  joined_at: string;
+}
+
+export interface Invitation {
+  id: string;
+  email: string;
+  role: string;
+  status: string;
+  invited_by_user_id: string;
+  expires_at: string;
+  accepted_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+export interface InvitationCreated {
+  invitation: Invitation;
+  /** Shown once to the inviter. Never stored and never served again. */
+  token: string;
+  share_instructions: string;
+}
+
+export interface ChainBreak {
+  sequence: number;
+  event_id: string;
+  reason: string;
+}
+
+export interface AuditVerification {
+  organization_id: string;
+  events_checked: number;
+  intact: boolean;
+  head_hash: string;
+  breaks: ChainBreak[];
+}
+
+// --- password reset ----------------------------------------------------------
+
+export interface PasswordResetAvailability {
+  available: boolean;
+  channel: string;
+  notice: string;
 }
 
 export interface Finding {

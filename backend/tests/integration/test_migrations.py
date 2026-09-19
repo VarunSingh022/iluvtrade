@@ -49,7 +49,7 @@ def test_a_fresh_database_migrates_to_head(tmp_path: Path) -> None:
         row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     assert "alembic_version" in tables
-    assert len(tables - {"alembic_version"}) == 27
+    assert len(tables - {"alembic_version"}) == 29
 
     columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_events)")}
     assert {"sequence", "previous_hash", "event_hash"} <= columns
@@ -190,14 +190,25 @@ def test_the_chain_migration_is_reversible(tmp_path: Path) -> None:
 def test_production_never_creates_tables_implicitly(monkeypatch) -> None:
     """A production deployment's schema is the migrations', whatever is set."""
 
-    from iluvtrade.config import get_settings
+    from iluvtrade.config import Settings, UnsafeProductionConfiguration, get_settings
 
     monkeypatch.setenv("ILUVTRADE_ENVIRONMENT", "production")
     monkeypatch.setenv("ILUVTRADE_AUTO_CREATE_TABLES", "true")
     monkeypatch.setenv("ILUVTRADE_SECRET_KEY", "x" * 48)
     get_settings.cache_clear()
     try:
-        settings = get_settings()
+        # Two independent guarantees, and both matter.
+        #
+        # First: the setting is *refused* at startup, so this combination never
+        # reaches a running production process.
+        with pytest.raises(UnsafeProductionConfiguration) as refusal:
+            get_settings()
+        assert any(p.variable == "ILUVTRADE_AUTO_CREATE_TABLES" for p in refusal.value.problems)
+
+        # Second: even if it did — a future caller constructing Settings
+        # directly, a test, a REPL — create_all still does not run. A refusal
+        # at one entry point is not the same as the behaviour being impossible.
+        settings = Settings()
         assert settings.is_production
         assert settings.auto_create_tables is True
         assert settings.should_create_tables is False, (

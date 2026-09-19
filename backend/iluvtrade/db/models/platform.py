@@ -111,15 +111,22 @@ class User(Base, IdMixin, TimestampMixin):
     )
 
 
-class Membership(Base, IdMixin, TimestampMixin):
-    """The user↔organization edge, carrying the role."""
+class Membership(Base, IdMixin, OrgScopedMixin, TimestampMixin):
+    """The user↔organization edge, carrying the role.
+
+    Carries :class:`OrgScopedMixin` rather than declaring the column itself, so
+    that listing a workspace's members goes through
+    :func:`~iluvtrade.platform.tenancy.scoped` like every other tenant read.
+    The column is identical either way; what changes is that the tenancy guard
+    now covers this table instead of refusing to.
+
+    Queries that deliberately span tenants — "which workspaces does this user
+    belong to?", asked at login — select directly and say so at the call site.
+    """
 
     __tablename__ = "memberships"
     __table_args__ = (UniqueConstraint("organization_id", "user_id", name="uq_membership"),)
 
-    organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
-    )
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -250,3 +257,60 @@ class Subscription(Base, IdMixin, OrgScopedMixin, TimestampMixin):
     )
     seats: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     current_period_end: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+
+
+class PasswordResetToken(Base, IdMixin, TimestampMixin):
+    """A single-use, short-lived permission to set one account's password.
+
+    **Not organization-scoped, deliberately.** A user may belong to several
+    organizations, and their password belongs to none of them — scoping this
+    would force a choice of tenant that has no meaning and would let a member of
+    one workspace reason about an account in another.
+
+    The token is stored as an HMAC under the application secret, exactly as a
+    session token is: a database disclosure yields no usable reset links. Only
+    the hash is ever written, and the plaintext exists once, in the response
+    that created it.
+    """
+
+    __tablename__ = "password_reset_tokens"
+
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    #: Set the moment the token is used. Single-use is enforced on this column,
+    #: not by deleting the row, so a replay is *distinguishable* from a token
+    #: that never existed — which is what makes the audit trail readable.
+    consumed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    requested_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class Invitation(Base, IdMixin, OrgScopedMixin, TimestampMixin):
+    """An offer of membership in one organization, at one role.
+
+    The token is hashed like every other credential here. It is returned to the
+    **inviter** once, who passes it on however they like — this deployment has
+    no email channel, and inventing one would be a lie rather than a feature.
+
+    ``role`` is the role the invitation grants and cannot be changed by the
+    person accepting it; ``email`` is the address that may accept, checked
+    against the accepting user's own. Both together are what stops a leaked
+    token from being a membership: the holder must also control that address.
+    """
+
+    __tablename__ = "invitations"
+    __table_args__ = (
+        Index("ix_invitation_org_email", "organization_id", "email"),
+        UniqueConstraint("token_hash", name="uq_invitation_token"),
+    )
+
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    role: Mapped[Role] = mapped_column(Enum(Role, native_enum=False), nullable=False)
+    invited_by_user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False)
+    accepted_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)
+    accepted_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)

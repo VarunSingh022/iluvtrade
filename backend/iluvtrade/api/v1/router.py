@@ -7,6 +7,7 @@ from iluvtrade.api.v1 import (
     backtests,
     brokers,
     datasets,
+    organizations,
     portfolio,
     reddesk,
     strategies,
@@ -15,6 +16,7 @@ from iluvtrade.api.v1 import (
 
 api_v1 = APIRouter(prefix="/api/v1")
 api_v1.include_router(auth.router)
+api_v1.include_router(organizations.router)
 api_v1.include_router(datasets.router)
 api_v1.include_router(strategies.router)
 api_v1.include_router(backtests.router)

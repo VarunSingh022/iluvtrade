@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
+import { ConfirmButton } from "../components/Confirm";
 import { EquityCurve } from "../components/EquityCurve";
 import { Badge, Banner, Card, ErrorBanner, Loading, Stat, StatusBadge, Tabs } from "../components/ui";
 import { api } from "../lib/api";
@@ -19,6 +20,17 @@ export default function BacktestDetailPage() {
     [jobId, job.data?.status],
   );
   const [tab, setTab] = useState("summary");
+  const [cancelError, setCancelError] = useState<string | undefined>();
+
+  async function cancel() {
+    setCancelError(undefined);
+    try {
+      await api.post(`/backtests/${jobId}/cancel`);
+      job.reload();
+    } catch (caught) {
+      setCancelError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
 
   if (job.loading) return <Loading what="Loading backtest" />;
   if (job.error) return <ErrorBanner error={job.error} />;
@@ -39,8 +51,20 @@ export default function BacktestDetailPage() {
             {job.data.finished_at && ` · finished ${when(job.data.finished_at)}`}
           </p>
         </div>
-        <Link className="btn" to="/backtests">All backtests</Link>
+        <div className="row">
+          {running && (
+            <ConfirmButton
+              label="Cancel run"
+              confirmLabel="Cancel this backtest"
+              consequence="The job stops and no result is stored. Submitting it again starts from the beginning."
+              onConfirm={cancel}
+            />
+          )}
+          <Link className="btn" to="/backtests">All backtests</Link>
+        </div>
       </div>
+
+      {cancelError && <Banner tone="err">{cancelError}</Banner>}
 
       {running && (
         <Banner tone="info">

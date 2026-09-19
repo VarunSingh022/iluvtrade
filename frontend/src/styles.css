@@ -205,6 +205,12 @@ input, select, textarea {
 input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 textarea { min-height: 5rem; resize: vertical; font-family: inherit; }
 label { display: block; font-size: 0.78rem; color: var(--text-dim); margin-bottom: 0.2rem; font-weight: 500; }
+/* When the label wraps its control (see the Field component), the spacing and
+   the dim label colour belong to the text, not to the whole block — otherwise
+   the input inherits both. */
+.field label { margin-bottom: 0; }
+.field .label-text { display: block; margin-bottom: 0.2rem; }
+.field input, .field select, .field textarea { color: var(--text); font-size: 0.85rem; font-weight: 400; }
 .field { margin-bottom: 0.7rem; }
 .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
 .row.end { justify-content: flex-end; }
@@ -274,4 +280,42 @@ pre.code { background: var(--surface-2); padding: 0.6rem; border-radius: 6px; ov
   .nav-group { flex-direction: row; flex-wrap: wrap; }
   .nav-label { display: none; }
   .main { padding: 1rem; }
+}
+
+/* A button that reads as a link: secondary navigation inside a form, where a
+   real <a> would either need a route or be a no-op href. */
+button.link, .btn.link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  padding: 0.25rem;
+  font-size: 0.82rem;
+}
+button.link:hover:not(:disabled) { background: none; text-decoration: underline; }
+
+/* Recovery codes and one-time secrets: shown once, meant to be copied or
+   written down, so they are set large and unambiguous rather than dense. */
+.code-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.4rem 1rem;
+  font-family: var(--mono);
+  font-size: 0.86rem;
+  letter-spacing: 0.04em;
+  margin: 0.6rem 0;
+}
+.code-grid span { padding: 0.25rem 0.4rem; background: var(--surface-2); border-radius: 4px; }
+@media (max-width: 520px) { .code-grid { grid-template-columns: 1fr; } }
+
+/* The one-time secret itself: wrapped, selectable, and visually marked as
+   something that will not be shown again. */
+.secret-box {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  word-break: break-all;
+  background: var(--surface-2);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  margin: 0.4rem 0;
 }

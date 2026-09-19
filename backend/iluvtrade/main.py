@@ -148,16 +148,25 @@ def create_app(*, start_workers: bool = True, create_tables: bool = True) -> Fas
     # already carry the correlation id.
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(CorrelationMiddleware)
-    if not settings.is_production:
-        # The dev frontend runs on its own origin. Credentials are allowed only
-        # for that explicit origin list — never with a wildcard, which browsers
-        # refuse alongside credentials anyway and which would be wrong here.
+    if settings.allowed_origins:
+        # Credentials are allowed only for an explicit origin list — never with
+        # a wildcard, which browsers refuse alongside credentials anyway and
+        # which production refuses at startup.
+        #
+        # ``expose_headers`` is not decoration. A cross-origin response's
+        # headers are invisible to JavaScript unless they are named here, and
+        # two of ours carry meaning the client acts on: ``X-MFA-Required``
+        # distinguishes "show the code challenge" from "the password is wrong",
+        # and ``X-Request-ID`` is what a user quotes when reporting a problem.
+        # Without this the dev frontend — which *is* cross-origin — silently
+        # loses both.
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+            allow_origins=list(settings.allowed_origins),
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
+            expose_headers=["X-Request-ID", "X-MFA-Required"],
         )
 
     errors.install(app)

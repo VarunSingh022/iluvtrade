@@ -208,6 +208,20 @@ CATALOGUE: dict[str, NotificationKind] = {
             "Two-factor authentication was disabled on an account.",
             external=True,
         ),
+        _kind(
+            "account.password_reset",
+            Severity.WARNING,
+            Audience.ACTOR,
+            "This account's password was reset and every session signed out.",
+            external=True,
+        ),
+        # --- organization ---------------------------------------------------
+        _kind(
+            "organization.member_joined",
+            Severity.INFO,
+            Audience.ORGANIZATION,
+            "Someone accepted an invitation and joined this workspace.",
+        ),
     )
 }
 

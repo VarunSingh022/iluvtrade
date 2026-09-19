@@ -76,6 +76,110 @@ class UserResponse(BaseModel):
     mfa_enabled: bool
 
 
+class ChainBreakResponse(BaseModel):
+    sequence: int
+    event_id: str
+    reason: str
+
+
+class AuditVerificationResponse(BaseModel):
+    """The result of recomputing one organization's audit chain.
+
+    Declared as a model rather than returned as a bare dict so the shape is in
+    the OpenAPI schema and a client cannot depend on a field that is not part
+    of the contract — which is exactly what happened while this was untyped.
+    """
+
+    organization_id: str
+    events_checked: int
+    intact: bool
+    head_hash: str
+    breaks: list[ChainBreakResponse]
+
+
+# --- password reset ---------------------------------------------------------
+
+
+class PasswordResetRequest(Strict):
+    email: EmailStr
+
+
+class PasswordResetConfirmRequest(Strict):
+    #: Opaque to the client. The server stores only an HMAC of it.
+    token: str = Field(min_length=16, max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+class PasswordResetAvailability(BaseModel):
+    """Whether this deployment can carry a reset token to a user, and how.
+
+    Returned so the sign-in screen can say what is true rather than offering a
+    link that silently goes nowhere.
+    """
+
+    available: bool
+    channel: str
+    notice: str
+
+
+# --- organizations and invitations -----------------------------------------
+
+
+class MembershipSummary(BaseModel):
+    organization_id: str
+    organization_name: str
+    role: str
+    is_current: bool
+
+
+class SwitchOrganizationRequest(Strict):
+    organization_id: str = Field(min_length=1, max_length=36)
+
+
+class MemberResponse(BaseModel):
+    user_id: str
+    email: str
+    display_name: str
+    role: str
+    joined_at: datetime
+
+
+class InvitationCreateRequest(Strict):
+    email: EmailStr
+    role: Literal["viewer", "trader", "admin", "owner"]
+
+
+class InvitationResponse(BaseModel):
+    """An invitation as anyone may see it. Deliberately carries no token."""
+
+    id: str
+    email: str
+    role: str
+    status: str
+    invited_by_user_id: str
+    expires_at: datetime
+    accepted_at: datetime | None
+    revoked_at: datetime | None
+    created_at: datetime
+
+
+class InvitationCreatedResponse(BaseModel):
+    """Returned **once**, to the inviter.
+
+    ``token`` is the invitation. This deployment has no email channel, so the
+    inviter passes it on through a channel they already trust; it is stored
+    only as an HMAC and is never served again, by this route or any other.
+    """
+
+    invitation: InvitationResponse
+    token: str
+    share_instructions: str
+
+
+class AcceptInvitationRequest(Strict):
+    token: str = Field(min_length=16, max_length=256)
+
+
 # --- datasets --------------------------------------------------------------
 
 

@@ -22,10 +22,12 @@ from iluvtrade.db.models.data import (
 )
 from iluvtrade.db.models.platform import (
     AuditEvent,
+    Invitation,
     Membership,
     Notification,
     NotificationSeverity,
     Organization,
+    PasswordResetToken,
     Role,
     Session,
     Subscription,
@@ -81,6 +83,7 @@ __all__ = [
     "DatasetVersionStatus",
     "Entitlement",
     "EntitlementStatus",
+    "Invitation",
     "JobStatus",
     "Listing",
     "ListingStatus",
@@ -89,6 +92,7 @@ __all__ = [
     "Notification",
     "NotificationSeverity",
     "Organization",
+    "PasswordResetToken",
     "Purchase",
     "PurchaseStatus",
     "Review",

@@ -20,9 +20,14 @@ pytestmark = pytest.mark.security
 _GLOBAL_TABLES = {
     "organizations": "is the tenant",
     "users": "a person is global; their data is not",
-    "memberships": "carries organization_id directly, as the user↔org edge",
+    "memberships": "the user↔org edge; carries the column via OrgScopedMixin",
     "sessions": "carries organization_id directly; it is the auth record",
     "listing_versions": "belongs to a listing, which is tenant-scoped",
+    "password_reset_tokens": (
+        "a password belongs to a person, not to a workspace. A user may be a "
+        "member of several, and scoping this would force a meaningless choice "
+        "of tenant and let one workspace reason about an account in another."
+    ),
 }
 
 

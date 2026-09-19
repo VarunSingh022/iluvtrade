@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy.orm import Session as DbSession
 
 from iluvtrade.api.deps import (
@@ -13,17 +13,22 @@ from iluvtrade.api.deps import (
 )
 from iluvtrade.api.v1.schemas import (
     LoginRequest,
+    MembershipSummary,
     MfaCodeRequest,
     MfaEnrolmentResponse,
     MfaStatusResponse,
+    PasswordResetAvailability,
+    PasswordResetConfirmRequest,
+    PasswordResetRequest,
     RegisterRequest,
     SessionResponse,
+    SwitchOrganizationRequest,
     UpdateSettingsRequest,
     UserResponse,
 )
 from iluvtrade.config import get_settings
 from iluvtrade.db.models.platform import Organization, User
-from iluvtrade.platform import accounts, audit, mfa, notifications
+from iluvtrade.platform import accounts, audit, mfa, notifications, passwords
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -112,24 +117,18 @@ def login(
     response: Response,
     session: DbSession = Depends(db_session),
 ) -> SessionResponse:
-    try:
-        row, token = accounts.login(
-            session,
-            email=payload.email,
-            password=payload.password,
-            organization_id=payload.organization_id,
-            mfa_code=payload.mfa_code,
-            ip_address=request.client.host if request.client else None,
-            user_agent=request.headers.get("user-agent"),
-        )
-    except mfa.MfaRequired as exc:
-        # 401 with a distinct code, so the client shows a challenge rather than
-        # reporting the password as wrong.
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(exc),
-            headers={"X-MFA-Required": "true"},
-        ) from exc
+    # ``mfa.MfaRequired`` propagates: it has its own handler, which answers 401
+    # with ``error.code == "MfaRequired"`` and the ``X-MFA-Required`` header, so
+    # the client shows a code challenge rather than reporting a bad password.
+    row, token = accounts.login(
+        session,
+        email=payload.email,
+        password=payload.password,
+        organization_id=payload.organization_id,
+        mfa_code=payload.mfa_code,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
     principal = accounts.resolve_principal(session, token)
     _set_cookie(response, token)
     return SessionResponse(
@@ -346,3 +345,151 @@ def disable_mfa(
         resource_id=user.id,
     )
     return MfaStatusResponse(enabled=False, enrolment_pending=False, recovery_codes_remaining=0)
+
+
+# ---------------------------------------------------------------------------
+# Workspaces the caller belongs to
+# ---------------------------------------------------------------------------
+
+
+@router.get("/organizations", response_model=list[MembershipSummary])
+def my_organizations(
+    session: DbSession = Depends(db_session),
+    principal: accounts.Principal = Depends(current_principal),
+) -> list[MembershipSummary]:
+    """Every workspace this account may act in."""
+
+    out: list[MembershipSummary] = []
+    for membership in accounts.memberships_for(session, principal.user_id):
+        organization = session.get(Organization, membership.organization_id)
+        out.append(
+            MembershipSummary(
+                organization_id=membership.organization_id,
+                organization_name=organization.name if organization else "",
+                role=membership.role.value,
+                is_current=membership.organization_id == principal.organization_id,
+            )
+        )
+    return out
+
+
+@router.post("/switch-organization", response_model=SessionResponse)
+def switch_organization(
+    payload: SwitchOrganizationRequest,
+    request: Request,
+    response: Response,
+    session: DbSession = Depends(db_session),
+    principal: accounts.Principal = Depends(current_principal),
+) -> SessionResponse:
+    """Act in a different workspace.
+
+    Issues a **new** session and revokes the current one, because a session
+    names one organization and every authorization decision reads it. Mutating
+    the row instead would let one token act in two tenants across its life.
+    """
+
+    row, token = accounts.switch_organization(
+        session,
+        principal,
+        organization_id=payload.organization_id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    switched = accounts.resolve_principal(session, token)
+    _set_cookie(response, token)
+    return SessionResponse(
+        token=token, expires_at=row.expires_at, user=_user_response(session, switched)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Password reset
+# ---------------------------------------------------------------------------
+
+
+@router.get("/password-reset", response_model=PasswordResetAvailability)
+def password_reset_availability() -> PasswordResetAvailability:
+    """Whether a reset can actually reach a user here.
+
+    Public, and it has to be: the sign-in screen reads this to decide whether
+    to offer "forgot password" at all, and a link that silently goes nowhere is
+    worse than no link. It discloses a property of the deployment, not of any
+    account.
+    """
+
+    provider = passwords.delivery_provider()
+    return PasswordResetAvailability(
+        available=provider.available,
+        channel=provider.name,
+        notice=(
+            "Enter your email address and a reset link will be sent."
+            if provider.available
+            else (
+                "This deployment has no email delivery configured, so a reset link "
+                "cannot be sent. An administrator can issue one directly."
+            )
+        ),
+    )
+
+
+@router.post(
+    "/password-reset/request",
+    status_code=202,
+    dependencies=[Depends(rate_limit_anonymous("password_reset"))],
+)
+def request_password_reset(
+    payload: PasswordResetRequest,
+    request: Request,
+    session: DbSession = Depends(db_session),
+) -> Response:
+    """Begin a reset.
+
+    Answers 202 for *any* address when a delivery channel exists — a different
+    answer for a known address would turn this into an account enumerator. When
+    no channel exists it refuses with 503, which is decided before the address
+    is looked at and is therefore identical for everyone.
+    """
+
+    passwords.request_reset(
+        session,
+        email=payload.email,
+        ip_address=request.client.host if request.client else None,
+    )
+    return Response(status_code=202)
+
+
+@router.post(
+    "/password-reset/confirm",
+    response_model=UserResponse,
+    dependencies=[Depends(rate_limit_anonymous("password_reset_confirm"))],
+)
+def confirm_password_reset(
+    payload: PasswordResetConfirmRequest,
+    request: Request,
+    session: DbSession = Depends(db_session),
+) -> UserResponse:
+    """Set a new password against a token, and sign every session out.
+
+    Revoking the account's sessions is the point of doing this rather than a
+    settings-page password change: the reason someone resets a password is
+    often that a session is in the wrong hands.
+    """
+
+    user = passwords.consume(
+        session,
+        token=payload.token,
+        new_password=payload.new_password,
+        ip_address=request.client.host if request.client else None,
+    )
+    membership = accounts._default_membership(session, user.id)
+    organization = session.get(Organization, membership.organization_id)
+    return UserResponse(
+        id=user.id,
+        email=user.email,
+        display_name=user.display_name,
+        organization_id=membership.organization_id,
+        organization_name=organization.name if organization else "",
+        role=membership.role.value,
+        live_trading_enabled=user.live_trading_enabled,
+        mfa_enabled=mfa.is_enabled(user),
+    )

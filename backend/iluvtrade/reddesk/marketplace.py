@@ -713,6 +713,7 @@ def review(
     if existing is not None:
         existing.rating = rating
         existing.body = body
+        _record_rating(session, principal, listing_id=listing.id, rating=rating, amended=True)
         return existing
 
     row = Review(
@@ -724,7 +725,34 @@ def review(
     )
     session.add(row)
     session.flush()
+    _record_rating(session, principal, listing_id=listing.id, rating=rating, amended=False)
     return row
+
+
+def _record_rating(
+    session: DbSession,
+    principal: Principal,
+    *,
+    listing_id: str,
+    rating: int,
+    amended: bool,
+) -> None:
+    """Audit a rating like any other durable marketplace write.
+
+    A rating changes what every prospective buyer sees on a listing, which
+    makes it exactly the kind of record that needs to be attributable — the
+    rest of this module audits far less consequential actions.
+    """
+
+    audit.record(
+        session,
+        organization_id=principal.organization_id,
+        action="reddesk.listing.rated",
+        resource_type="listing",
+        resource_id=listing_id,
+        actor_user_id=principal.user_id,
+        payload={"rating": rating, "amended": amended},
+    )
 
 
 def refund(

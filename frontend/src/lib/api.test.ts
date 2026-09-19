@@ -116,3 +116,31 @@ describe("browser storage", () => {
     expect(JSON.stringify(localStorage)).not.toContain("SECRET-TOKEN");
   });
 });
+
+describe("a session that expires mid-visit", () => {
+  it("announces itself once, so the shell can return the user to sign-in", async () => {
+    stubFetch({ status: 401, body: { error: { code: "NotAuthenticated", message: "Session expired." } } });
+    const heard: Event[] = [];
+    const listener = (event: Event) => heard.push(event);
+    window.addEventListener("iluvtrade:session-expired", listener);
+
+    await expect(api.get("/datasets")).rejects.toBeInstanceOf(ApiError);
+    window.removeEventListener("iluvtrade:session-expired", listener);
+
+    expect(heard).toHaveLength(1);
+  });
+
+  it("stays silent for an MFA challenge, which is also a 401", async () => {
+    // The caller is mid-login and not signed in yet; clearing the user here
+    // would wipe the form the moment the challenge appeared.
+    stubFetch({ status: 401, body: { error: { code: "MfaRequired", message: "Code needed." } } });
+    const heard: Event[] = [];
+    const listener = (event: Event) => heard.push(event);
+    window.addEventListener("iluvtrade:session-expired", listener);
+
+    await expect(api.post("/auth/login", { email: "a@b.c", password: "x" })).rejects.toBeInstanceOf(ApiError);
+    window.removeEventListener("iluvtrade:session-expired", listener);
+
+    expect(heard).toHaveLength(0);
+  });
+});

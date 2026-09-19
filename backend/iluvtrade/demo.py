@@ -22,6 +22,8 @@ import sys
 import tempfile
 from typing import Any
 
+import pyotp
+
 __all__ = ["run_demo"]
 
 WIDTH = 78
@@ -766,6 +768,199 @@ def run_demo() -> int:
         if limiting["caveat"]:
             print(f"     {limiting['caveat'][:72]}")
         print(f"     notification channels attached: {health['notification_channels'] or 'none'}")
+
+        # -- accounts, continued ----------------------------------------
+        _rule("ACCOUNT SECURITY — second factor, teams, password recovery")
+
+        _step(32, "A correlation id spans the request and comes back on the response")
+        traced = buyer.get("/api/v1/dashboard", headers={"X-Request-ID": "demo-trace-0001"})
+        echoed = traced.headers.get("X-Request-ID")
+        print(f"     sent X-Request-ID=demo-trace-0001  received={echoed}")
+        if echoed != "demo-trace-0001":
+            print("     ✗ the inbound id was not adopted")
+            raise SystemExit(1)
+        print("     an id supplied by a proxy is adopted, not replaced, so one trace stays one")
+
+        _step(33, "Enable two-factor authentication on the buyer's account")
+        enrolment = check(
+            buyer.post("/api/v1/auth/mfa/enrol", headers=headers), 201, "begin MFA enrolment"
+        )
+        secret, recovery = enrolment["secret"], enrolment["recovery_codes"]
+        print(f"     secret issued ({len(secret)} chars) and {len(recovery)} recovery codes")
+        print("     MFA is NOT yet on — enrolment is two-step, so a lost")
+        print("     secret cannot lock anyone out of their own account")
+        before = buyer.get("/api/v1/auth/mfa").json()
+        print(f"     enabled={before['enabled']}  pending={before['enrolment_pending']}")
+
+        check(
+            buyer.post(
+                "/api/v1/auth/mfa/confirm",
+                json={"code": pyotp.TOTP(secret).now()},
+                headers=headers,
+            ),
+            200,
+            "confirm MFA",
+        )
+        print("     confirmed with a live code from the secret — MFA is now required at sign-in")
+
+        _step(34, "The secret is never served again")
+        leaked_secret = [
+            path
+            for path in ("/api/v1/auth/mfa", "/api/v1/auth/me", "/api/v1/audit?limit=200")
+            if secret in buyer.get(path).text
+        ]
+        print(f"     endpoints re-serving the secret: {leaked_secret or 'none'}")
+        if leaked_secret:
+            # Joins whatever the credential sweep in step 26 already found, so
+            # the demo's exit status reflects every leak rather than the last.
+            leaked.extend(leaked_secret)
+
+        _step(35, "Sign out, then try to sign in with only the password")
+        buyer.post("/api/v1/auth/logout", headers=headers)
+        refused = buyer.post(
+            "/api/v1/auth/login",
+            json={"email": "trader@example.com", "password": "correct-horse-battery-staple"},
+        )
+        body = refused.json()["error"]
+        print(f"     HTTP {refused.status_code}  code={body['code']}")
+        print(f"     X-MFA-Required: {refused.headers.get('X-MFA-Required')}")
+        if body["code"] != "MfaRequired":
+            print("     ✗ the refusal is indistinguishable from a wrong password")
+            raise SystemExit(1)
+        print("     distinguishable from a wrong password, so the UI shows a code challenge")
+
+        _step(36, "Sign in with a recovery code, which is then spent")
+        check(
+            buyer.post(
+                "/api/v1/auth/login",
+                json={
+                    "email": "trader@example.com",
+                    "password": "correct-horse-battery-staple",
+                    "mfa_code": recovery[0],
+                },
+            ),
+            200,
+            "login with a recovery code",
+        )
+        remaining = buyer.get("/api/v1/auth/mfa").json()["recovery_codes_remaining"]
+        print(f"     signed in; recovery codes remaining: {remaining} (was {len(recovery)})")
+        replayed = buyer.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "trader@example.com",
+                "password": "correct-horse-battery-staple",
+                "mfa_code": recovery[0],
+            },
+        )
+        print(f"     replaying the same recovery code: HTTP {replayed.status_code}")
+        if replayed.status_code == 200:
+            print("     ✗ a recovery code was accepted twice")
+            raise SystemExit(1)
+
+        _step(37, "The creator invites an analyst into their workspace")
+        with TestClient(app) as analyst:
+            check(
+                analyst.post(
+                    "/api/v1/auth/register",
+                    json={
+                        "email": "analyst@example.com",
+                        "password": "correct-horse-battery-staple",
+                        "display_name": "Analyst",
+                    },
+                ),
+                201,
+                "register analyst",
+            )
+            invitation = check(
+                creator.post(
+                    "/api/v1/organizations/invitations",
+                    json={"email": "analyst@example.com", "role": "viewer"},
+                    headers=headers,
+                ),
+                201,
+                "create invitation",
+            )
+            print(
+                f"     invited analyst@example.com as {invitation['invitation']['role']}, "
+                f"status={invitation['invitation']['status']}"
+            )
+            print("     the token is returned to the inviter once — this deployment sends no email")
+
+            _step(38, "A leaked token is inert in the wrong hands")
+            stolen = buyer.post(
+                "/api/v1/organizations/invitations/accept",
+                json={"token": invitation["token"]},
+                headers=headers,
+            )
+            print(f"     the buyer tries the same token: HTTP {stolen.status_code}")
+            if stolen.status_code == 200:
+                print("     ✗ an invitation was accepted by an address it was not issued to")
+                raise SystemExit(1)
+
+            _step(39, "The analyst accepts, and the role is the invitation's, not theirs to choose")
+            joined = check(
+                analyst.post(
+                    "/api/v1/organizations/invitations/accept",
+                    json={"token": invitation["token"]},
+                    headers=headers,
+                ),
+                200,
+                "accept invitation",
+            )
+            print(f"     joined as {joined['role']}")
+            escalation = analyst.post(
+                "/api/v1/organizations/invitations/accept",
+                json={"token": invitation["token"], "role": "owner"},
+                headers=headers,
+            )
+            print(f"     attempting to send a role with the token: HTTP {escalation.status_code}")
+
+            _step(40, "The analyst switches workspace and the role is enforced there")
+            switched = check(
+                analyst.post(
+                    "/api/v1/auth/switch-organization",
+                    json={"organization_id": creator_user["organization_id"]},
+                    headers=headers,
+                ),
+                200,
+                "switch organization",
+            )
+            print(
+                f"     now acting in {switched['user']['organization_name']} "
+                f"as {switched['user']['role']}"
+            )
+            members = analyst.get("/api/v1/organizations/members").json()
+            print(f"     workspace members: {[m['email'] for m in members]}")
+            denied = analyst.post(
+                "/api/v1/strategies", json={"name": "Not allowed"}, headers=headers
+            )
+            print(f"     a viewer creating a strategy: HTTP {denied.status_code}")
+            if denied.status_code != 403:
+                print("     ✗ a viewer was able to write")
+                raise SystemExit(1)
+
+        _step(41, "Password reset refuses rather than pretending")
+        availability = creator.get("/api/v1/auth/password-reset").json()
+        print(
+            f"     delivery channel: {availability['channel']}  "
+            f"available={availability['available']}"
+        )
+        attempted = creator.post(
+            "/api/v1/auth/password-reset/request", json={"email": "quant@example.com"}
+        )
+        unknown = creator.post(
+            "/api/v1/auth/password-reset/request", json={"email": "nobody@example.com"}
+        )
+        print(
+            f"     known address:   HTTP {attempted.status_code} "
+            f"{attempted.json()['error']['code']}"
+        )
+        print(f"     unknown address: HTTP {unknown.status_code} {unknown.json()['error']['code']}")
+        if attempted.text != unknown.text:
+            print("     ✗ the two answers differ, which would enumerate accounts")
+            raise SystemExit(1)
+        print("     identical for both, and decided before the address is looked up")
+        print("     a 202 that never arrives would be worse: the user would wait for nothing")
 
         _rule()
         print("\nEvery step above ran against the real application: real HTTP routes, real")

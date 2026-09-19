@@ -1,9 +1,11 @@
 import { useState } from "react";
 
 import { ConfirmButton } from "../components/Confirm";
+import MfaSettings from "../components/MfaSettings";
+import Workspace from "../components/Workspace";
 import { Banner, Card, ErrorBanner, Field, Loading } from "../components/ui";
 import { ApiError, api, health } from "../lib/api";
-import type { HealthResponse, Notification, User } from "../lib/api";
+import type { HealthResponse, Notification, PasswordResetAvailability, User } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { relative } from "../lib/format";
 import { useAsync } from "../lib/useAsync";
@@ -12,6 +14,13 @@ export default function SettingsPage() {
   const { user, refresh } = useAuth();
   const status = useAsync<HealthResponse>(() => health(), []);
   const notifications = useAsync<Notification[]>(() => api.get<Notification[]>("/notifications?limit=50"), []);
+  // Read from the endpoint that owns the answer rather than inferred from the
+  // notification channels: they are different transports and conflating them
+  // would make this panel quietly wrong the moment one is configured.
+  const reset = useAsync<PasswordResetAvailability>(
+    () => api.get<PasswordResetAvailability>("/auth/password-reset"),
+    [],
+  );
   const [displayName, setDisplayName] = useState(user?.display_name ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>();
@@ -100,6 +109,35 @@ export default function SettingsPage() {
         </Card>
       </div>
 
+      <div className="grid cols-2">
+        <MfaSettings />
+
+        <Card title="Sessions and sign-in">
+          <p className="small dim">
+            Signing in issues a session that lasts until it expires or you sign out. Resetting your
+            password signs out every session on the account, which is the point of resetting one.
+          </p>
+          <table>
+            <tbody>
+              <tr>
+                <td className="dim small">Password reset delivery</td>
+                <td className="mono small">{reset.data?.channel ?? "—"}</td>
+              </tr>
+              <tr>
+                <td className="dim small">Two-factor</td>
+                <td className="mono small">{user.mfa_enabled ? "required at sign-in" : "not enabled"}</td>
+              </tr>
+            </tbody>
+          </table>
+          <p className="tiny faint" style={{ marginBottom: 0 }}>
+            {reset.data?.notice}
+          </p>
+        </Card>
+      </div>
+
+      <h2 style={{ marginTop: "1.4rem", marginBottom: "0.6rem", fontSize: "1rem" }}>Workspace</h2>
+      <Workspace />
+
       <Card
         title="Notifications"
         actions={
@@ -141,6 +179,25 @@ export default function SettingsPage() {
               <tr><td className="dim">Application version</td><td className="mono small">{status.data?.version}</td></tr>
               <tr><td className="dim">Environment</td><td className="mono small">{status.data?.environment}</td></tr>
               <tr><td className="dim">Engine</td><td className="mono small">{status.data?.engine.name} {status.data?.engine.version}</td></tr>
+              <tr>
+                <td className="dim">Payments</td>
+                <td className="mono small">{status.data?.payment_provider ?? "—"}</td>
+              </tr>
+              <tr>
+                <td className="dim">Notification channels</td>
+                <td className="mono small">
+                  {status.data ? (status.data.notification_channels.join(", ") || "in-app only") : "—"}
+                </td>
+              </tr>
+              <tr>
+                <td className="dim">Rate limiting</td>
+                <td className="small">
+                  <span className={`badge ${status.data?.rate_limiting.enabled ? "ok" : "err"}`}>
+                    {status.data?.rate_limiting.enabled ? "on" : "off"}
+                  </span>{" "}
+                  <span className="tiny faint">{status.data?.rate_limiting.caveat}</span>
+                </td>
+              </tr>
             </tbody>
           </table>
         </div>

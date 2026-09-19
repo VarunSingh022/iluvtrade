@@ -36,3 +36,8 @@ npm-debug.log*
 
 # --- build artifacts --------------------------------------------------------
 *.tsbuildinfo
+
+# --- deployment -------------------------------------------------------------
+# The AlphaLab wheel is built from its own repository and is not redistributed
+# here. See deploy/README.md.
+deploy/wheels/*.whl

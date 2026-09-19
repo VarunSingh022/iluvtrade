@@ -348,7 +348,20 @@ def test_login_over_http_signals_that_a_code_is_needed(app) -> None:
         )
         assert refused.status_code == 401
         assert refused.headers.get("X-MFA-Required") == "true"
-        assert refused.json()["error"]["code"] == "NotAuthenticated"
+        # Both signals, because a client can only ever see one of them: a
+        # cross-origin caller reads the header only if CORS exposes it, and a
+        # proxy may strip it. The body always arrives.
+        assert refused.json()["error"]["code"] == "MfaRequired"
+
+        # And it must be distinguishable from a genuinely wrong password —
+        # otherwise the UI tells a user with a working password that it is
+        # wrong, and the account is unreachable through the app.
+        wrong = client.post(
+            "/api/v1/auth/login", json={"email": "http@example.com", "password": "not-the-one"}
+        )
+        assert wrong.status_code == 401
+        assert wrong.json()["error"]["code"] == "AuthError"
+        assert "X-MFA-Required" not in wrong.headers
 
         accepted = client.post(
             "/api/v1/auth/login",

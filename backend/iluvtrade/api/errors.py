@@ -17,6 +17,7 @@ from typing import Any
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from iluvtrade.backtests.service import BacktestSubmissionError
@@ -24,6 +25,9 @@ from iluvtrade.brokers.crypto import CredentialError
 from iluvtrade.brokers.service import BrokerError
 from iluvtrade.data.ingest import IngestError
 from iluvtrade.platform.accounts import AuthError, RegistrationError
+from iluvtrade.platform.invitations import InvitationError
+from iluvtrade.platform.mfa import MfaRequired
+from iluvtrade.platform.passwords import DeliveryUnavailable, ResetError
 from iluvtrade.platform.ratelimit import RateLimitError
 from iluvtrade.platform.security import WeakPasswordError
 from iluvtrade.platform.tenancy import NotFoundError, TenancyError
@@ -44,6 +48,7 @@ _HTTP_CODES: dict[int, str] = {
     413: "PayloadTooLarge",
     422: "ValidationError",
     429: "RateLimited",
+    503: "ServiceUnavailable",
 }
 
 #: Starlette renamed this constant; read whichever this version defines.
@@ -57,6 +62,12 @@ _STATUS_MAP: tuple[tuple[type[Exception], int], ...] = (
     (VersionFrozenError, status.HTTP_409_CONFLICT),
     (CredentialError, status.HTTP_409_CONFLICT),
     (RegistrationError, status.HTTP_400_BAD_REQUEST),
+    (InvitationError, status.HTTP_400_BAD_REQUEST),
+    (ResetError, status.HTTP_400_BAD_REQUEST),
+    # Not 400: the request was fine, the deployment cannot carry it. A
+    # client distinguishing these is the difference between "try again"
+    # and "this will never work here, ask an administrator".
+    (DeliveryUnavailable, status.HTTP_503_SERVICE_UNAVAILABLE),
     (WeakPasswordError, status.HTTP_400_BAD_REQUEST),
     (IngestError, status.HTTP_400_BAD_REQUEST),
     (StrategyError, status.HTTP_400_BAD_REQUEST),
@@ -106,6 +117,60 @@ def install(app: FastAPI) -> None:
                 }
             },
             headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
+
+    @app.exception_handler(MfaRequired)
+    async def _mfa_required(_request: Request, exc: MfaRequired) -> JSONResponse:
+        """401, but not "wrong password".
+
+        The password *was* correct. A client that cannot tell this apart from a
+        credential failure shows "invalid email or password" to someone whose
+        password is fine, and the account becomes unreachable through the UI.
+
+        Said twice on purpose. The header is the conventional signal; the
+        ``error.code`` is the one that survives, because a cross-origin client
+        cannot read a response header unless CORS is configured to expose it,
+        and a proxy is free to strip one. The body always arrives.
+        """
+
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content=_payload(exc, "MfaRequired"),
+            headers={"X-MFA-Required": "true"},
+        )
+
+    @app.exception_handler(OperationalError)
+    async def _database_busy(_request: Request, exc: OperationalError) -> JSONResponse:
+        """A transient database contention failure, told apart from a real fault.
+
+        SQLite serialises writers, and a long transaction — dataset ingestion
+        holds one for the length of the parse — can make a concurrent write
+        exceed ``busy_timeout`` and fail with "database is locked". That is
+        retryable, and answering it with a generic 500 tells the user the
+        opposite: that something is broken and trying again is pointless.
+
+        Only the contention case is remapped. Every other ``OperationalError``
+        is a genuine fault and falls through to the 500 handler, where it is
+        logged with its detail and the client is told nothing specific.
+        """
+
+        text = str(exc.orig if exc.orig is not None else exc).lower()
+        if "database is locked" not in text and "database table is locked" not in text:
+            raise exc
+
+        logger.warning("Database contention: %s", text)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": {
+                    "code": "DatabaseBusy",
+                    "message": (
+                        "The database is busy with another write. Nothing was changed; "
+                        "try again in a moment."
+                    ),
+                }
+            },
+            headers={"Retry-After": "2"},
         )
 
     @app.exception_handler(StarletteHTTPException)

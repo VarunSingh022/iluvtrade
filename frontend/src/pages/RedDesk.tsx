@@ -1,6 +1,7 @@
 import { useState } from "react";
 
-import { Badge, Banner, Card, ErrorBanner, Loading, Stat, StatusBadge, Tabs } from "../components/ui";
+import { ConfirmButton } from "../components/Confirm";
+import { Badge, Banner, Card, ErrorBanner, Field, Loading, Stat, StatusBadge, Tabs } from "../components/ui";
 import { ApiError, api } from "../lib/api";
 import type { BacktestJob, BillingStatus, Entitlement, Listing, Strategy } from "../lib/api";
 import { count, money, percent, ratio, shortId, when } from "../lib/format";
@@ -15,6 +16,52 @@ export default function RedDeskPage() {
   const [error, setError] = useState<string | undefined>();
   const [notice, setNotice] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
+  const [rating, setRating] = useState<{ listingId: string; stars: number; body: string } | undefined>();
+
+  /**
+   * Move a rolling licence to the listing's current version.
+   *
+   * Explicit, and only offered for a rolling licence: a pinned one never
+   * changes under the buyer, and the server refuses it. Offering a button that
+   * would be refused is a worse way to say so.
+   */
+  async function advance(entitlementId: string) {
+    setBusy(true);
+    setError(undefined);
+    setNotice(undefined);
+    try {
+      const updated = await api.post<Entitlement>(`/reddesk/entitlements/${entitlementId}/advance`);
+      setNotice(
+        `Licence updated to strategy version ${shortId(updated.granted_strategy_version_id)}.`,
+      );
+      entitlements.reload();
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : String(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitRating() {
+    if (!rating) return;
+    setBusy(true);
+    setError(undefined);
+    setNotice(undefined);
+    try {
+      await api.post(`/reddesk/listings/${rating.listingId}/rate`, {
+        rating: rating.stars,
+        body: rating.body,
+      });
+      setRating(undefined);
+      setNotice("Rating recorded.");
+      discover.reload();
+      mine.reload();
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : String(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function buy(listing: Listing) {
     setBusy(true);
@@ -164,7 +211,7 @@ export default function RedDeskPage() {
             <div className="table-wrap">
               <table>
                 <thead>
-                  <tr><th>Strategy version granted</th><th>Licence</th><th>Status</th><th>From</th><th>Until</th></tr>
+                  <tr><th>Strategy version granted</th><th>Licence</th><th>Status</th><th>From</th><th>Until</th><th /></tr>
                 </thead>
                 <tbody>
                   {(entitlements.data ?? []).map((row) => (
@@ -174,10 +221,68 @@ export default function RedDeskPage() {
                       <td><StatusBadge status={row.status} /></td>
                       <td className="tiny faint">{when(row.valid_from)}</td>
                       <td className="tiny faint">{row.valid_until ? when(row.valid_until) : "perpetual"}</td>
+                      <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                        {row.version_access_policy === "rolling" && row.status === "active" && (
+                          <button
+                            className="small"
+                            disabled={busy}
+                            onClick={() => void advance(row.id)}
+                            type="button"
+                            title="Move this licence to the listing's current version"
+                          >
+                            Update version
+                          </button>
+                        )}
+                        <button
+                          className="small"
+                          style={{ marginLeft: 4 }}
+                          disabled={busy}
+                          onClick={() => setRating({ listingId: row.listing_id, stars: 5, body: "" })}
+                          type="button"
+                        >
+                          Rate
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+
+          {rating && (
+            <div style={{ marginTop: "1rem", borderTop: "1px solid var(--border)", paddingTop: "0.8rem" }}>
+              <p className="small" style={{ marginTop: 0 }}>
+                Rate this strategy. Only a workspace holding an entitlement can, which is what
+                stops a listing from being rated by people who never ran it.
+              </p>
+              <div className="row" style={{ alignItems: "flex-end" }}>
+                <Field label="Stars">
+                  <select
+                    value={rating.stars}
+                    onChange={(event) => setRating({ ...rating, stars: Number(event.target.value) })}
+                  >
+                    {[1, 2, 3, 4, 5].map((value) => (
+                      <option key={value} value={value}>{value}</option>
+                    ))}
+                  </select>
+                </Field>
+                <div style={{ flex: 1 }}>
+                  <Field label="Comment">
+                    <input
+                      value={rating.body}
+                      onChange={(event) => setRating({ ...rating, body: event.target.value })}
+                      placeholder="Optional"
+                    />
+                  </Field>
+                </div>
+                <button className="primary" disabled={busy} onClick={() => void submitRating()} type="button">
+                  Submit rating
+                </button>
+                <button disabled={busy} onClick={() => setRating(undefined)} type="button">
+                  Cancel
+                </button>
+              </div>
             </div>
           )}
         </Card>
@@ -247,7 +352,7 @@ function SellTab({ listings }: { listings: ReturnType<typeof useAsync<Listing[]>
     }
   }
 
-  async function advance(listing: Listing, action: "submit" | "review" | "publish") {
+  async function advance(listing: Listing, action: "submit" | "review" | "publish" | "withdraw") {
     setBusy(true);
     setError(undefined);
     try {
@@ -326,6 +431,14 @@ function SellTab({ listings }: { listings: ReturnType<typeof useAsync<Listing[]>
             {listing.status === "draft" && <button disabled={busy} onClick={() => void advance(listing, "submit")} type="button">Submit for review</button>}
             {listing.status === "submitted" && <button disabled={busy} onClick={() => void advance(listing, "review")} type="button">Approve</button>}
             {listing.status === "approved" && <button className="primary" disabled={busy} onClick={() => void advance(listing, "publish")} type="button">Publish</button>}
+            {listing.status === "published" && (
+              <ConfirmButton
+                label="Withdraw from sale"
+                confirmLabel="Withdraw this listing"
+                consequence="It disappears from discovery and cannot be bought again. Licences already sold keep working — withdrawing is not revoking."
+                onConfirm={() => advance(listing, "withdraw")}
+              />
+            )}
           </div>
         </Card>
       ))}

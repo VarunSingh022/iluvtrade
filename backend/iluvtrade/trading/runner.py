@@ -430,9 +430,21 @@ class SessionRunner:
             thread.join(timeout=timeout)
 
     def join_all(self, timeout: float = 120.0) -> None:
+        """Wait for every launched runner, then forget the ones that finished.
+
+        Runner threads are daemons, so nothing waits for them by default. That
+        is right for a process that is exiting and wrong for a test suite about
+        to repoint the database underneath them: a runner that keeps polling
+        after its database has gone raises from a background thread, which
+        pytest reports against whichever test is running *next*. The test
+        fixtures call this before resetting the engine.
+        """
+
         deadline = time.monotonic() + timeout
         for thread in list(self._threads.values()):
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._lock:
+            self._threads = {key: value for key, value in self._threads.items() if value.is_alive()}
 
 
 #: The process-wide runner the API uses.

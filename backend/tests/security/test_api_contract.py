@@ -18,6 +18,14 @@ PUBLIC = {
     ("GET", "/api/health"),
     ("POST", "/api/v1/auth/register"),
     ("POST", "/api/v1/auth/login"),
+    # Password reset is reached by someone who cannot sign in, so it cannot
+    # require a session. Each is anonymous-safe by construction: the
+    # availability probe describes the deployment and no account; the request
+    # endpoint answers identically for a known and an unknown address; the
+    # confirm endpoint needs a 256-bit token. All three are rate limited.
+    ("GET", "/api/v1/auth/password-reset"),
+    ("POST", "/api/v1/auth/password-reset/request"),
+    ("POST", "/api/v1/auth/password-reset/confirm"),
 }
 
 _PATH_PARAMS = (
@@ -28,6 +36,7 @@ _PATH_PARAMS = (
     "{session_id}",
     "{account_id}",
     "{strategy_id}",
+    "{invitation_id}",
 )
 
 

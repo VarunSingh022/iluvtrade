@@ -1,0 +1,61 @@
+# A deployment of iluvtrade: PostgreSQL, and one application container that
+# serves both the API and the built frontend.
+#
+# NOT a production deployment as written. It is a reproducible way to run the
+# whole thing on one machine. Before pointing anything real at it, read
+# docs/DEPLOYMENT.md — in particular, the database here has no backup, no
+# volume snapshot policy and a password from an environment file.
+#
+# PREREQUISITE: deploy/wheels/alphalab-3.0.0-py3-none-any.whl must exist.
+# AlphaLab is not on PyPI; see the header of the Dockerfile.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: iluvtrade
+      POSTGRES_USER: iluvtrade
+      # No default. An unset password here is a startup failure rather than a
+      # deployment that quietly comes up with a guessable one.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      # The application's migrations run at startup and will fail against a
+      # database that is still initialising, so the API waits for this.
+      test: ["CMD-SHELL", "pg_isready -U iluvtrade -d iluvtrade"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ILUVTRADE_ENVIRONMENT: production
+      ILUVTRADE_SECRET_KEY: ${ILUVTRADE_SECRET_KEY:?set ILUVTRADE_SECRET_KEY in .env}
+      ILUVTRADE_DATABASE_URL: postgresql+psycopg://iluvtrade:${POSTGRES_PASSWORD}@db:5432/iluvtrade
+      ILUVTRADE_STORAGE_ROOT: /var/lib/iluvtrade/storage
+      # Schema is Alembic's; the entrypoint runs the upgrade explicitly.
+      ILUVTRADE_AUTO_CREATE_TABLES: "false"
+      # Same-origin: this container serves the frontend, so no CORS is needed.
+      # A separately hosted frontend sets this to its exact https origin.
+      ILUVTRADE_ALLOWED_ORIGINS: ""
+      ILUVTRADE_LIVE_TRADING_ENABLED: "false"
+      ILUVTRADE_PAYMENT_PROVIDER: manual
+      # See deploy/entrypoint.sh: counters are per-process.
+      ILUVTRADE_WEB_CONCURRENCY: "1"
+    volumes:
+      - storage:/var/lib/iluvtrade/storage
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  storage:
