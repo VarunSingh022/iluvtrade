@@ -122,48 +122,49 @@ jobs:
         env:
           ALPHALAB_WHEEL_URL: ${{ vars.ALPHALAB_WHEEL_URL }}
 
-      - name: Install
+      - name: Create project venv and install dependencies
         if: steps.engine.outputs.available == 'true'
         working-directory: backend
         run: |
-          python -m pip install --upgrade pip
-          pip install ../deploy/wheels/alphalab-3.5.0-py3-none-any.whl
-          pip install -e ".[dev]"
+          python -m venv .venv
+          ./.venv/bin/pip install --upgrade pip
+          ./.venv/bin/pip install ../deploy/wheels/alphalab-3.5.0-py3-none-any.whl
+          ./.venv/bin/pip install -e ".[dev]"
 
       - name: Ruff
         if: steps.engine.outputs.available == 'true'
         working-directory: backend
-        run: ruff check .
+        run: ./.venv/bin/ruff check .
 
       - name: Ruff format
         if: steps.engine.outputs.available == 'true'
         working-directory: backend
-        run: ruff format --check .
+        run: ./.venv/bin/ruff format --check .
 
       - name: Mypy
         if: steps.engine.outputs.available == 'true'
         working-directory: backend
-        run: mypy
+        run: ./.venv/bin/mypy
 
       - name: Configuration is safe for this environment
         if: steps.engine.outputs.available == 'true'
         working-directory: backend
-        run: python -m iluvtrade.cli check-config
+        run: ./.venv/bin/python -m iluvtrade.cli check-config
 
       - name: AlphaLab boundary
         if: steps.engine.outputs.available == 'true'
         working-directory: backend
-        run: pytest -q tests/unit/test_engine_boundary.py
+        run: ./.venv/bin/pytest -q tests/unit/test_engine_boundary.py
 
       - name: Test isolation — the suite cannot reach a real database
         if: steps.engine.outputs.available == 'true'
         working-directory: backend
-        run: pytest -q tests/test_isolation.py
+        run: ./.venv/bin/pytest -q tests/test_isolation.py
 
       - name: Full test suite
         if: steps.engine.outputs.available == 'true'
         working-directory: backend
-        run: pytest -q
+        run: ./.venv/bin/pytest -q
 
       - name: Alembic — models match migrations
         if: steps.engine.outputs.available == 'true'
@@ -173,13 +174,13 @@ jobs:
         # particular machine's layout.
         run: |
           export ILUVTRADE_DATABASE_URL="sqlite:///${RUNNER_TEMP}/ci-check.db"
-          alembic upgrade head
-          alembic check
+          ./.venv/bin/alembic upgrade head
+          ./.venv/bin/alembic check
 
       - name: End-to-end demonstration
         if: steps.engine.outputs.available == 'true'
         working-directory: backend
-        run: python -m iluvtrade.cli demo
+        run: ./.venv/bin/python -m iluvtrade.cli demo
 
   postgres:
     name: Migrations against PostgreSQL
@@ -228,13 +229,14 @@ jobs:
         env:
           ALPHALAB_WHEEL_URL: ${{ vars.ALPHALAB_WHEEL_URL }}
 
-      - name: Install, with the PostgreSQL driver
+      - name: Create project venv and install dependencies, with the PostgreSQL driver
         if: steps.engine.outputs.available == 'true'
         working-directory: backend
         run: |
-          python -m pip install --upgrade pip
-          pip install ../deploy/wheels/alphalab-3.5.0-py3-none-any.whl
-          pip install -e ".[dev,postgres]"
+          python -m venv .venv
+          ./.venv/bin/pip install --upgrade pip
+          ./.venv/bin/pip install ../deploy/wheels/alphalab-3.5.0-py3-none-any.whl
+          ./.venv/bin/pip install -e ".[dev,postgres]"
 
       - name: Migrate a PostgreSQL database from empty to head
         if: steps.engine.outputs.available == 'true'
@@ -242,9 +244,9 @@ jobs:
         env:
           ILUVTRADE_DATABASE_URL: postgresql+psycopg://iluvtrade:ci-not-a-secret@localhost:5432/iluvtrade
         run: |
-          alembic upgrade head
-          alembic current
-          alembic check
+          ./.venv/bin/alembic upgrade head
+          ./.venv/bin/alembic current
+          ./.venv/bin/alembic check
 
       - name: Run the suite against PostgreSQL
         if: steps.engine.outputs.available == 'true'
@@ -253,4 +255,4 @@ jobs:
           ILUVTRADE_DATABASE_URL: postgresql+psycopg://iluvtrade:ci-not-a-secret@localhost:5432/iluvtrade
         # Expected to reveal dialect differences the SQLite run cannot. Its
         # result is evidence either way; see docs/DEPLOYMENT.md.
-        run: pytest -q
+        run: ./.venv/bin/pytest -q
