@@ -204,6 +204,33 @@ python3.12 -m venv .venv
 is the single most common way a fresh setup stalls, which is why it is stated
 before the step that needs it rather than after.
 
+### GitHub Actions: required AlphaLab wheel configuration
+
+A clean CI runner has the same requirement as a fresh local environment: it
+must be able to fetch the exact `alphalab==3.0.0` wheel before installing the
+backend. The workflow in `.github/workflows/ci.yml` looks for a repository
+variable named `ALPHALAB_WHEEL_URL`, then downloads the wheel into
+`deploy/wheels/` before running the backend checks.
+
+Set the value in GitHub at:
+
+`Settings -> Secrets and variables -> Actions -> Variables -> New repository variable`
+
+The variable must contain only a non-sensitive direct HTTPS URL to the wheel,
+for example a public package index URL or a public release asset URL. The
+workflow uses `curl -fsSL` against that URL, so it is not a secret and should
+not contain credentials or bearer-style signed URLs embedded in the repository
+itself.
+
+If the AlphaLab wheel is private and requires authentication, the auth must use
+an appropriate GitHub Actions secret/token or another authenticated artifact
+mechanism. Do not place credentials or an authenticated bearer-style URL in a
+normal repository variable, and do not prescribe a private-artifact mechanism the
+current workflow does not actually support.
+
+If no value is configured and no wheel exists in `deploy/wheels/`, the backend
+job fails immediately with a clear error instead of silently passing or skipping.
+
 Verify the install actually took, rather than assuming it did:
 
 ```bash

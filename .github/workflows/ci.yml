@@ -3,14 +3,14 @@ name: CI
 # Every gate this project has, run on a machine that is not a developer's.
 #
 # ---------------------------------------------------------------------------
-# READ THIS BEFORE WONDERING WHY THE BACKEND JOB SKIPS
+# READ THIS BEFORE WONDERING WHY THE BACKEND JOB FAILS
 # ---------------------------------------------------------------------------
 #
 # `alphalab==3.0.0` is NOT on PyPI. It is built from its own repository, and
 # this repository does not vendor the wheel (see deploy/README.md). CI
 # therefore cannot install the backend from a clean checkout alone.
 #
-# The backend jobs obtain the wheel from one of two places and skip, loudly,
+# The backend jobs obtain the wheel from one of two places and fail clearly
 # when neither is configured:
 #
 #   * `ALPHALAB_WHEEL_URL` — a repository *variable* pointing at a wheel the
@@ -18,9 +18,10 @@ name: CI
 #   * A wheel committed to `deploy/wheels/` on a branch where that is
 #     acceptable.
 #
-# Skipping rather than failing is deliberate: a permanently red pipeline that
-# everyone has learned to ignore is worse than an honest "not run here". The
-# frontend job has no such dependency and always runs.
+# The workflow must not silently skip backend checks when the engine artifact is
+# absent. A clean runner can only install `alphalab==3.0.0` from a wheel the
+# AlphaLab project publishes; the wheel is not on PyPI. The frontend job has no
+# such dependency and still runs.
 #
 # ---------------------------------------------------------------------------
 # WHAT CI MUST NEVER TOUCH
@@ -103,16 +104,20 @@ jobs:
         id: engine
         run: |
           set -euo pipefail
-          mkdir -p deploy/wheels
+          engine_wheel="deploy/wheels/alphalab-3.0.0-py3-none-any.whl"
+          mkdir -p "$(dirname "$engine_wheel")"
+
           if [ -n "${ALPHALAB_WHEEL_URL:-}" ]; then
             echo "Fetching the engine wheel from ALPHALAB_WHEEL_URL"
-            curl -fsSL "$ALPHALAB_WHEEL_URL" -o deploy/wheels/alphalab-3.0.0-py3-none-any.whl
+            curl -fsSL "$ALPHALAB_WHEEL_URL" -o "$engine_wheel"
           fi
-          if ls deploy/wheels/alphalab-3.0.0-py3-none-any.whl >/dev/null 2>&1; then
+
+          if [ -f "$engine_wheel" ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=AlphaLab wheel missing::alphalab==3.0.0 is not on PyPI and no wheel was provided. Set the ALPHALAB_WHEEL_URL repository variable, or commit the wheel to deploy/wheels/. Backend checks are being skipped, not passed."
+            echo "::error title=AlphaLab wheel missing::alphalab==3.0.0 is not on PyPI and no wheel was provided. Set the repository variable ALPHALAB_WHEEL_URL to a direct wheel URL, or commit the wheel to deploy/wheels/."
+            exit 1
           fi
         env:
           ALPHALAB_WHEEL_URL: ${{ vars.ALPHALAB_WHEEL_URL }}
@@ -180,7 +185,7 @@ jobs:
     name: Migrations against PostgreSQL
     runs-on: ubuntu-latest
     # This is the job that turns "PostgreSQL: NOT TESTED" into an answer. It
-    # needs the same engine wheel, so it skips under the same condition.
+    # needs the same engine wheel, so it fails under the same condition.
     services:
       postgres:
         image: postgres:16-alpine
@@ -206,14 +211,19 @@ jobs:
         id: engine
         run: |
           set -euo pipefail
-          mkdir -p deploy/wheels
+          engine_wheel="deploy/wheels/alphalab-3.0.0-py3-none-any.whl"
+          mkdir -p "$(dirname "$engine_wheel")"
+
           if [ -n "${ALPHALAB_WHEEL_URL:-}" ]; then
-            curl -fsSL "$ALPHALAB_WHEEL_URL" -o deploy/wheels/alphalab-3.0.0-py3-none-any.whl
+            curl -fsSL "$ALPHALAB_WHEEL_URL" -o "$engine_wheel"
           fi
-          if ls deploy/wheels/alphalab-3.0.0-py3-none-any.whl >/dev/null 2>&1; then
+
+          if [ -f "$engine_wheel" ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::error title=AlphaLab wheel missing::alphalab==3.0.0 is not on PyPI and no wheel was provided. Set the repository variable ALPHALAB_WHEEL_URL to a direct wheel URL, or commit the wheel to deploy/wheels/."
+            exit 1
           fi
         env:
           ALPHALAB_WHEEL_URL: ${{ vars.ALPHALAB_WHEEL_URL }}
