@@ -17,7 +17,7 @@ So the architecture is organised around keeping that from being possible.
 
 ### AlphaLab — every quantitative and trading semantic
 
-An installed dependency (`alphalab==3.0.0`), never vendored. It owns:
+An installed dependency (`alphalab==3.5.0`), never vendored. It owns:
 
 | Concern | AlphaLab type |
 |---|---|

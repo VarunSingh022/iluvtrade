@@ -4,7 +4,7 @@
 
 - Python 3.12+
 - Node 20+ (for the frontend)
-- AlphaLab 3.0.0 — a wheel or an installable source tree
+- AlphaLab 3.5.0 — a wheel or an installable source tree
 
 ## Install
 
@@ -15,7 +15,7 @@ git clone <this repository> && cd iluvtrade
 cd backend
 python3 -m venv .venv
 ./.venv/bin/pip install --upgrade pip
-./.venv/bin/pip install /path/to/alphalab-3.0.0-py3-none-any.whl
+./.venv/bin/pip install /path/to/alphalab-3.5.0-py3-none-any.whl
 ./.venv/bin/pip install -e ".[dev]"
 
 # Frontend
@@ -27,7 +27,7 @@ Verify it:
 
 ```bash
 cd backend && ./.venv/bin/python -c "import alphalab; print(alphalab.__version__)"
-# 3.0.0
+# 3.5.0
 ```
 
 If this prints a different version, another `alphalab` is shadowing it — check

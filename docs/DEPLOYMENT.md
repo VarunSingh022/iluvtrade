@@ -194,20 +194,20 @@ python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
 
-`alphalab==3.0.0` is **not on PyPI**. It comes from the engine's own build:
+`alphalab==3.5.0` is **not on PyPI**. It comes from the engine's own build:
 
 ```bash
-.venv/bin/pip install /path/to/AlphaLab/dist/alphalab-3.0.0-py3-none-any.whl
+.venv/bin/pip install /path/to/AlphaLab/dist/alphalab-3.5.0-py3-none-any.whl
 ```
 
-`pip install alphalab==3.0.0` fails with "No matching distribution found". This
+`pip install alphalab==3.5.0` fails with "No matching distribution found". This
 is the single most common way a fresh setup stalls, which is why it is stated
 before the step that needs it rather than after.
 
 ### GitHub Actions: required AlphaLab wheel configuration
 
 A clean CI runner has the same requirement as a fresh local environment: it
-must be able to fetch the exact `alphalab==3.0.0` wheel before installing the
+must be able to fetch the exact `alphalab==3.5.0` wheel before installing the
 backend. The workflow in `.github/workflows/ci.yml` looks for a repository
 variable named `ALPHALAB_WHEEL_URL`, then downloads the wheel into
 `deploy/wheels/` before running the backend checks.
@@ -313,7 +313,7 @@ have to assume:
 ```json
 {
   "status": "ok",
-  "engine": {"name": "alphalab", "version": "3.0.0"},
+  "engine": {"name": "alphalab", "version": "3.5.0"},
   "live_trading_enabled": false,
   "rate_limiting": {
     "enabled": true,
@@ -365,7 +365,7 @@ Before building, place the AlphaLab wheel where the Dockerfile expects it:
 
 ```bash
 mkdir -p deploy/wheels
-cp /path/to/AlphaLab/dist/alphalab-3.0.0-py3-none-any.whl deploy/wheels/
+cp /path/to/AlphaLab/dist/alphalab-3.5.0-py3-none-any.whl deploy/wheels/
 ```
 
 Then:
@@ -550,17 +550,17 @@ syntax. The CI job below is what turns them into answers.
 **It has never run.** There is no CI history for this repository, and the
 workflow is written, not proven.
 
-## Why the backend jobs may skip
+## Why the backend jobs fail closed
 
-`alphalab==3.0.0` is not on PyPI, and this repository does not vendor the
+`alphalab==3.5.0` is not on PyPI, and this repository does not vendor the
 wheel. The backend jobs obtain it from the `ALPHALAB_WHEEL_URL` repository
-variable, or from a wheel committed to `deploy/wheels/`, and **skip with a
-warning** when neither is configured.
+variable, or from a wheel committed to `deploy/wheels/`, and they **fail
+immediately with a clear error** when neither is configured.
 
-Skipping rather than failing is deliberate. A pipeline that is permanently red
-for a reason nobody can fix on a pull request is a pipeline everyone learns to
-ignore, and then a real failure goes unnoticed too. The frontend and dependency
-jobs have no such dependency and always run.
+The workflow does not silently skip backend or PostgreSQL checks: the
+provisioning step exits with status 1 if the AlphaLab 3.5.0 wheel is not
+available. The frontend and dependency jobs have no such dependency and always
+run.
 
 ## What CI is never given
 

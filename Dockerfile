@@ -11,12 +11,12 @@
 # BEFORE YOU BUILD: the AlphaLab wheel
 # ---------------------------------------------------------------------------
 #
-# ``alphalab==3.0.0`` is NOT on PyPI. It is built from its own repository and
+# ``alphalab==3.5.0`` is NOT on PyPI. It is built from its own repository and
 # installed from a local wheel, which means this image cannot be built from a
 # clean checkout alone. Put the wheel in ``deploy/wheels/`` first:
 #
 #     mkdir -p deploy/wheels
-#     cp /path/to/AlphaLab/dist/alphalab-3.0.0-py3-none-any.whl deploy/wheels/
+#     cp /path/to/AlphaLab/dist/alphalab-3.5.0-py3-none-any.whl deploy/wheels/
 #
 # Stating this here rather than letting the build fail at the pip step, and
 # pinning the version rather than taking whatever wheel is present, is the
@@ -52,9 +52,9 @@ WORKDIR /app
 
 # The engine, from the wheel that must be present in the build context.
 COPY deploy/wheels/ /tmp/wheels/
-RUN test -f /tmp/wheels/alphalab-3.0.0-py3-none-any.whl \
-      || (echo "ERROR: deploy/wheels/alphalab-3.0.0-py3-none-any.whl is missing. See the header of this Dockerfile." >&2; exit 1) \
- && pip install /tmp/wheels/alphalab-3.0.0-py3-none-any.whl
+RUN test -f /tmp/wheels/alphalab-3.5.0-py3-none-any.whl \
+      || (echo "ERROR: deploy/wheels/alphalab-3.5.0-py3-none-any.whl is missing. See the header of this Dockerfile." >&2; exit 1) \
+ && pip install /tmp/wheels/alphalab-3.5.0-py3-none-any.whl
 
 COPY backend/pyproject.toml backend/alembic.ini ./backend/
 COPY backend/iluvtrade/ ./backend/iluvtrade/

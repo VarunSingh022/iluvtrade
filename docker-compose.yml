@@ -6,7 +6,7 @@
 # docs/DEPLOYMENT.md — in particular, the database here has no backup, no
 # volume snapshot policy and a password from an environment file.
 #
-# PREREQUISITE: deploy/wheels/alphalab-3.0.0-py3-none-any.whl must exist.
+# PREREQUISITE: deploy/wheels/alphalab-3.5.0-py3-none-any.whl must exist.
 # AlphaLab is not on PyPI; see the header of the Dockerfile.
 
 services:

@@ -144,7 +144,7 @@ def test_evidence_must_be_a_run_against_that_exact_version(db) -> None:
         dataset_version_id=outcome.version.id,
         strategy_version_id=other_version.id,
         seed=1,
-        engine_version="3.0.0",
+        engine_version="3.5.0",
         starting_cash="1000",
         ending_equity="9999999",
         realized_pnl="0",

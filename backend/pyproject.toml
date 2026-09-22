@@ -21,7 +21,7 @@ license = { text = "Proprietary" }
 authors = [{ name = "Varun Kumar Singh" }]
 
 dependencies = [
-  "alphalab==3.0.0",
+  "alphalab==3.5.0",
   "fastapi>=0.115,<1",
   "uvicorn[standard]>=0.32,<1",
   "sqlalchemy>=2.0,<3",

@@ -44,7 +44,7 @@ license, and deploy an exact version to paper trading.
                 engine · results · broker vocab
                                  │
                                  ▼
-                        AlphaLab v3.0.0
+                        AlphaLab v3.5.0
         market data · strategy dispatch · allocation · risk
         OMS · execution · portfolio accounting · analytics
                                  │
@@ -65,7 +65,7 @@ Three authorities, and nothing crosses them:
 
 | Authority | Owns | Lives in |
 |---|---|---|
-| **AlphaLab** | every quantitative and trading semantic — market data, strategy dispatch, allocation, risk, OMS, execution, portfolio accounting, analytics | installed package `alphalab==3.0.0` |
+| **AlphaLab** | every quantitative and trading semantic — market data, strategy dispatch, allocation, risk, OMS, execution, portfolio accounting, analytics | installed package `alphalab==3.5.0` |
 | **RedDesk** | marketplace and licensing: what an organization is *permitted* to run | `backend/iluvtrade/reddesk/` |
 | **Platform** | identity, tenancy, authorization, audit: *who is asking* | `backend/iluvtrade/platform/` |
 
@@ -90,7 +90,7 @@ The tables named `session_orders` / `session_fills` / `session_positions` are
 # 1. Backend
 cd backend
 python3 -m venv .venv
-./.venv/bin/pip install /path/to/alphalab-3.0.0-py3-none-any.whl
+./.venv/bin/pip install /path/to/alphalab-3.5.0-py3-none-any.whl
 ./.venv/bin/pip install -e ".[dev]"
 
 # 2. Configuration

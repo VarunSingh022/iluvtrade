@@ -6,7 +6,7 @@ name: CI
 # READ THIS BEFORE WONDERING WHY THE BACKEND JOB FAILS
 # ---------------------------------------------------------------------------
 #
-# `alphalab==3.0.0` is NOT on PyPI. It is built from its own repository, and
+# `alphalab==3.5.0` is NOT on PyPI. It is built from its own repository, and
 # this repository does not vendor the wheel (see deploy/README.md). CI
 # therefore cannot install the backend from a clean checkout alone.
 #
@@ -19,7 +19,7 @@ name: CI
 #     acceptable.
 #
 # The workflow must not silently skip backend checks when the engine artifact is
-# absent. A clean runner can only install `alphalab==3.0.0` from a wheel the
+# absent. A clean runner can only install `alphalab==3.5.0` from a wheel the
 # AlphaLab project publishes; the wheel is not on PyPI. The frontend job has no
 # such dependency and still runs.
 #
@@ -104,7 +104,7 @@ jobs:
         id: engine
         run: |
           set -euo pipefail
-          engine_wheel="deploy/wheels/alphalab-3.0.0-py3-none-any.whl"
+          engine_wheel="deploy/wheels/alphalab-3.5.0-py3-none-any.whl"
           mkdir -p "$(dirname "$engine_wheel")"
 
           if [ -n "${ALPHALAB_WHEEL_URL:-}" ]; then
@@ -116,7 +116,7 @@ jobs:
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::error title=AlphaLab wheel missing::alphalab==3.0.0 is not on PyPI and no wheel was provided. Set the repository variable ALPHALAB_WHEEL_URL to a direct wheel URL, or commit the wheel to deploy/wheels/."
+            echo "::error title=AlphaLab wheel missing::alphalab==3.5.0 is not on PyPI and no wheel was provided. Set the repository variable ALPHALAB_WHEEL_URL to a direct wheel URL, or commit the wheel to deploy/wheels/."
             exit 1
           fi
         env:
@@ -127,7 +127,7 @@ jobs:
         working-directory: backend
         run: |
           python -m pip install --upgrade pip
-          pip install ../deploy/wheels/alphalab-3.0.0-py3-none-any.whl
+          pip install ../deploy/wheels/alphalab-3.5.0-py3-none-any.whl
           pip install -e ".[dev]"
 
       - name: Ruff
@@ -211,7 +211,7 @@ jobs:
         id: engine
         run: |
           set -euo pipefail
-          engine_wheel="deploy/wheels/alphalab-3.0.0-py3-none-any.whl"
+          engine_wheel="deploy/wheels/alphalab-3.5.0-py3-none-any.whl"
           mkdir -p "$(dirname "$engine_wheel")"
 
           if [ -n "${ALPHALAB_WHEEL_URL:-}" ]; then
@@ -222,7 +222,7 @@ jobs:
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::error title=AlphaLab wheel missing::alphalab==3.0.0 is not on PyPI and no wheel was provided. Set the repository variable ALPHALAB_WHEEL_URL to a direct wheel URL, or commit the wheel to deploy/wheels/."
+            echo "::error title=AlphaLab wheel missing::alphalab==3.5.0 is not on PyPI and no wheel was provided. Set the repository variable ALPHALAB_WHEEL_URL to a direct wheel URL, or commit the wheel to deploy/wheels/."
             exit 1
           fi
         env:
@@ -233,7 +233,7 @@ jobs:
         working-directory: backend
         run: |
           python -m pip install --upgrade pip
-          pip install ../deploy/wheels/alphalab-3.0.0-py3-none-any.whl
+          pip install ../deploy/wheels/alphalab-3.5.0-py3-none-any.whl
           pip install -e ".[dev,postgres]"
 
       - name: Migrate a PostgreSQL database from empty to head

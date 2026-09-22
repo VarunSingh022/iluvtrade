@@ -11,10 +11,10 @@ image. It is git-ignored, and the directory is empty in a fresh checkout.
 
 ```bash
 mkdir -p deploy/wheels
-cp /path/to/AlphaLab/dist/alphalab-3.0.0-py3-none-any.whl deploy/wheels/
+cp /path/to/AlphaLab/dist/alphalab-3.5.0-py3-none-any.whl deploy/wheels/
 ```
 
-AlphaLab is not published to PyPI. `pip install alphalab==3.0.0` fails with
+AlphaLab is not published to PyPI. `pip install alphalab==3.5.0` fails with
 "No matching distribution found", so the wheel has to come from the engine's
 own build. The Dockerfile checks for it by exact filename and stops with that
 message rather than installing whatever else is in the directory.
