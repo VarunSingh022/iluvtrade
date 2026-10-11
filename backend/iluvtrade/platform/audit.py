@@ -48,7 +48,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from iluvtrade.db.base import utcnow
-from iluvtrade.db.models.platform import AuditEvent
+from iluvtrade.db.models.platform import AuditEvent, Organization
 
 #: Substrings that make a key a secret. Matched case-insensitively against the
 #: whole key, at every depth.
@@ -108,11 +108,29 @@ def record(
 ) -> AuditEvent:
     """Append one audit event. The caller must still commit the session."""
 
-    # The head is read inside the caller's transaction, so two concurrent
-    # writers in the same organization serialise on the unique
-    # (organization_id, sequence) constraint rather than silently both claiming
-    # the same position. One of them fails its INSERT, which is the correct
-    # outcome: an audit trail with two events at position 7 is not verifiable.
+    # Two writers in one organization must not both read head N and both claim
+    # N+1: an audit trail with two events at position 7 is not verifiable, and
+    # the unique (organization_id, sequence) constraint refuses the second.
+    # Refusing is safe but wrong for the user — on PostgreSQL the second writer
+    # waits for the first to commit and then fails its INSERT, so one of two
+    # concurrent, unrelated actions in a workspace errors out. Locking the
+    # organization row first makes the second writer wait and then read the
+    # *new* head, so both succeed in order. SQLite serialises writers anyway and
+    # SQLAlchemy renders no FOR UPDATE there; the constraint stays as the
+    # backstop on both.
+    #
+    # FOR NO KEY UPDATE (``key_share=True``), not FOR UPDATE: every insert that
+    # references the organization takes FOR KEY SHARE on its row for the
+    # foreign-key check, and FOR UPDATE conflicts with that. Two uploads that
+    # had each inserted rows and then asked for FOR UPDATE waited on each
+    # other's key-share lock -- a deadlock PostgreSQL broke by aborting one.
+    # NO KEY UPDATE still serialises audit writers against each other and leaves
+    # foreign-key checks alone.
+    session.execute(
+        select(Organization.id)
+        .where(Organization.id == organization_id)
+        .with_for_update(key_share=True)
+    )
     previous_sequence, previous_hash = chain_head(session, organization_id)
 
     event = AuditEvent(

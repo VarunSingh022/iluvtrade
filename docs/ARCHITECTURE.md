@@ -2,7 +2,8 @@
 
 ## The problem this shape solves
 
-AlphaLab is a mature quantitative engine: 48 packages, an execution pipeline
+AlphaLab is a mature quantitative engine: 43 packages and an application-facing
+`alphalab.api` module (2,628 public names at 4.1.0), an execution pipeline
 that every environment shares, portfolio accounting that satisfies an exact
 identity, and a documented parity guarantee between backtest, replay, paper and
 live. The temptation when building a product on top of it is to reimplement
@@ -17,7 +18,10 @@ So the architecture is organised around keeping that from being possible.
 
 ### AlphaLab — every quantitative and trading semantic
 
-An installed dependency (`alphalab==3.5.0`), never vendored. It owns:
+An installed dependency — AlphaLab 4.1.0, the release wheel pinned by URL and
+SHA-256 in `backend/pyproject.toml` — never vendored. The bridge imports only
+its public API: names from each package's `__all__` and the documented
+modules, never a submodule path (`tests/unit/test_engine_boundary.py`). It owns:
 
 | Concern | AlphaLab type |
 |---|---|

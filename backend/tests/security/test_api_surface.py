@@ -83,6 +83,7 @@ FROZEN_SURFACE: frozenset[str] = frozenset(
         "POST /api/v1/brokers/{account_id}/zerodha/login-url",
         "POST /api/v1/datasets/fetch",
         "POST /api/v1/datasets/inspect",
+        "POST /api/v1/datasets/inspect-url",
         "POST /api/v1/datasets/upload",
         "POST /api/v1/datasets/versions/{version_id}/approve",
         "POST /api/v1/datasets/versions/{version_id}/reject",

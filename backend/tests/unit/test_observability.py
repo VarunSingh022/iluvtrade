@@ -22,6 +22,7 @@ from iluvtrade.common.observability import (
     new_correlation_id,
     set_context,
 )
+from tests.support import DECLARED
 
 
 @pytest.fixture
@@ -255,6 +256,7 @@ def test_a_backtest_job_records_the_submitting_requests_identifier(client, heade
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=40), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
     client.post(f"/api/v1/datasets/versions/{version['id']}/approve", headers=headers)

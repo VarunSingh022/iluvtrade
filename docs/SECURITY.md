@@ -419,29 +419,61 @@ source with `ast` and fails when a construct appears:
 A grep proves nothing about tomorrow. These fail on the commit that introduces
 the construct.
 
+**NUL characters** are refused at the edge: a path or query containing one
+answers 400 before routing (`NulCharacterMiddleware`), and a request-body string
+containing one fails validation (422, `schemas.Strict`; multipart form fields
+and the uploaded filename are checked in the upload route, since they are not
+request models). PostgreSQL text cannot
+hold NUL, and until the first PostgreSQL test run `/datasets/versions/%00`
+reached the driver and answered 500.
+
 ## Dependency risk
 
 `scripts/audit-dependencies.sh` compares `npm audit` against
-`scripts/accepted-advisories.txt` and fails on anything not yet assessed. Seven
+`scripts/accepted-advisories.txt` and fails on anything not yet assessed. Two
 advisories are currently open; the assessment is what makes them acceptable, not
 their presence on a list.
 
-**Development tooling — never reaches the browser.** `vitest` (critical),
-`vite` (high), `esbuild`, `@vitest/mocker`, `vite-node`. Every one is in
-`devDependencies`. The vulnerabilities are "a website you visit can talk to your
-dev server" and "the Vitest UI server can read files" — real, and scoped to a
-developer's machine, not to a deployment.
+**Development tooling — resolved, not accepted.** `vitest` (critical),
+`tinypool` (critical), `vite` (high, the copy nested under vitest),
+`source-map-js` (high), `esbuild`, `@vitest/mocker` and `vite-node` were all
+reported by `npm audit` until the AlphaLab 4.1 integration. All but
+`source-map-js` came from the test runner, `vitest` 2.1.9, which carried its own
+`vite` 5 and `esbuild` 0.21 trees and `tinypool`. `vitest` 5.0.3 fixes every one
+of them and no longer depends on `tinypool`; `source-map-js` 1.2.2 (through
+`postcss`, within its declared range) fixes the last. The lockfile change touches
+only `vitest`'s own dependencies and `source-map-js`; the production bundle built
+before and after is byte-identical. `tinypool` and `source-map-js` were never in
+the accepted list, so the advisory gate would have failed on them in CI.
 
 **Shipped in the bundle — assessed as not reachable here.**
 `react-router` / `react-router-dom` (moderate), with two advisories:
 
-* *Arbitrary constructor injection via `deserializeErrors()` in SSR hydration.*
+* [GHSA-337j-9hxr-rhxg](https://github.com/advisories/GHSA-337j-9hxr-rhxg),
+  against `react-router` `>=6.4.0 <7.18.0`: *arbitrary constructor injection via
+  `deserializeErrors()` in SSR hydration.*
   This application has no SSR. It uses `BrowserRouter`, not
   `createBrowserRouter`, and never hydrates server-rendered error state.
-* *Open redirect via a backslash in `<Link>` and `useNavigate`.* Exploitable
+* [GHSA-wrjc-x8rr-h8h6](https://github.com/advisories/GHSA-wrjc-x8rr-h8h6),
+  against `react-router` `>=6.0.0 <7.18.0`: *open redirect via a backslash in
+  `<Link>` and `useNavigate`* (a bypass of the CVE-2025-68470 fix). Exploitable
   only when a route target is built from user-controlled input. Every `to=` and
   `navigate()` in this codebase is a literal path or a server-generated UUID;
   there is no free-text path anywhere.
+
+`react-router-dom` is reported only *via* `react-router`; it carries no advisory
+of its own.
+
+**How the gate matches.** `scripts/audit-dependencies.sh` runs `npm audit` and
+hands the report to `scripts/check_advisories.py`, which accepts a finding only
+when its GitHub advisory id **and** package both appear in
+`scripts/accepted-advisories.txt`. Until the review-blocker pass it matched
+package names, so a new — possibly critical — advisory against `react-router`
+would have passed as "already assessed". It also fails closed: an `npm audit`
+error (offline, registry failure), a report of the wrong shape, or a finding
+without a GHSA id exits 2, where the old script read an error report as zero
+findings and printed OK. `backend/tests/unit/test_advisory_gate.py` pins each of
+these against synthetic reports.
 
 The fix for both is a **major** version bump (`react-router-dom` 6 → 7), taken
 at the end of a release-candidate audit, to close advisories that are not

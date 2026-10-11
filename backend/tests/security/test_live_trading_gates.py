@@ -14,6 +14,7 @@ import pytest
 
 from iluvtrade.db.models.trading import TradingMode
 from tests.conftest import make_csv, register
+from tests.support import DECLARED
 
 pytestmark = pytest.mark.security
 
@@ -117,6 +118,7 @@ def test_the_paper_runner_refuses_a_live_session(db) -> None:
         strategy_version_id=version.id,
         starting_cash="1000",
         seed=1,
+        fill_timing="next_event",
     )
     db.add(session_row)
     db.flush()
@@ -134,6 +136,7 @@ def _paper_inputs(client, headers) -> tuple[str, str]:
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=60), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
     client.post(f"/api/v1/datasets/versions/{version['id']}/approve", headers=headers)
@@ -254,6 +257,142 @@ def test_a_paper_broker_cannot_back_a_live_session(client, headers, monkeypatch)
         )
         assert response.status_code == 400
         assert "paper broker cannot be used" in response.json()["error"]["message"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_a_gated_live_session_snapshots_its_exact_dataset_version(
+    client, headers, monkeypatch
+) -> None:
+    """Constructing a live session is safe and snapshots only server-derived evidence."""
+
+    import json
+
+    from iluvtrade.config import get_settings
+    from iluvtrade.data import ingest
+    from iluvtrade.db.models.data import DatasetVersion
+    from iluvtrade.db.models.trading import TradingSession
+    from iluvtrade.db.session import session_scope
+
+    register(client, "live-created@example.com")
+    dataset_version_id, strategy_version_id = _paper_inputs(client, headers)
+    broker = client.post(
+        "/api/v1/brokers", json={"broker": "zerodha", "label": "venue"}, headers=headers
+    ).json()
+
+    monkeypatch.setenv("ILUVTRADE_LIVE_TRADING_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        client.patch("/api/v1/auth/me", json={"live_trading_enabled": True}, headers=headers)
+        response = client.post(
+            "/api/v1/trading/sessions",
+            json={
+                "name": "live",
+                "mode": "live",
+                "strategy_version_id": strategy_version_id,
+                "dataset_version_id": dataset_version_id,
+                "broker_account_id": broker["account_id"],
+                "live_confirmed": True,
+            },
+            headers=headers,
+        )
+        assert response.status_code == 201, response.text
+        returned = response.json()
+
+        with session_scope() as session:
+            version = session.get(DatasetVersion, dataset_version_id)
+            row = session.get(TradingSession, returned["id"])
+            assert version is not None and row is not None
+            expected = ingest.temporal_evidence(version)
+            persisted = json.loads(row.temporal_evidence_json)
+            assert row.dataset_version_id == dataset_version_id
+            assert persisted == expected
+            assert returned["temporal_evidence"] == persisted
+
+        assert returned["temporal_evidence"]["dataset_version_id"] == dataset_version_id
+
+        without_dataset = client.post(
+            "/api/v1/trading/sessions",
+            json={
+                "name": "live without dataset",
+                "mode": "live",
+                "strategy_version_id": strategy_version_id,
+                "broker_account_id": broker["account_id"],
+                "live_confirmed": True,
+            },
+            headers=headers,
+        )
+        assert without_dataset.status_code == 201, without_dataset.text
+        assert without_dataset.json()["temporal_evidence"] is None
+    finally:
+        get_settings.cache_clear()
+
+
+def test_a_live_session_cannot_attach_an_unapproved_dataset(client, headers, monkeypatch) -> None:
+    """Live authorization does not let an unapproved dataset bypass provenance checks."""
+
+    from iluvtrade.config import get_settings
+    from iluvtrade.db.models.data import DatasetVersion
+    from iluvtrade.db.models.trading import TradingSession
+    from iluvtrade.db.session import session_scope
+
+    register(client, "live-unapproved@example.com")
+    approved_id, strategy_version_id = _paper_inputs(client, headers)
+    pending = client.post(
+        "/api/v1/datasets/upload",
+        files={"file": ("pending.csv", make_csv(bars=60), "text/csv")},
+        data=DECLARED,
+        headers=headers,
+    ).json()
+    broker = client.post(
+        "/api/v1/brokers", json={"broker": "zerodha", "label": "venue"}, headers=headers
+    ).json()
+
+    monkeypatch.setenv("ILUVTRADE_LIVE_TRADING_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        client.patch("/api/v1/auth/me", json={"live_trading_enabled": True}, headers=headers)
+        response = client.post(
+            "/api/v1/trading/sessions",
+            json={
+                "name": "live",
+                "mode": "live",
+                "strategy_version_id": strategy_version_id,
+                "dataset_version_id": pending["id"],
+                "broker_account_id": broker["account_id"],
+                "live_confirmed": True,
+            },
+            headers=headers,
+        )
+        assert response.status_code == 404
+        assert "not approved" in response.json()["error"]["message"]
+
+        with session_scope() as session:
+            approved = session.get(DatasetVersion, approved_id)
+            assert approved is not None
+            approved.temporal_json = "{}"
+
+        invalid_provenance = client.post(
+            "/api/v1/trading/sessions",
+            json={
+                "name": "live with legacy provenance",
+                "mode": "live",
+                "strategy_version_id": strategy_version_id,
+                "dataset_version_id": approved_id,
+                "broker_account_id": broker["account_id"],
+                "live_confirmed": True,
+            },
+            headers=headers,
+        )
+        assert invalid_provenance.status_code == 400
+        assert "no validated timestamp provenance" in invalid_provenance.json()["error"]["message"]
+        with session_scope() as session:
+            assert (
+                session.query(TradingSession)
+                .filter(TradingSession.name.in_(["live", "live with legacy provenance"]))
+                .count()
+                == 0
+            )
     finally:
         get_settings.cache_clear()
 

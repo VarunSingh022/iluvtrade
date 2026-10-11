@@ -1,10 +1,13 @@
 import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
+import { BarInterval } from "../components/BarInterval";
 import { ConfirmButton } from "../components/Confirm";
 import { Badge, Banner, Card, ErrorBanner, Loading, ScoreMeter, Stat, StatusBadge, Tabs } from "../components/ui";
 import { ApiError, api } from "../lib/api";
 import type { DatasetVersionDetail } from "../lib/api";
+import { TIMESTAMP_CONVENTIONS } from "../lib/assumptions";
+import type { TimestampConvention } from "../lib/assumptions";
 import { count, epochDate, titleCase, when } from "../lib/format";
 import { useAsync } from "../lib/useAsync";
 
@@ -83,6 +86,15 @@ export default function DatasetDetailPage() {
 
       {error && <Banner tone="err">{error}</Banner>}
       {data.failure_reason && <Banner tone="err">{data.failure_reason}</Banner>}
+      {data.interval_status === "missing_observations_confirmed" && (
+        <Banner tone="warn">
+          For {data.accepted_on_confirmation.join(", ")}, the {data.bar_interval} interval is the importer&apos;s
+          declaration, not something the bars show: their bars are never one interval apart, and the importer
+          declared their observations missing at {data.bar_interval} rather than longer bars. Nothing verified
+          this. If it is wrong, those start-stamped bars sit at the wrong instants and backtests on this version
+          see closes before they happened. Approve only if the declaration is right.
+        </Banner>
+      )}
 
       <div className="grid cols-4">
         <Stat label="Rows accepted" value={count(quality.accepted_rows)} sub={`of ${count(quality.total_input_rows)} read`} />
@@ -96,9 +108,10 @@ export default function DatasetDetailPage() {
       </div>
 
       <div className="grid cols-4" style={{ marginTop: "0.75rem" }}>
-        <Stat label="Date range" value={<span className="small">{epochDate(quality.start_timestamp)} → {epochDate(quality.end_timestamp)}</span>} />
-        <Stat label="Frequency" value={<span className="small mono">{quality.inferred_frequency ?? "irregular"}</span>} sub={quality.median_gap_seconds ? `median gap ${Math.round(quality.median_gap_seconds)}s` : undefined} />
         <Stat label="Gaps" value={quality.gap_count} sub="two or more intervals" />
+        <Stat label="Date range" value={<span className="small">{epochDate(quality.start_timestamp)} → {epochDate(quality.end_timestamp)}</span>} />
+        <Stat label="Bar interval" value={<span className="small"><BarInterval version={data} /></span>} sub="declared; checked per instrument" />
+        <Stat label="Observed spacing" value={<span className="small mono">{quality.inferred_frequency ?? "irregular"}</span>} sub="most common gap — descriptive, not the interval" />
         <Stat label="Canonical hash" value={<span className="mono tiny">{data.canonical_hash?.slice(0, 16) ?? "—"}…</span>} sub="pinned by any backtest" />
       </div>
 
@@ -247,6 +260,62 @@ export default function DatasetDetailPage() {
                 <Badge tone="err"> ambiguous</Badge>
               )}
             </div>
+            <h3 style={{ marginTop: "1rem" }}>What the timestamps mean</h3>
+            {data.interval_status === "unvalidated" ? (
+              <Banner tone="err">
+                No validated timestamp provenance: imported before timestamp conventions and bar intervals
+                were declared and checked for each instrument, so its bars may be placed at the wrong
+                instants. Nothing can run on it — re-import the file declaring what its timestamps mean and
+                its bar interval. Re-importing creates a new version; it does not change past backtest results.
+              </Banner>
+            ) : data.temporal.convention ? (
+              <div className="small">
+                <strong>{TIMESTAMP_CONVENTIONS[data.temporal.convention as TimestampConvention]?.label ?? data.temporal.convention}</strong>
+                {data.temporal.timezone && <> in <span className="mono">{data.temporal.timezone}</span></>}
+                {data.temporal.bar_interval && <>, <span className="mono">{data.temporal.bar_interval}</span> bars ({data.temporal.bar_interval_source})</>}
+                {" — "}read by {data.temporal.interpreted_by}: {data.temporal.rule}
+                {data.temporal.spacing && (
+                  <> — spacing checked for each instrument ({data.temporal.spacing.arithmetic.replace("_", " ")} arithmetic): longer gaps are missing bars, overnight, weekends or holidays; no calendar assumed</>
+                )}
+                {(data.temporal.moved_to_interval_end ?? 0) > 0 && (
+                  <> ({count(data.temporal.moved_to_interval_end ?? 0)} bars moved to the end of their interval)</>
+                )}
+              </div>
+            ) : (
+              <p className="small dim">No timestamp declaration was recorded for this failed import.</p>
+            )}
+            {data.temporal.spacing && (
+              <div className="table-wrap" style={{ marginTop: "0.5rem" }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Instrument</th>
+                      <th className="num">Bars</th>
+                      <th className="num">One interval apart</th>
+                      <th className="num">Longer gaps</th>
+                      <th>Interval shown by</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(data.temporal.spacing.instruments).map(([symbol, spacing]) => (
+                      <tr key={symbol}>
+                        <td className="mono">{symbol}</td>
+                        <td className="num">{count(spacing.bars)}</td>
+                        <td className="num">{count(spacing.one_interval_pairs)}</td>
+                        <td className="num">{count(spacing.longer_gaps)}</td>
+                        <td className="tiny">
+                          {spacing.accepted_on_confirmation ? (
+                            <Badge tone="warn">user declaration only — not verified</Badge>
+                          ) : (
+                            "its own bars (consistent; timestamps cannot prove bar length)"
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
             <h3 style={{ marginTop: "1rem" }}>Cleaning policy applied</h3>
             <pre className="code">{JSON.stringify(data.cleaning_policy, null, 2)}</pre>
           </Card>

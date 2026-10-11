@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from tests.conftest import make_csv, register
+from tests.support import DECLARED
 
 pytestmark = pytest.mark.integration
 
@@ -33,6 +34,7 @@ def _ready(client, *, bars: int = 40) -> tuple[str, str]:
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=bars), "text/csv")},
+        data=DECLARED,
         headers=HEADERS,
     ).json()
     client.post(f"/api/v1/datasets/versions/{version['id']}/approve", headers=HEADERS)
@@ -106,7 +108,7 @@ def test_concurrent_dataset_uploads_do_not_write_into_each_other(app) -> None:
             return client.post(
                 "/api/v1/datasets/upload",
                 files={"file": (f"d{index}.csv", make_csv(bars=20 + index), "text/csv")},
-                data={"name": f"set-{index}"},
+                data={**DECLARED, "name": f"set-{index}"},
                 headers=HEADERS,
             )
 
@@ -431,7 +433,7 @@ def test_a_database_busy_refusal_commits_nothing_and_is_safely_retryable(app) ->
             return client.post(
                 "/api/v1/datasets/upload",
                 files={"file": (f"b{index}.csv", make_csv(bars=25 + index), "text/csv")},
-                data={"name": f"busy-{index}"},
+                data={**DECLARED, "name": f"busy-{index}"},
                 headers=HEADERS,
             )
 

@@ -779,11 +779,13 @@ def downgrade() -> None:
 
     op.drop_table('broker_accounts')
     with op.batch_alter_table('audit_events', schema=None) as batch_op:
-        batch_op.drop_index('ix_audit_org_sequence')
+        # ix_audit_org_sequence and ix_audit_events_event_hash are 0002's, and
+        # 0002's downgrade has already dropped them. Dropping them again here
+        # passed on SQLite, whose batch mode rebuilds the table, and failed on
+        # PostgreSQL ("index does not exist") -- found by the PostgreSQL suite.
         batch_op.drop_index('ix_audit_org_created')
         batch_op.drop_index(batch_op.f('ix_audit_events_resource_id'))
         batch_op.drop_index(batch_op.f('ix_audit_events_organization_id'))
-        batch_op.drop_index(batch_op.f('ix_audit_events_event_hash'))
         batch_op.drop_index(batch_op.f('ix_audit_events_actor_user_id'))
         batch_op.drop_index(batch_op.f('ix_audit_events_action'))
 

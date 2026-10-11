@@ -26,7 +26,25 @@ from iluvtrade.alphalab_bridge import (
 )
 from iluvtrade.backtests.requests import BacktestRequest
 
-__all__ = ["ExecutedBacktest", "execute"]
+__all__ = ["ExecutedBacktest", "StrategyFailedDuringRun", "execute"]
+
+
+class StrategyFailedDuringRun(RuntimeError):
+    """The strategy failed mid-run, so the run's figures are not a result of it.
+
+    The job is recorded as failed with this as its reason; the class name is the
+    job's ``error_code``.
+    """
+
+    def __init__(self, failures: list[dict[str, Any]]) -> None:
+        self.failures = failures
+        first = failures[0]
+        super().__init__(
+            f"Strategy {first['strategy_id']} failed at t={first['timestamp']}: "
+            f"{first['error']}. AlphaLab isolated it and the run continued without it, "
+            f"so its figures are not stored as a result"
+            + (f" ({len(failures)} failures in all)." if len(failures) > 1 else ".")
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +118,6 @@ def execute(
     # Fund the portfolio strictly before the first record, so the funding
     # snapshot is not confused with the first bar's mark.
     start_timestamp = dataset.start_time - 1.0
-    span_seconds = max(dataset.end_time - dataset.start_time, 1.0)
-    years_elapsed = max(span_seconds / (365.25 * 86400.0), 1e-9)
 
     config = runconfig.build_run_config(
         mode=runconfig.ExecutionMode.BACKTEST,
@@ -110,13 +126,14 @@ def execute(
         currency=request.currency,
         starting_cash=capital,
         risk=risk,
+        exchange=request.exchange,
+        fill_timing=request.fill_timing,
         strategy_ids=(strategy_id,),
         instruments=universe.registry,
         seed=request.effective_seed(),
         start_timestamp=start_timestamp,
         commission_kind=request.commission_kind,
         commission_rate=Decimal(request.commission_rate),
-        years_elapsed=years_elapsed,
         risk_free_rate=request.risk_free_rate,
     )
 
@@ -164,7 +181,25 @@ def execute(
 
     result = engine.run_backtest_observed(config, dataset, runtime, factory, on_step=observe)
 
+    # Before any figure is read. A strategy that raised was isolated and the run
+    # went on without it, so every number below would describe a run of nothing
+    # from that point on while looking like a quiet strategy. This deployment
+    # runs one strategy per backtest, so that is not a result to store.
+    failures = results.failures_of(result)
+    if failures:
+        raise StrategyFailedDuringRun(failures)
+
     document = results.extract(result)
+    # The fill timing the simulator actually applied, read back from AlphaLab's
+    # record of the run. A disagreement with the request means the setting
+    # never reached the engine, and the figures describe a different run.
+    applied = document["execution_assumptions"]["fill_timing"]
+    if applied != request.fill_timing:
+        raise RuntimeError(
+            f"The backtest asked for fill timing {request.fill_timing!r} but AlphaLab "
+            f"recorded {applied!r}; its figures are not stored."
+        )
+    document["engine_identity"] = results.identity_of(result)
     document["risk_refusals"] = {
         "count": len(refusals),
         "logged": refusals,
@@ -186,10 +221,14 @@ def execute(
         "exchange": request.exchange,
         "risk_profile": request.risk_profile,
         "risk_limits": risk.to_dict(),
+        "trading_day_zone": runconfig.trading_day_zone(request.exchange),
+        "fill_timing": request.fill_timing,
         "commission_kind": request.commission_kind,
         "commission_rate": request.commission_rate,
         "risk_free_rate": request.risk_free_rate,
-        "years_elapsed": years_elapsed,
+        # Derived by AlphaLab from the equity curve, and read back from its
+        # report rather than computed here.
+        "years_elapsed": ((document["report"] or {}).get("returns") or {}).get("years_elapsed"),
         "start_timestamp": start_timestamp,
         "parameters": parameters,
         "universe": selected,

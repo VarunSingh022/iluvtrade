@@ -347,3 +347,124 @@ def test_the_mfa_revision_defaults_recovery_codes_for_existing_users(tmp_path: P
     assert row[0] is None, "an existing account has no secret"
     assert row[1] is None, "and MFA is off"
     assert row[2] == "[]", "but its recovery list is a usable empty array, not NULL"
+
+
+@pytest.mark.skipif(not ALEMBIC.exists(), reason="alembic is not installed")
+def test_0006_and_0007_against_a_row_in_every_table(tmp_path: Path) -> None:
+    """Upgrade a database with a row in every table, as it stood at 0005, to head.
+
+    Existing sessions must come out ``same_event`` (what they ran), existing
+    dataset versions with no timestamp provenance (``{}``, which nothing may run
+    on), existing runs with no artifact digest (never served as verified), and
+    every seed intact.
+    """
+
+    from sqlalchemy import create_engine, text
+
+    from tests.support import OLD_SEED_MAX, seed_every_table
+
+    url = f"sqlite:///{tmp_path}/every-table.db"
+    assert _alembic("upgrade", "0005_teams_and_reset", database_url=url).returncode == 0
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        ids = seed_every_table(connection)
+    assert {"trading_sessions", "dataset_versions", "backtest_runs"} <= set(ids)
+
+    result = _alembic("upgrade", "head", database_url=url)
+    assert result.returncode == 0, result.stderr
+    with engine.connect() as connection:
+        session = connection.execute(text("SELECT seed, fill_timing FROM trading_sessions")).one()
+        run = connection.execute(text("SELECT seed, artifact_sha256 FROM backtest_runs")).one()
+        version = connection.execute(text("SELECT temporal_json FROM dataset_versions")).one()
+        tables = [
+            r[0]
+            for r in connection.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
+        ]
+        counts = {
+            table: connection.execute(text(f'SELECT count(*) FROM "{table}"')).scalar_one()
+            for table in ids
+        }
+    engine.dispose()
+    assert session == (OLD_SEED_MAX, "same_event")
+    assert run == (OLD_SEED_MAX, None)
+    assert version == ("{}",)
+    assert all(count == 1 for count in counts.values()), counts
+    assert "alembic_version" in tables
+    assert _alembic("check", database_url=url).returncode == 0
+
+    # A downgrade below 0006 would drop a stated fill timing and a later upgrade
+    # would write "same_event" in its place: refused while such a row exists.
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE trading_sessions SET fill_timing = 'next_event'"))
+    refused = _alembic("downgrade", "0005_teams_and_reset", database_url=url)
+    assert refused.returncode != 0 and "Refusing to downgrade below 0006" in refused.stderr
+    with engine.begin() as connection:
+        assert connection.execute(text("SELECT fill_timing FROM trading_sessions")).one() == (
+            "next_event",
+        )
+        connection.execute(text("UPDATE trading_sessions SET fill_timing = 'same_event'"))
+    engine.dispose()
+    assert _alembic("downgrade", "0005_teams_and_reset", database_url=url).returncode == 0
+
+
+@pytest.mark.skipif(not ALEMBIC.exists(), reason="alembic is not installed")
+def test_0008_against_a_row_in_every_table(tmp_path: Path) -> None:
+    """Existing runs and sessions come out with no temporal evidence: "not recorded".
+
+    Nothing is backfilled -- reconstructing a snapshot from today's rules would
+    invent a record. A downgrade is refused while any row holds a snapshot, and
+    succeeds (dropping only the new columns) once none does.
+    """
+
+    from sqlalchemy import create_engine, inspect, text
+
+    from tests.support import seed_every_table
+
+    url = f"sqlite:///{tmp_path}/evidence.db"
+    assert _alembic("upgrade", "0007_artifact_digest", database_url=url).returncode == 0
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        ids = seed_every_table(connection)
+    engine.dispose()
+
+    result = _alembic("upgrade", "head", database_url=url)
+    assert result.returncode == 0, result.stderr
+    engine = create_engine(url)
+    with engine.connect() as connection:
+        run = connection.execute(text("SELECT temporal_evidence_json FROM backtest_runs")).one()
+        sess = connection.execute(text("SELECT temporal_evidence_json FROM trading_sessions")).one()
+        counts = {
+            table: connection.execute(text(f'SELECT count(*) FROM "{table}"')).scalar_one()
+            for table in ids
+        }
+    assert run == (None,) and sess == (None,)
+    assert all(count == 1 for count in counts.values()), counts
+    assert _alembic("check", database_url=url).returncode == 0
+
+    with engine.begin() as connection:
+        connection.execute(
+            text('UPDATE backtest_runs SET temporal_evidence_json = \'{"status": "validated"}\'')
+        )
+    engine.dispose()
+    refused = _alembic("downgrade", "0007_artifact_digest", database_url=url)
+    assert refused.returncode != 0 and "Refusing to downgrade below 0008" in refused.stderr
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        assert connection.execute(
+            text("SELECT temporal_evidence_json FROM backtest_runs")
+        ).one() == ('{"status": "validated"}',)
+        connection.execute(text("UPDATE backtest_runs SET temporal_evidence_json = NULL"))
+    engine.dispose()
+    assert _alembic("downgrade", "0007_artifact_digest", database_url=url).returncode == 0
+    engine = create_engine(url)
+    columns = {c["name"] for c in inspect(engine).get_columns("backtest_runs")}
+    session_columns = {c["name"] for c in inspect(engine).get_columns("trading_sessions")}
+    with engine.connect() as connection:
+        survived = {
+            table: connection.execute(text(f'SELECT count(*) FROM "{table}"')).scalar_one()
+            for table in ids
+        }
+    engine.dispose()
+    assert "temporal_evidence_json" not in columns | session_columns
+    assert survived == counts

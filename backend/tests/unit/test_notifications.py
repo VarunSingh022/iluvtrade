@@ -21,6 +21,7 @@ from iluvtrade.platform.events import (
     kind_of,
 )
 from tests.conftest import make_principal
+from tests.support import DECLARED
 
 PACKAGE = pathlib.Path(__file__).resolve().parents[2] / "iluvtrade"
 
@@ -243,6 +244,7 @@ def test_the_product_flow_produces_the_notifications_it_should(client, headers) 
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=50), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
     kinds = {n["kind"] for n in client.get("/api/v1/notifications").json()}

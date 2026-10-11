@@ -68,10 +68,11 @@ parsing prose.
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/datasets/inspect` | detect a schema, store nothing |
-| POST | `/datasets/upload` | multipart; returns the full detail with the quality report |
-| POST | `/datasets/fetch` | from an allowlisted URL, through the same pipeline |
-| GET | `/datasets` | datasets with their versions |
+| POST | `/datasets/inspect` | detect a schema, store nothing; `timestamp_semantics` says which conventions fit and whether a zone is needed. With `timestamp_convention` / `timezone` / `bar_interval`, also runs the import's interval check (default cleaning policy) and returns `interval_check`: `refused` (the reason, or `null`), per-instrument `spacing`, and `ambiguous` — the instruments whose own bars cannot show the interval. Also accepts `policy_json`. `interval_check` carries `content_sha256` and `preview_id`, binding the check to those bytes, the declaration and the policy. Runs in the thread pool, never on the event loop |
+| POST | `/datasets/inspect-url` | JSON: `url`, the declaration, `policy`. Fetches through the same allowlist and protections and returns the same inspection, including `interval_check` and its `preview_id`, storing nothing |
+| POST | `/datasets/upload` | multipart; **requires** `timestamp_convention` (`session_date` / `interval_start` / `interval_end`), `bar_interval` (AlphaLab code; implied `1d` for `session_date`; never inferred, and checked against **each instrument's** bars — an instrument whose own bars never sit one interval apart is refused unless named in `missing_observations_confirmed_for` — a repeated field, one symbol each, asserting that instrument's observations are missing at the declared interval; it must name exactly the ambiguous instruments, and any other symbol is refused — and requires `preview_id` from an inspection of these exact bytes with these settings, recomputed server-side; missing or mismatched answers 400. The retired `missing_observations_confirmed` answers 422) and, for bare dates and wall-clock times, `timezone` (IANA). Multipart text fields containing NUL answer 422. Refused before storing anything otherwise. Returns the full detail, including `temporal` |
+| POST | `/datasets/fetch` | from an allowlisted URL, through the same pipeline; same `timestamp_convention` / `timezone` / `bar_interval` / `missing_observations_confirmed_for` (a list) and `preview_id` (from `/datasets/inspect-url`; recomputed from the bytes this fetch returns, so a changed resource is refused) fields |
+| GET | `/datasets` | datasets with their versions. Each version carries `bar_interval` (the declared interval, or `null` without validated provenance), `interval_status` (`validated` — every instrument's own bars consistent with it and showing it at least once, which is consistency, not proof of bar length; `missing_observations_confirmed` — some instruments accepted only on the importer's named declaration, not verified; `unvalidated`; `none`) and `accepted_on_confirmation` (those instruments). `inferred_frequency` is the observed median spacing — descriptive, never the interval |
 | GET | `/datasets/versions/{id}` | schema, quality, transformations, rejected rows, provenance |
 | GET | `/datasets/versions/{id}/preview` | first rows of the canonical data |
 | POST | `/datasets/versions/{id}/approve` | the gate — nothing may use a version until this |
@@ -92,11 +93,11 @@ parsing prose.
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/backtests` | **202**; idempotent, `deduplicated` says whether it was a repeat |
+| POST | `/backtests` | **202**; idempotent, `deduplicated` says whether it was a repeat. `fill_timing`: `next_event` (default) or `same_event`; part of the idempotency key. The result carries AlphaLab's `execution_assumptions` |
 | GET | `/backtests` | |
 | GET | `/backtests/{id}` | |
-| POST | `/backtests/{id}/cancel` | a running job is *asked* to stop; the response may still say running |
-| GET | `/backtests/{id}/result` | metrics, the full result document, and the reproducibility record |
+| POST | `/backtests/{id}/cancel` | a queued job is cancelled; a running one is checked only when it finishes — it runs to the end and its result is discarded. The response may still say running |
+| GET | `/backtests/{id}/result` | headline metrics (from the run's own row), the reproducibility record, `result_integrity`, and the full result document **only if** it is verified as this run's (own key, recorded SHA-256, names the run) — otherwise `result` is `null` and `result_integrity.reason` says why. `reproducibility.temporal_evidence` is the run's snapshot of its dataset version's temporal evidence (`status`, `meaning`, interval, `user_declared_instruments`; `not_recorded` for runs before 0008) |
 
 ### RedDesk
 
@@ -104,7 +105,7 @@ parsing prose.
 |---|---|---|
 | GET | `/reddesk/billing-status` | whether a purchase actually charges anything |
 | GET | `/reddesk/discover` | published listings, cross-tenant by design |
-| GET | `/reddesk/listings/{id}` | |
+| GET | `/reddesk/listings/{id}` | `evidence.temporal_evidence` repeats the cited run's snapshot without the creator's dataset id/hash; `not_recorded` / `unavailable` where nothing can be shown |
 | GET | `/reddesk/my-listings` | this org's listings at any status |
 | POST | `/reddesk/listings` | |
 | POST | `/reddesk/listings/{id}/versions` | attach a published version and its evidence |
@@ -133,8 +134,8 @@ endpoint.
 
 | Method | Path | Notes |
 |---|---|---|
-| GET · POST | `/trading/sessions` | live sessions need all three gates |
-| GET | `/trading/sessions/{id}` | includes `is_live_state` |
+| GET · POST | `/trading/sessions` | live sessions need all three gates; `fill_timing` as for backtests, stored on the session |
+| GET | `/trading/sessions/{id}` | includes `is_live_state`, and `temporal_evidence` (paper sessions: the snapshot taken at creation; `null` for live) |
 | POST | `/trading/sessions/{id}/start` · `/pause` · `/resume` · `/stop` | |
 | POST | `/trading/sessions/{id}/kill` | terminal; not resumable |
 | GET | `/trading/sessions/{id}/orders` · `/fills` · `/positions` · `/events` | |
@@ -170,6 +171,7 @@ identifier spans the HTTP request, the job and the engine run. See
 
 - **Money is a string**, always. A float would lose the precision AlphaLab
   maintains and break the accounting identity.
+- **NUL characters** in a path or query answer 400, and in a request body 422; PostgreSQL text cannot hold one.
 - **Timestamps** are ISO-8601 with an offset for application events, and epoch
   seconds for market data.
 - **`null` means AlphaLab produced nothing.** It is never replaced with a zero

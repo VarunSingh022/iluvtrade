@@ -10,6 +10,7 @@ import pytest
 from iluvtrade.common import storage
 from iluvtrade.config import Settings
 from iluvtrade.data.fetch import FetchError, fetch_csv, validate_url
+from tests.support import session_date_ist
 
 pytestmark = pytest.mark.security
 
@@ -276,6 +277,7 @@ def test_an_upload_filename_cannot_traverse(db) -> None:
         filename="../../../../etc/passwd",
         payload=make_csv(),
         dataset_name="Traversal attempt",
+        temporal=session_date_ist(),
     )
     assert outcome.source.origin == "passwd"
     assert storage.resolve(outcome.source.raw_path).is_relative_to(storage.root().resolve())

@@ -13,6 +13,7 @@ from iluvtrade.db.models.reddesk import BillingCadence, VersionAccessPolicy
 from iluvtrade.reddesk import marketplace
 from iluvtrade.strategies import service as strategies
 from tests.conftest import make_csv, make_principal, register
+from tests.support import DECLARED, session_date_ist
 
 pytestmark = pytest.mark.security
 
@@ -132,7 +133,12 @@ def test_evidence_must_be_a_run_against_that_exact_version(db) -> None:
     from iluvtrade.data import ingest
 
     outcome = ingest.ingest_upload(
-        db, principal, filename="d.csv", payload=make_csv(bars=30), dataset_name="D"
+        db,
+        principal,
+        filename="d.csv",
+        payload=make_csv(bars=30),
+        dataset_name="D",
+        temporal=session_date_ist(),
     )
     job.dataset_version_id = outcome.version.id
     db.add(job)
@@ -347,6 +353,7 @@ def test_a_backtest_records_the_exact_strategy_version(client, headers) -> None:
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=60), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
     client.post(f"/api/v1/datasets/versions/{version['id']}/approve", headers=headers)
@@ -377,6 +384,7 @@ def test_a_session_records_the_exact_strategy_version(client, headers) -> None:
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=40), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
     client.post(f"/api/v1/datasets/versions/{version['id']}/approve", headers=headers)

@@ -31,6 +31,7 @@ from iluvtrade.data.schema import (
     TimestampFormat,
     parse_timestamp,
 )
+from iluvtrade.data.temporal import TemporalDeclaration, TemporalError, label_instant
 
 __all__ = [
     "CanonicalRow",
@@ -68,7 +69,15 @@ class TransformationKind(StrEnum):
     TRIMMED_WHITESPACE = "trimmed_whitespace"
     FILLED_OHLC_FROM_CLOSE = "filled_ohlc_from_close"
     DEFAULTED_VOLUME = "defaulted_volume"
+    #: Kept so older versions' transformation logs still read. Nothing derives
+    #: VWAP any more: an unreported VWAP stays absent.
     DERIVED_VWAP = "derived_vwap"
+    #: A VWAP or trade count the source wrote but that cannot be one (not a
+    #: number, outside the bar's range, negative). Dropped to absent, recorded.
+    DISCARDED_INVALID_VWAP = "discarded_invalid_vwap"
+    DISCARDED_INVALID_TRADE_COUNT = "discarded_invalid_trade_count"
+    #: A bar stamped at the start of its interval, moved to the end by AlphaLab.
+    MOVED_TO_INTERVAL_END = "moved_to_interval_end"
     DEFAULTED_SYMBOL = "defaulted_symbol"
     REORDERED = "reordered"
     COERCED_NUMERIC = "coerced_numeric"
@@ -92,7 +101,9 @@ class CleaningPolicy:
     """Every decision cleaning is allowed to make, in one serializable object."""
 
     duplicate_policy: DuplicatePolicy = DuplicatePolicy.KEEP_FIRST
-    #: Reject rows whose timestamp goes backwards. AlphaLab's market engine takes
+    #: Reject rows whose timestamp goes backwards *within their instrument*.
+    #: Order across instruments carries no meaning -- a file grouped by symbol
+    #: is as valid as an interleaved one, and is sorted. AlphaLab's market engine takes
     #: the newest record as current, so an out-of-order bar would mark the book
     #: backwards; ``MarketDataset`` refuses such a dataset outright.
     drop_out_of_order: bool = True
@@ -100,8 +111,6 @@ class CleaningPolicy:
     fill_ohlc_from_close: bool = True
     #: Use 0 when no volume column exists. Recorded, never assumed silently.
     default_volume_to_zero: bool = True
-    #: Derive VWAP as the typical price when no VWAP column exists.
-    derive_vwap: bool = True
     #: Refuse a bar whose high < low, or whose open/close sit outside [low, high].
     enforce_ohlc_consistency: bool = True
     #: Refuse zero or negative prices. A price of 0 is not a price.
@@ -116,7 +125,6 @@ class CleaningPolicy:
             "drop_out_of_order": self.drop_out_of_order,
             "fill_ohlc_from_close": self.fill_ohlc_from_close,
             "default_volume_to_zero": self.default_volume_to_zero,
-            "derive_vwap": self.derive_vwap,
             "enforce_ohlc_consistency": self.enforce_ohlc_consistency,
             "require_positive_prices": self.require_positive_prices,
             "default_symbol": self.default_symbol,
@@ -125,6 +133,8 @@ class CleaningPolicy:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> CleaningPolicy:
+        # ``derive_vwap`` was a field until VWAP stopped being invented; a stored
+        # policy that still names it reads back without it.
         known = set(cls.__dataclass_fields__)
         data = {k: v for k, v in payload.items() if k in known}
         if "duplicate_policy" in data:
@@ -143,8 +153,12 @@ class CanonicalRow:
     low: Decimal
     close: Decimal
     volume: Decimal
-    vwap: Decimal
-    trade_count: int
+    #: ``None`` when the source did not report a valid VWAP -- the absence
+    #: AlphaLab's ``Bar.vwap`` represents (v3.11). Never the typical price or
+    #: the close standing in for one.
+    vwap: Decimal | None
+    #: ``None`` when the source did not report one.
+    trade_count: int | None
     source_line: int
 
     def to_dict(self) -> dict[str, Any]:
@@ -156,7 +170,7 @@ class CanonicalRow:
             "low": str(self.low),
             "close": str(self.close),
             "volume": str(self.volume),
-            "vwap": str(self.vwap),
+            "vwap": None if self.vwap is None else str(self.vwap),
             "trade_count": self.trade_count,
         }
 
@@ -238,8 +252,20 @@ def _cell(row: list[str], index: int | None) -> str:
     return row[index]
 
 
-def clean(text: str, schema: DetectedSchema, policy: CleaningPolicy) -> CleaningResult:
-    """Turn raw CSV text into canonical rows under ``policy``."""
+def clean(
+    text: str,
+    schema: DetectedSchema,
+    policy: CleaningPolicy,
+    temporal: TemporalDeclaration | None = None,
+) -> CleaningResult:
+    """Turn raw CSV text into canonical rows under ``policy``.
+
+    With ``temporal``, every timestamp is read by AlphaLab under the user's
+    declaration (:mod:`iluvtrade.data.temporal`); a value it cannot read that
+    way is rejected with AlphaLab's reason. Without one -- only callers that
+    inspect a file, never the import path -- timestamps get the provisional
+    reading of :func:`iluvtrade.data.schema.parse_timestamp`.
+    """
 
     result = CleaningResult()
 
@@ -259,7 +285,11 @@ def clean(text: str, schema: DetectedSchema, policy: CleaningPolicy) -> Cleaning
     expected_width = len(schema.columns)
 
     seen: dict[tuple[str, float], int] = {}
-    last_timestamp: float | None = None
+    #: The latest timestamp seen per instrument. Out-of-order is a property of
+    #: one instrument's series: a file listing all of AAA and then all of BBB
+    #: goes "backwards" at the first BBB row without anything being out of order.
+    #: (A single file-wide high-water mark rejected every BBB row up to AAA's last.)
+    last_timestamp: dict[str, float] = {}
 
     for line_number, raw_row in enumerate(reader, start=1):
         if line_number == 1 and schema.has_header:
@@ -302,7 +332,18 @@ def clean(text: str, schema: DetectedSchema, policy: CleaningPolicy) -> Cleaning
                     raw_timestamp.strip(),
                 )
             )
-        timestamp = parse_timestamp(raw_timestamp, schema.timestamp_format)
+        if temporal is not None:
+            try:
+                timestamp: float | None = label_instant(
+                    raw_timestamp, schema.timestamp_format, temporal
+                )
+            except TemporalError as exc:
+                result._reject(
+                    RejectedRow(line_number, RejectionReason.INVALID_TIMESTAMP, str(exc), raw_text)
+                )
+                continue
+        else:
+            timestamp = parse_timestamp(raw_timestamp, schema.timestamp_format)
         if timestamp is None:
             result._reject(
                 RejectedRow(
@@ -452,27 +493,44 @@ def clean(text: str, schema: DetectedSchema, policy: CleaningPolicy) -> Cleaning
                 )
                 continue
 
-            # --- vwap ----------------------------------------------------
+            # --- vwap: what the source reported, or nothing ---------------
+            # A typical price or a close is not a volume-weighted average and is
+            # never stored as one. A VWAP outside the bar's own range cannot be
+            # real, so it is dropped (and the drop recorded) rather than kept.
             raw_vwap = _cell(raw_row, idx[FieldRole.VWAP])
             vwap = _decimal(raw_vwap)
-            if vwap is None:
-                if policy.derive_vwap:
-                    vwap = (high + low + close) / Decimal("3")
-                    result._transform(
-                        Transformation(
-                            line_number,
-                            TransformationKind.DERIVED_VWAP,
-                            "vwap",
-                            raw_vwap.strip(),
-                            str(vwap),
-                        )
+            if vwap is not None and not (low <= vwap <= high):
+                vwap = None
+            if vwap is None and raw_vwap.strip():
+                result._transform(
+                    Transformation(
+                        line_number,
+                        TransformationKind.DISCARDED_INVALID_VWAP,
+                        "vwap",
+                        raw_vwap.strip(),
+                        "",
                     )
-                else:
-                    vwap = close
+                )
 
             raw_trades = _cell(raw_row, idx[FieldRole.TRADE_COUNT])
             trades_value = _decimal(raw_trades)
-            trade_count = int(trades_value) if trades_value is not None and trades_value >= 0 else 0
+            trade_count: int | None = None
+            if (
+                trades_value is not None
+                and trades_value >= 0
+                and trades_value == trades_value.to_integral_value()
+            ):
+                trade_count = int(trades_value)
+            elif raw_trades.strip():
+                result._transform(
+                    Transformation(
+                        line_number,
+                        TransformationKind.DISCARDED_INVALID_TRADE_COUNT,
+                        "trade_count",
+                        raw_trades.strip(),
+                        "",
+                    )
+                )
 
             # --- duplicates and ordering ---------------------------------
             key = (symbol, timestamp)
@@ -513,23 +571,20 @@ def clean(text: str, schema: DetectedSchema, policy: CleaningPolicy) -> Cleaning
                         )
                         break
 
-            if (
-                last_timestamp is not None
-                and timestamp < last_timestamp
-                and policy.drop_out_of_order
-            ):
+            previous = last_timestamp.get(symbol)
+            if previous is not None and timestamp < previous and policy.drop_out_of_order:
                 result._reject(
                     RejectedRow(
                         line_number,
                         RejectionReason.OUT_OF_ORDER,
-                        f"{timestamp} follows {last_timestamp}.",
+                        f"{symbol} {timestamp} follows {symbol} {previous}.",
                         raw_text,
                     )
                 )
                 continue
 
             seen[key] = line_number
-            last_timestamp = timestamp if last_timestamp is None else max(last_timestamp, timestamp)
+            last_timestamp[symbol] = timestamp if previous is None else max(previous, timestamp)
             result.rows.append(
                 CanonicalRow(
                     symbol=symbol,
@@ -546,8 +601,9 @@ def clean(text: str, schema: DetectedSchema, policy: CleaningPolicy) -> Cleaning
             )
 
     # AlphaLab requires chronological records. Rows arriving interleaved across
-    # symbols are legitimate and common, so sort rather than reject — and record
-    # having done so, because a reordered file is not the file that was uploaded.
+    # symbols, or grouped by symbol, are legitimate and common, so sort rather
+    # than reject — and record having done so, because a reordered file is not
+    # the file that was uploaded.
     if result.rows:
         ordered = sorted(result.rows, key=lambda r: (r.timestamp, r.symbol))
         if [r.source_line for r in ordered] != [r.source_line for r in result.rows]:

@@ -2,6 +2,8 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { Banner, Card, ErrorBanner, Field, Loading, ModeBadge, StatusBadge } from "../components/ui";
+import { DEFAULT_FILL_TIMING, FILL_TIMINGS } from "../lib/assumptions";
+import type { FillTiming } from "../lib/assumptions";
 import { ApiError, api, health } from "../lib/api";
 import type { Dataset, Entitlement, HealthResponse, Strategy, TradingSession } from "../lib/api";
 import { money, relative, signOf } from "../lib/format";
@@ -22,6 +24,7 @@ export default function SessionsPage() {
   const [datasetVersionId, setDatasetVersionId] = useState("");
   const [cash, setCash] = useState("1000000.00");
   const [riskProfile, setRiskProfile] = useState<"research" | "conservative">("conservative");
+  const [fillTiming, setFillTiming] = useState<FillTiming>(DEFAULT_FILL_TIMING);
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<string | undefined>();
 
@@ -60,6 +63,7 @@ export default function SessionsPage() {
         dataset_version_id: datasetVersionId,
         starting_cash: cash,
         risk_profile: riskProfile,
+        fill_timing: fillTiming,
       });
       if (start) await api.post(`/trading/sessions/${session.id}/start`);
       setName("");
@@ -121,6 +125,12 @@ export default function SessionsPage() {
             <select value={riskProfile} onChange={(event) => setRiskProfile(event.target.value as "research" | "conservative")}>
               <option value="conservative">Conservative</option>
               <option value="research">Research</option>
+            </select>
+          </Field>
+          <Field label="Fill timing" hint={FILL_TIMINGS[fillTiming].meaning}>
+            <select aria-label="Fill timing" value={fillTiming} onChange={(event) => setFillTiming(event.target.value as FillTiming)}>
+              <option value="next_event">{FILL_TIMINGS.next_event.label}</option>
+              <option value="same_event">{FILL_TIMINGS.same_event.label}</option>
             </select>
           </Field>
         </div>

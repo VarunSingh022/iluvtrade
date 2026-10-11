@@ -3,25 +3,22 @@ name: CI
 # Every gate this project has, run on a machine that is not a developer's.
 #
 # ---------------------------------------------------------------------------
-# READ THIS BEFORE WONDERING WHY THE BACKEND JOB FAILS
+# WHERE THE ENGINE COMES FROM
 # ---------------------------------------------------------------------------
 #
-# `alphalab==3.5.0` is NOT on PyPI. It is built from its own repository, and
-# this repository does not vendor the wheel (see deploy/README.md). CI
-# therefore cannot install the backend from a clean checkout alone.
+# AlphaLab is not on PyPI. backend/pyproject.toml depends on the v4.1.0 release
+# wheel by direct reference, with the SHA-256 the release's SHA256SUMS-4.1.0
+# records, so the ordinary `pip install -e ".[dev]"` below downloads exactly
+# that artifact from the AlphaLab GitHub release and pip refuses it if a single
+# byte differs. There is no other source: no repository variable, no wheel
+# directory, nothing to configure, and nothing that can install a different
+# engine quietly. If the download fails or the digest differs, the install step
+# fails and every backend check after it is skipped by the failure itself.
 #
-# The backend jobs obtain the wheel from one of two places and fail clearly
-# when neither is configured:
-#
-#   * `ALPHALAB_WHEEL_URL` — a repository *variable* pointing at a wheel the
-#     runner can fetch (an internal package index, a release asset).
-#   * A wheel committed to `deploy/wheels/` on a branch where that is
-#     acceptable.
-#
-# The workflow must not silently skip backend checks when the engine artifact is
-# absent. A clean runner can only install `alphalab==3.5.0` from a wheel the
-# AlphaLab project publishes; the wheel is not on PyPI. The frontend job has no
-# such dependency and still runs.
+# `scripts/verify-alphalab.sh` then checks what was installed — `pip check`, the
+# version, that it loads from the venv's site-packages — and runs the release's
+# own consumer contract (AlphaLab docs/INTEGRATION.md, checklist step 2) from a
+# scratch directory outside the checkout.
 #
 # ---------------------------------------------------------------------------
 # WHAT CI MUST NEVER TOUCH
@@ -100,74 +97,50 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Locate the AlphaLab wheel
-        id: engine
-        run: |
-          set -euo pipefail
-          engine_wheel="deploy/wheels/alphalab-3.5.0-py3-none-any.whl"
-          mkdir -p "$(dirname "$engine_wheel")"
-
-          if [ -n "${ALPHALAB_WHEEL_URL:-}" ]; then
-            echo "Fetching the engine wheel from ALPHALAB_WHEEL_URL"
-            curl -fsSL "$ALPHALAB_WHEEL_URL" -o "$engine_wheel"
-          fi
-
-          if [ -f "$engine_wheel" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::error title=AlphaLab wheel missing::alphalab==3.5.0 is not on PyPI and no wheel was provided. Set the repository variable ALPHALAB_WHEEL_URL to a direct wheel URL, or commit the wheel to deploy/wheels/."
-            exit 1
-          fi
-        env:
-          ALPHALAB_WHEEL_URL: ${{ vars.ALPHALAB_WHEEL_URL }}
-
       - name: Create project venv and install dependencies
-        if: steps.engine.outputs.available == 'true'
         working-directory: backend
+        # The AlphaLab wheel arrives here, from the hash-pinned reference in
+        # pyproject.toml; see "Where the engine comes from" above.
         run: |
           python -m venv .venv
           ./.venv/bin/pip install --upgrade pip
-          ./.venv/bin/pip install ../deploy/wheels/alphalab-3.5.0-py3-none-any.whl
           ./.venv/bin/pip install -e ".[dev]"
 
+      - name: AlphaLab — verify the installed release and run its consumer contract
+        working-directory: backend
+        run: ../scripts/verify-alphalab.sh "$PWD/.venv/bin/python"
+
       - name: Ruff
-        if: steps.engine.outputs.available == 'true'
         working-directory: backend
         run: ./.venv/bin/ruff check .
 
       - name: Ruff format
-        if: steps.engine.outputs.available == 'true'
         working-directory: backend
         run: ./.venv/bin/ruff format --check .
 
       - name: Mypy
-        if: steps.engine.outputs.available == 'true'
         working-directory: backend
         run: ./.venv/bin/mypy
 
       - name: Configuration is safe for this environment
-        if: steps.engine.outputs.available == 'true'
         working-directory: backend
         run: ./.venv/bin/python -m iluvtrade.cli check-config
 
       - name: AlphaLab boundary
-        if: steps.engine.outputs.available == 'true'
         working-directory: backend
         run: ./.venv/bin/pytest -q tests/unit/test_engine_boundary.py
 
       - name: Test isolation — the suite cannot reach a real database
-        if: steps.engine.outputs.available == 'true'
         working-directory: backend
         run: ./.venv/bin/pytest -q tests/test_isolation.py
 
-      - name: Full test suite
-        if: steps.engine.outputs.available == 'true'
+      - name: Application suite (SQLite)
         working-directory: backend
+        # SQLite, a temporary file per test. Tests marked postgres are listed as
+        # not run here; the postgres job runs them.
         run: ./.venv/bin/pytest -q
 
       - name: Alembic — models match migrations
-        if: steps.engine.outputs.available == 'true'
         working-directory: backend
         # Against a scratch database in the runner's workspace, never a
         # committed one. The path is relative so nothing here depends on a
@@ -178,15 +151,20 @@ jobs:
           ./.venv/bin/alembic check
 
       - name: End-to-end demonstration
-        if: steps.engine.outputs.available == 'true'
         working-directory: backend
         run: ./.venv/bin/python -m iluvtrade.cli demo
 
   postgres:
-    name: Migrations against PostgreSQL
+    name: PostgreSQL — migrations, PostgreSQL-specific tests, application suite
     runs-on: ubuntu-latest
-    # This is the job that turns "PostgreSQL: NOT TESTED" into an answer. It
-    # needs the same engine wheel, so it fails under the same condition.
+    # Until 2026-10-11 the step that claimed to "run the suite against
+    # PostgreSQL" ran it on SQLite: tests/conftest.py's autouse fixture replaced
+    # ILUVTRADE_DATABASE_URL with a temporary SQLite file for every test. Only the
+    # alembic step ever reached PostgreSQL. The suite now selects its backend from
+    # ILUVTRADE_TEST_DATABASE_URL, gives each test its own PostgreSQL database
+    # cloned from a template `alembic upgrade head` built, asserts on every test
+    # that the engine really is PostgreSQL, and refuses -- rather than skips -- the
+    # PostgreSQL tests when that variable is missing.
     services:
       postgres:
         image: postgres:16-alpine
@@ -201,6 +179,10 @@ jobs:
           --health-retries 10
         ports:
           - 5432:5432
+    env:
+      # The server, not one database: the suite creates and drops its own
+      # (prefixed iluvtrade_test_) through the maintenance database.
+      ILUVTRADE_TEST_DATABASE_URL: postgresql+psycopg://iluvtrade:ci-not-a-secret@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -208,38 +190,17 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Locate the AlphaLab wheel
-        id: engine
-        run: |
-          set -euo pipefail
-          engine_wheel="deploy/wheels/alphalab-3.5.0-py3-none-any.whl"
-          mkdir -p "$(dirname "$engine_wheel")"
-
-          if [ -n "${ALPHALAB_WHEEL_URL:-}" ]; then
-            curl -fsSL "$ALPHALAB_WHEEL_URL" -o "$engine_wheel"
-          fi
-
-          if [ -f "$engine_wheel" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::error title=AlphaLab wheel missing::alphalab==3.5.0 is not on PyPI and no wheel was provided. Set the repository variable ALPHALAB_WHEEL_URL to a direct wheel URL, or commit the wheel to deploy/wheels/."
-            exit 1
-          fi
-        env:
-          ALPHALAB_WHEEL_URL: ${{ vars.ALPHALAB_WHEEL_URL }}
-
       - name: Create project venv and install dependencies, with the PostgreSQL driver
-        if: steps.engine.outputs.available == 'true'
         working-directory: backend
         run: |
           python -m venv .venv
           ./.venv/bin/pip install --upgrade pip
-          ./.venv/bin/pip install ../deploy/wheels/alphalab-3.5.0-py3-none-any.whl
           ./.venv/bin/pip install -e ".[dev,postgres]"
 
-      - name: Migrate a PostgreSQL database from empty to head
-        if: steps.engine.outputs.available == 'true'
+      - name: PostgreSQL is up and answering
+        run: pg_isready -h localhost -p 5432 -U iluvtrade
+
+      - name: Migrations — empty to head, then drift check
         working-directory: backend
         env:
           ILUVTRADE_DATABASE_URL: postgresql+psycopg://iluvtrade:ci-not-a-secret@localhost:5432/iluvtrade
@@ -248,11 +209,12 @@ jobs:
           ./.venv/bin/alembic current
           ./.venv/bin/alembic check
 
-      - name: Run the suite against PostgreSQL
-        if: steps.engine.outputs.available == 'true'
+      - name: PostgreSQL-specific tests (tests/postgres)
         working-directory: backend
-        env:
-          ILUVTRADE_DATABASE_URL: postgresql+psycopg://iluvtrade:ci-not-a-secret@localhost:5432/iluvtrade
-        # Expected to reveal dialect differences the SQLite run cannot. Its
-        # result is evidence either way; see docs/DEPLOYMENT.md.
-        run: ./.venv/bin/pytest -q
+        run: ./.venv/bin/pytest -q -p no:cacheprovider tests/postgres
+
+      - name: Application suite against PostgreSQL
+        working-directory: backend
+        # Prints "database backend: postgresql ..." in its header and lists any
+        # sqlite_only test it did not run.
+        run: ./.venv/bin/pytest -q -p no:cacheprovider -m "not postgres"

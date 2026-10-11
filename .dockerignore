@@ -12,10 +12,6 @@
 #    @esbuild/darwin-arm64 and @rollup/rollup-darwin-arm64 land in a linux
 #    image. The layer-caching intent — dependencies first, sources second — is
 #    defeated at the same time.
-#
-# Note the asymmetry with .gitignore: deploy/wheels/*.whl is git-ignored and
-# must be *present* here, because the AlphaLab wheel is not on PyPI and the
-# image cannot be built without it.
 
 # --- secrets ----------------------------------------------------------------
 .env

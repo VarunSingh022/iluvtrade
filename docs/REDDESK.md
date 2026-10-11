@@ -28,6 +28,17 @@ organization actually performed on this platform, against this exact strategy
 version** — a creator cannot cite a number they typed, or another strategy's
 result. A listing with no evidence is publishable and is shown as having none.
 
+Evidence also carries the cited run's **temporal evidence**
+(`evidence.temporal_evidence`): what the bar interval of the data it ran on
+rested on — consistency with the timestamps (`validated`), or the creator's own
+unverified declaration that named instruments have missing observations
+(`missing_observations_confirmed`, with `user_declared_instruments`). It comes
+from the run's snapshot of its dataset version, never from the listing request,
+so a creator cannot relabel it; a run stored before snapshots shows
+`not_recorded`, and a cited run that no longer exists shows `unavailable`
+(with no metrics). The creator's dataset version id and canonical hash are
+withheld from the public view; the limitation is described without them.
+
 Every displayed evidence block carries:
 
 > A backtest is a simulation over historical data under stated assumptions. It

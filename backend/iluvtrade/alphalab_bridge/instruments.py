@@ -21,9 +21,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from alphalab.core.enums import AssetType
-from alphalab.instrument.record import InstrumentRecord
-from alphalab.instrument.registry import InstrumentRegistry, register_instruments
+from alphalab.core import AssetType
+from alphalab.instrument import InstrumentRecord, InstrumentRegistry, register_instruments
 
 __all__ = ["InstrumentUniverse", "asset_id_for", "universe_for"]
 

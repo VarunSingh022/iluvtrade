@@ -23,6 +23,7 @@ live. ``docs/TRADING.md`` records what remains for live.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -33,10 +34,10 @@ from typing import Any, cast
 from sqlalchemy import update
 from sqlalchemy.engine import CursorResult
 
-from iluvtrade.alphalab_bridge import engine, instruments, market, runconfig
+from iluvtrade.alphalab_bridge import engine, instruments, market, results, runconfig
 from iluvtrade.alphalab_bridge import strategies as implementations
-from iluvtrade.common import storage
 from iluvtrade.common.observability import correlated, correlation_id, set_context
+from iluvtrade.data import ingest
 from iluvtrade.db.base import utcnow
 from iluvtrade.db.models.data import DatasetVersion
 from iluvtrade.db.models.strategy import StrategyVersion
@@ -72,11 +73,11 @@ class _Loaded:
     risk_profile: dict[str, Any]
     seed: int
     symbols: list[str]
+    fill_timing: str
+    temporal_evidence: dict[str, Any]
 
 
 def _load(session_id: str) -> _Loaded:
-    import json
-
     with session_scope() as session:
         trading_session = session.get(TradingSession, session_id)
         if trading_session is None:
@@ -97,7 +98,11 @@ def _load(session_id: str) -> _Loaded:
         if strategy_version is None:
             raise LookupError("The strategy version no longer exists.")
 
-        rows = list(storage.read_jsonl(version.canonical_path))
+        # Re-checked at start, not only at creation: a session created before an
+        # upgrade may name a version that is no longer runnable.
+        ingest.require_runnable(version)
+        evidence = _session_evidence(trading_session, version)
+        rows = ingest.canonical_rows(version)
         stored_parameters = json.loads(trading_session.parameters_json or "{}")
         # The version's own defaults are the baseline; the session may override
         # within the schema. An unknown key is refused by validate_parameters.
@@ -107,7 +112,7 @@ def _load(session_id: str) -> _Loaded:
         )
         return _Loaded(
             rows=rows,
-            frequency=version.inferred_frequency,
+            frequency=ingest.bar_interval_of(version),
             implementation_key=strategy_version.implementation_key,
             parameters=parameters,
             starting_cash=Decimal(trading_session.starting_cash),
@@ -115,7 +120,33 @@ def _load(session_id: str) -> _Loaded:
             risk_profile=json.loads(trading_session.risk_config_json or "{}"),
             seed=trading_session.seed,
             symbols=sorted({str(row["symbol"]) for row in rows}),
+            fill_timing=trading_session.fill_timing,
+            temporal_evidence=evidence,
         )
+
+
+def _session_evidence(trading_session: TradingSession, version: DatasetVersion) -> dict[str, Any]:
+    """The session's temporal-evidence snapshot, checked against its dataset version.
+
+    A session created before snapshots existed has none; it is refused rather
+    than given one now, which would present today's reading as what was
+    recorded. A snapshot naming another version or canonical file is refused.
+    """
+
+    if not trading_session.temporal_evidence_json:
+        raise LookupError(
+            "This paper session was created before temporal evidence was recorded, so what "
+            "its dataset's bar interval rested on is unknown. Create a new session."
+        )
+    evidence = dict(json.loads(trading_session.temporal_evidence_json))
+    if (
+        evidence.get("dataset_version_id") != version.id
+        or evidence.get("dataset_canonical_hash") != version.canonical_hash
+    ):
+        raise LookupError(
+            "This paper session's temporal evidence does not describe its dataset version."
+        )
+    return evidence
 
 
 def _should_continue(session_id: str) -> tuple[bool, SessionStatus]:
@@ -129,6 +160,19 @@ def _should_continue(session_id: str) -> tuple[bool, SessionStatus]:
 
 
 def run_session(session_id: str, *, max_records: int | None = None) -> str:
+    """Drive one paper session; see :func:`_run_session_unscoped`.
+
+    Runs inside its own logging-context scope, so a caller that drives a session
+    synchronously gets its own context back afterwards. The body sets
+    ``organization_id`` and ``mode`` for its log lines; without the scope they
+    stayed set on the calling thread after the session ended.
+    """
+
+    with correlated(correlation_id()):
+        return _run_session_unscoped(session_id, max_records=max_records)
+
+
+def _run_session_unscoped(session_id: str, *, max_records: int | None = None) -> str:
     """Drive one paper session to completion, a stop request, or a pause.
 
     Returns the terminal status as a string. Safe to call again on a paused
@@ -183,6 +227,24 @@ def run_session(session_id: str, *, max_records: int | None = None) -> str:
             message=f"Replaying {len(loaded.rows)} records for {', '.join(loaded.symbols)}.",
             payload={"records": len(loaded.rows), "symbols": loaded.symbols},
         )
+        # Logged on every start, separately from execution assumptions: what
+        # the bar interval rests on is a property of the data, not of fills.
+        declared = loaded.temporal_evidence.get("user_declared_instruments") or []
+        log_event(
+            session,
+            trading_session,
+            kind="session.temporal_evidence",
+            severity="warning" if declared else "info",
+            message=(
+                f"Bar interval {loaded.temporal_evidence.get('bar_interval')}: "
+                + (
+                    f"user-declared, not verified, for {', '.join(declared)}."
+                    if declared
+                    else "consistent with every instrument's timestamps."
+                )
+            ),
+            payload=loaded.temporal_evidence,
+        )
         organization_id = trading_session.organization_id
         created_by = trading_session.created_by_user_id
         session_name = trading_session.name
@@ -210,6 +272,8 @@ def run_session(session_id: str, *, max_records: int | None = None) -> str:
         currency=loaded.currency,
         starting_cash=loaded.starting_cash,
         risk=risk,
+        exchange=universe.exchange,
+        fill_timing=loaded.fill_timing,
         strategy_ids=(strategy_id,),
         instruments=universe.registry,
         seed=loaded.seed,
@@ -223,18 +287,28 @@ def run_session(session_id: str, *, max_records: int | None = None) -> str:
     logs: list[tuple[str, str]] = []
     factory = engine.context_factory_for(loaded.parameters, logs, start_timestamp)
     runtime = engine.runtime_for({strategy_id: instance}, start_timestamp=start_timestamp)
-    run_state = engine.initialize_session(config, runtime)
 
     terminal = SessionStatus.STOPPED
     fills_seen = 0
     processed = 0
     refusals: list[tuple[int, str]] = []
+    strategy_failures: list[dict[str, Any]] = []
 
-    # Every advance happens inside AlphaLab's identifier scope. Its own drivers
-    # wrap their loop in this; advancing outside it drops identifier generation
-    # back to ``uuid4``, and a session whose order ids differ on every run cannot
-    # be compared to the backtest it was supposed to reproduce.
+    # Funding and every advance happen inside AlphaLab's identifier scope. Its
+    # own drivers wrap initialization and the loop in this; anything outside it
+    # mints from ``uuid4``, and a session whose record differs on every run
+    # cannot be compared to the backtest it was supposed to reproduce.
     with engine.run_scope(loaded.seed):
+        run_state = engine.initialize_session(config, runtime, source_id=source.source_id)
+        # The timing AlphaLab will apply, read from its own record of the run --
+        # before any record is processed. A session that asked for one timing
+        # and would run under another is refused rather than run and mislabelled.
+        applied = results.assumptions_of(engine.result_of(run_state))["fill_timing"]
+        if applied != loaded.fill_timing:
+            raise RuntimeError(
+                f"The session asked for fill timing {loaded.fill_timing!r} but AlphaLab is "
+                f"configured with {applied!r}; it was not run."
+            )
         for index, record in enumerate(records, start=1):
             keep_going, status = _should_continue(session_id)
             if not keep_going:
@@ -249,6 +323,15 @@ def run_session(session_id: str, *, max_records: int | None = None) -> str:
 
             run_state, step = engine.advance(run_state, record, factory)
             processed = index
+
+            # AlphaLab isolates a strategy that raised and keeps the run going
+            # without it (EXE-006). A paper session has one strategy, so what
+            # would continue is a session trading nothing that still looks
+            # alive. Stop here, with the engine's own account of why.
+            strategy_failures = results.failures_of(engine.result_of(run_state))
+            if strategy_failures:
+                terminal = SessionStatus.FAILED
+                break
 
             # A refused order never becomes an order, a report or a fill, so
             # without this the session log would show a strategy that simply
@@ -266,6 +349,9 @@ def run_session(session_id: str, *, max_records: int | None = None) -> str:
                     if trading_session is not None:
                         project(session, trading_session, run_state, universe)
         else:
+            # The data ran out: complete its last instant, as AlphaLab's own
+            # driver does. A stop or pause above leaves it open.
+            run_state = engine.close_final_slice(run_state, factory)
             terminal = SessionStatus.STOPPED
 
     # Final projection and any refusals the engine recorded, so the session log
@@ -329,10 +415,43 @@ def run_session(session_id: str, *, max_records: int | None = None) -> str:
             )
         for level, text in logs[-50:]:
             log_event(session, trading_session, kind="strategy_log", severity=level, message=text)
+        # How the simulator modelled execution, in AlphaLab's own words, so a
+        # session's log says how optimistic its fills were -- the fill timing
+        # chosen, and every other optimistic assumption in force.
+        assumptions = results.assumptions_of(engine.result_of(run_state))
+        log_event(
+            session,
+            trading_session,
+            kind="execution_assumptions",
+            severity="warning" if assumptions["optimistic"] else "info",
+            message=(
+                f"Simulated fills: {assumptions['fill_timing']}. "
+                + (
+                    "Optimistic: " + "; ".join(assumptions["optimistic"]) + "."
+                    if assumptions["optimistic"]
+                    else "No optimistic assumption in force."
+                )
+            ),
+            payload=assumptions,
+        )
+        for failure in strategy_failures:
+            log_event(
+                session,
+                trading_session,
+                kind="strategy_failed",
+                severity="error",
+                message=f"Strategy failed: {failure['error']}",
+                payload=failure,
+            )
+        if strategy_failures:
+            trading_session.failure_reason = (
+                f"Strategy failed at t={strategy_failures[0]['timestamp']}: "
+                f"{strategy_failures[0]['error']}"
+            )[:4000]
 
         if trading_session.status is not SessionStatus.HALTED:
             trading_session.status = terminal
-        if terminal in (SessionStatus.STOPPED, SessionStatus.HALTED):
+        if terminal in (SessionStatus.STOPPED, SessionStatus.HALTED, SessionStatus.FAILED):
             trading_session.stopped_at = utcnow()
         log_event(
             session,

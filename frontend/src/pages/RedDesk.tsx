@@ -1,6 +1,7 @@
 import { useState } from "react";
 
 import { ConfirmButton } from "../components/Confirm";
+import { TemporalEvidencePanel } from "../components/TemporalEvidence";
 import { Badge, Banner, Card, ErrorBanner, Field, Loading, Stat, StatusBadge, Tabs } from "../components/ui";
 import { ApiError, api } from "../lib/api";
 import type { BacktestJob, BillingStatus, Entitlement, Listing, Strategy } from "../lib/api";
@@ -156,7 +157,11 @@ export default function RedDeskPage() {
                     ))}
                   </div>
 
-                  {listing.evidence ? (
+                  {listing.evidence && !listing.evidence.available ? (
+                    <Banner tone="err">
+                      This listing cites a backtest run that no longer exists; its evidence cannot be shown.
+                    </Banner>
+                  ) : listing.evidence ? (
                     <div className="card" style={{ background: "var(--surface-2)", padding: "0.6rem" }}>
                       <div className="stat-label" style={{ marginBottom: "0.35rem" }}>Backtest evidence</div>
                       <div className="grid cols-4">
@@ -164,6 +169,10 @@ export default function RedDeskPage() {
                         <div><div className="tiny faint">Sharpe</div><div className="mono small">{ratio(listing.evidence.sharpe_ratio)}</div></div>
                         <div><div className="tiny faint">Max DD</div><div className="mono small">{percent(listing.evidence.max_drawdown)}</div></div>
                         <div><div className="tiny faint">Orders</div><div className="mono small">{count(listing.evidence.order_count)}</div></div>
+                      </div>
+                      <div style={{ marginTop: "0.5rem" }}>
+                        <div className="stat-label" style={{ marginBottom: "0.25rem" }}>Data the backtest ran on</div>
+                        <TemporalEvidencePanel evidence={listing.evidence.temporal_evidence} />
                       </div>
                       <div className="tiny faint" style={{ marginTop: "0.4rem" }}>
                         {listing.evidence.disclaimer}

@@ -1,7 +1,10 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
+import { BarInterval } from "../components/BarInterval";
 import { Banner, Card, ErrorBanner, Field, Loading } from "../components/ui";
+import { DEFAULT_FILL_TIMING, FILL_TIMINGS } from "../lib/assumptions";
+import type { FillTiming } from "../lib/assumptions";
 import { ApiError, api } from "../lib/api";
 import type { BacktestJob, Dataset, Implementation, Strategy } from "../lib/api";
 import { count, epochDate } from "../lib/format";
@@ -23,6 +26,7 @@ export default function ResearchPage() {
   const [commissionKind, setCommissionKind] = useState<"percentage" | "per_share">("percentage");
   const [commissionRate, setCommissionRate] = useState("0.0003");
   const [seed, setSeed] = useState("");
+  const [fillTiming, setFillTiming] = useState<FillTiming>(DEFAULT_FILL_TIMING);
   const [overrides, setOverrides] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | undefined>();
@@ -74,6 +78,7 @@ export default function ResearchPage() {
         commission_kind: commissionKind,
         commission_rate: commissionRate,
         seed: seed ? Number(seed) : null,
+        fill_timing: fillTiming,
       });
       navigate(`/backtests/${job.id}`);
     } catch (caught) {
@@ -130,7 +135,7 @@ export default function ResearchPage() {
             <>
               <div className="small dim" style={{ marginBottom: "0.6rem" }}>
                 {epochDate(chosenDataset.version.start_timestamp)} → {epochDate(chosenDataset.version.end_timestamp)} ·{" "}
-                {chosenDataset.version.inferred_frequency ?? "irregular"} ·{" "}
+                <BarInterval version={chosenDataset.version} /> bars ·{" "}
                 {chosenDataset.version.symbol_count} symbol(s) · quality{" "}
                 {chosenDataset.version.quality_score?.toFixed(1)}
               </div>
@@ -208,6 +213,12 @@ export default function ResearchPage() {
           </Field>
           <Field label="Commission rate">
             <input value={commissionRate} onChange={(event) => setCommissionRate(event.target.value)} />
+          </Field>
+          <Field label="Fill timing" hint={FILL_TIMINGS[fillTiming].meaning}>
+            <select aria-label="Fill timing" value={fillTiming} onChange={(event) => setFillTiming(event.target.value as FillTiming)}>
+              <option value="next_event">{FILL_TIMINGS.next_event.label}</option>
+              <option value="same_event">{FILL_TIMINGS.same_event.label}</option>
+            </select>
           </Field>
           <Field label="Seed" hint="Leave empty to derive one from the request, so re-running reproduces it.">
             <input value={seed} onChange={(event) => setSeed(event.target.value)} placeholder="derived" />

@@ -171,3 +171,75 @@ def test_the_bridge_projects_results_rather_than_computing_them() -> None:
         "projects what the engine returned; a ratio computed here is a second "
         "answer to a question AlphaLab has already answered."
     )
+
+
+#: The modules AlphaLab's public API covers besides its packages: ``alphalab.api``
+#: and the documented state modules (AlphaLab 4.1.0 ``docs/api/PUBLIC_API.md``
+#: and ``public_api.json``). Every other non-package module is AlphaLab's own.
+_DOCUMENTED_MODULES = frozenset(
+    {
+        "alphalab.api",
+        "alphalab.allocation.snapshot",
+        "alphalab.backtesting.replay_snapshot",
+        "alphalab.broker.snapshot",
+        "alphalab.instrument.snapshot",
+        "alphalab.lifecycle.snapshot",
+        "alphalab.oms.snapshot",
+        "alphalab.portfolio.fx_feed",
+        "alphalab.portfolio.snapshot",
+        "alphalab.runtime.live_snapshot",
+        "alphalab.runtime.run_snapshot",
+        "alphalab.runtime.snapshot",
+    }
+)
+
+
+def test_the_bridge_imports_only_alphalabs_public_api() -> None:
+    """Every AlphaLab name the bridge uses is one AlphaLab promises to keep.
+
+    AlphaLab's public API is each *package's* ``__all__`` plus the documented
+    modules above; "any other module's names ... may change in any release",
+    and moving a class between submodules is not a breaking change there. Up to
+    AlphaLab 3.5 the bridge imported 71 names from submodules such as
+    ``alphalab.risk.limits`` — each one public, but by a path a 4.x patch release
+    is free to move. Checked against the *installed* package, so the rule is
+    the engine's own ``__all__``, not a copy of it that could drift.
+    """
+
+    import importlib
+
+    offenders: list[str] = []
+    checked = 0
+    for path in sorted(BRIDGE.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            where = f"{path.relative_to(PACKAGE)}:{getattr(node, 'lineno', '?')}"
+            if isinstance(node, ast.Import):
+                offenders += [
+                    f"{where} import {alias.name} (import names from the package instead)"
+                    for alias in node.names
+                    if alias.name.split(".")[0] == "alphalab" and alias.name != "alphalab"
+                ]
+                continue
+            if not (
+                isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.split(".")[0] == "alphalab"
+            ):
+                continue
+            module = importlib.import_module(node.module)
+            surface = hasattr(module, "__path__") or node.module in _DOCUMENTED_MODULES
+            exported = set(getattr(module, "__all__", ()))
+            for alias in node.names:
+                checked += 1
+                if not surface:
+                    offenders.append(f"{where} {node.module} is not a public AlphaLab module")
+                elif alias.name not in exported:
+                    offenders.append(f"{where} {node.module}.{alias.name} is not in its __all__")
+
+    assert checked > 10, f"Only {checked} AlphaLab names imported; the walk found nothing."
+    assert not offenders, (
+        "The bridge imports AlphaLab names outside its public API:\n  "
+        + "\n  ".join(offenders)
+        + "\nImport each from its package (e.g. `from alphalab.risk import RiskLimits`)."
+    )

@@ -20,6 +20,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Enum,
     Float,
     ForeignKey,
@@ -108,7 +109,13 @@ class BacktestRun(Base, IdMixin, OrgScopedMixin, TimestampMixin):
     parameters_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     universe_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     configuration_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
-    seed: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: What the dataset version's bar times rested on when this run executed
+    #: (``ingest.temporal_evidence``), snapshotted from that immutable version.
+    #: ``NULL`` for a run stored before the snapshot existed: not recorded, and
+    #: never reconstructed from today's rules.
+    temporal_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # BigInteger: a derived seed reaches 2**32 - 1, past PostgreSQL's INTEGER.
+    seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
     engine_name: Mapped[str] = mapped_column(String(64), nullable=False, default="alphalab")
     engine_version: Mapped[str] = mapped_column(String(32), nullable=False)
 
@@ -130,6 +137,11 @@ class BacktestRun(Base, IdMixin, OrgScopedMixin, TimestampMixin):
     #: Everything AlphaLab returned that is too large for a column: the equity
     #: curve, every order, every fill, the full analytics report.
     artifact_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    #: SHA-256 of the artifact as written. Checked, with the run id the document
+    #: carries, before the document is served as this run's. ``None`` for runs
+    #: stored before 0007 -- whose documents are therefore never served as
+    #: verified (they may share ``backtests/None/result.json`` with other runs).
+    artifact_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     #: Metrics AlphaLab's report exposed that have no column here, verbatim.
     metrics_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
 

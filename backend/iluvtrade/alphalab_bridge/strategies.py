@@ -27,9 +27,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from alphalab.strategy.context import StrategyContext
-from alphalab.strategy.events import Intent
-from alphalab.strategy.protocol import BaseStrategy, StrategyProtocol
+from alphalab.strategy import BaseStrategy, Intent, StrategyContext, StrategyProtocol
 
 __all__ = [
     "IMPLEMENTATIONS",
@@ -91,6 +89,52 @@ class ParameterSpec:
 
 
 # ---------------------------------------------------------------------------
+# Declared state
+# ---------------------------------------------------------------------------
+#
+# Every implementation below keeps memory between bars — a rolling window, a
+# "currently long" flag — and declares it through AlphaLab's
+# ``StrategyStateProtocol`` (``strategy_state_version`` / ``capture_state`` /
+# ``restore_state``). Without the declaration AlphaLab *accepts* a restore and
+# continues the strategy with empty memory, so a paused-and-resumed run differs
+# from the uninterrupted one while nothing reports it. The payload is JSON
+# natives only: a ``Decimal`` as its exact text, a set as a sorted list, because
+# AlphaLab reads a configuration back as JSON reads it (LIM-004).
+#
+# The constructor parameters are captured too, and a restore into an instance
+# built with other parameters is refused. AlphaLab records a strategy by type,
+# not by its constructor arguments, so this is the check that stops a resume
+# from continuing a run under a different strategy version's settings.
+
+STATE_VERSION = 1
+
+
+def _decimals(values: Iterable[Decimal]) -> list[str]:
+    return [str(value) for value in values]
+
+
+def _canonical(value: Decimal) -> str:
+    """A parameter's value as one spelling: ``25``, ``25.0`` and ``2.5E+1`` all read ``25``.
+
+    Parameters are compared on restore, and the same number can arrive spelled
+    differently (a JSON float coerced through ``str``, or an exact decimal).
+    """
+
+    return format(value.normalize(), "f")
+
+
+def _require_state(payload: Any, version: int, expected: dict[str, Any], owner: str) -> None:
+    if version != STATE_VERSION:
+        raise ParameterError(f"{owner} cannot read declared state version {version}.")
+    recorded = payload.get("parameters") if isinstance(payload, dict) else None
+    if recorded != expected:
+        raise ParameterError(
+            f"{owner} was captured with parameters {recorded!r}; this instance has "
+            f"{expected!r}. Resume it with the parameters it was run with."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Strategy implementations
 # ---------------------------------------------------------------------------
 
@@ -141,6 +185,27 @@ class MovingAverageCrossover(BaseStrategy):
             timestamp=bar.timestamp,
         )
 
+    def _parameters(self) -> dict[str, Any]:
+        return {"fast": self._fast, "slow": self._slow, "quantity": _canonical(self._quantity)}
+
+    def strategy_state_version(self) -> int:
+        return STATE_VERSION
+
+    def capture_state(self) -> dict[str, Any]:
+        return {
+            "parameters": self._parameters(),
+            "closes": {asset: _decimals(window) for asset, window in sorted(self._closes.items())},
+            "long": dict(sorted(self._long.items())),
+        }
+
+    def restore_state(self, payload: Any, version: int) -> None:
+        _require_state(payload, version, self._parameters(), type(self).__name__)
+        self._closes = {
+            asset: [Decimal(close) for close in window]
+            for asset, window in payload["closes"].items()
+        }
+        self._long = {asset: bool(flag) for asset, flag in payload["long"].items()}
+
 
 class BuyAndHold(BaseStrategy):
     """Buy once per instrument on its first bar, then do nothing.
@@ -166,6 +231,21 @@ class BuyAndHold(BaseStrategy):
                 timestamp=bar.timestamp,
             ),
         )
+
+    def strategy_state_version(self) -> int:
+        return STATE_VERSION
+
+    def capture_state(self) -> dict[str, Any]:
+        return {
+            "parameters": {"quantity": _canonical(self._quantity)},
+            "bought": sorted(self._bought),
+        }
+
+    def restore_state(self, payload: Any, version: int) -> None:
+        _require_state(
+            payload, version, {"quantity": _canonical(self._quantity)}, type(self).__name__
+        )
+        self._bought = set(payload["bought"])
 
 
 class MeanReversionBands(BaseStrategy):
@@ -217,6 +297,31 @@ class MeanReversionBands(BaseStrategy):
             target=target,
             timestamp=bar.timestamp,
         )
+
+    def _parameters(self) -> dict[str, Any]:
+        return {
+            "window": self._window,
+            "entry_sigma": _canonical(self._entry),
+            "quantity": _canonical(self._quantity),
+        }
+
+    def strategy_state_version(self) -> int:
+        return STATE_VERSION
+
+    def capture_state(self) -> dict[str, Any]:
+        return {
+            "parameters": self._parameters(),
+            "closes": {asset: _decimals(window) for asset, window in sorted(self._closes.items())},
+            "long": dict(sorted(self._long.items())),
+        }
+
+    def restore_state(self, payload: Any, version: int) -> None:
+        _require_state(payload, version, self._parameters(), type(self).__name__)
+        self._closes = {
+            asset: [Decimal(close) for close in window]
+            for asset, window in payload["closes"].items()
+        }
+        self._long = {asset: bool(flag) for asset, flag in payload["long"].items()}
 
 
 @dataclass(frozen=True, slots=True)

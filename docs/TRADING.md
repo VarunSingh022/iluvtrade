@@ -26,7 +26,27 @@ book — asserted in `tests/integration/test_workflow.py`.
 **Paper sessions run end to end.** `trading/runner.py` drives
 `TradingSession.advance()` one record at a time inside AlphaLab's `id_scope`,
 honours stop/pause/kill between records, projects the engine's state every 25
-records and on every fill, and logs every refusal.
+records and on every fill, and logs every refusal. Each session states its
+`fill_timing` (`next_event` by default; `same_event` only when asked for — see
+`docs/RESEARCH.md`), stored on the row so a restart replays under the same
+execution, and a snapshot of its dataset version's **temporal evidence** (what
+the bar interval rests on, including any instruments whose interval the
+importer only declared), taken at creation, shown on the session and logged as
+a `session.temporal_evidence` event on every start — kept apart from the
+execution assumptions. A session created before snapshots existed is refused at
+start rather than given evidence it never recorded; and its log ends with AlphaLab's own record of the execution
+assumptions in force (an `execution_assumptions` event, a warning when any is
+optimistic). Sessions created before the setting existed are recorded as
+`same_event`, which is what they ran. Before processing any record the runner
+reads the timing from AlphaLab's own record and refuses a session whose applied
+timing differs from the one it asked for. It also re-checks that the session's
+dataset version has validated timestamp provenance, so a session created before
+an upgrade cannot run on a version imported under the old UTC reading.
+
+A session's default seed is derived from its material inputs by the documented
+digest in `iluvtrade.common.seeds` (identical in every process) and stored on the
+row; every run, restart and reconstruction reads that stored value. Until
+2026-10-11 it came from Python's per-process `hash()`.
 
 **Live sessions do not run**, and the reason is structural rather than a check
 that could be forgotten: `ExecutionMode.LIVE` is **never constructed anywhere in
@@ -59,10 +79,19 @@ What remains to be built:
 4. Wall-clock staleness gating via `RunConfig.max_market_data_age_seconds` —
    already supported by the engine, unused by the paper runner because a
    replayed dataset's clock is the record itself and nothing is ever stale.
-5. Durable mid-run resume. A paper session restarted today replays from the
+5. Durable mid-run resume. A paper session resumed today replays from the
    beginning of its dataset, which is honest for a replay but wrong for a live
-   run. AlphaLab has run snapshots (`runtime.run_snapshot`); wiring them is
-   unbuilt.
+   run. What exists: AlphaLab 4.1 can pause a replay and resume it, in this
+   process or another, to the byte-identical result (`PausedReplay`,
+   `backtesting.replay_snapshot`, `api.resume_replay`); a stopped run continues
+   the same way through `runtime.run_snapshot` and `RunEngine.resume`; and every
+   strategy here declares its memory, so such a resume continues it rather than
+   restarting it empty (asserted against the real engine). What is unbuilt is
+   the application half: a per-session checkpoint table and tenant-scoped
+   payload store, the runner capturing at a pause and restoring on resume
+   against the same dataset version and session configuration, and refusing —
+   never retrying with other inputs — when AlphaLab reports `StateDecodeError`
+   or `StorageError`.
 
 ## The three live gates
 

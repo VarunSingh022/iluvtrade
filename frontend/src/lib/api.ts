@@ -257,6 +257,101 @@ export interface DetectedSchema {
   ohlc_complete: boolean;
   sample_rows: string[][];
   warnings: string[];
+  /** What must be declared before importing: present on `/datasets/inspect`. */
+  timestamp_semantics?: TimestampSemantics;
+  /** Present when `/datasets/inspect` was given a declaration: the import's interval check, nothing stored. */
+  interval_check?: IntervalCheck;
+}
+
+/**
+ * The declared interval checked against each instrument's bars, without storing.
+ * `ambiguous` names the instruments whose own bars never sit one interval apart:
+ * for them the interval is only the user's declaration, and the import refuses
+ * them unless each is named in `missing_observations_confirmed_for`.
+ */
+export interface IntervalCheck {
+  refused: string | null;
+  bar_interval?: string;
+  spacing: SpacingEvidence | null;
+  ambiguous: string[];
+  /** SHA-256 of the exact bytes inspected. */
+  content_sha256: string;
+  /** Binds this check to those bytes, the declaration and the cleaning policy; sent back with a confirmation. */
+  preview_id: string;
+}
+
+/**
+ * What a dataset's bar interval rested on, snapshotted from the exact dataset
+ * version a run or session used. `missing_observations_confirmed` means the
+ * interval was the importer's unverified declaration for the listed
+ * instruments; `validated` means the timestamps are consistent with it (not
+ * proof); `not_recorded` / `unavailable` mean nothing can be said.
+ */
+export type TemporalEvidenceStatus =
+  | "validated"
+  | "missing_observations_confirmed"
+  | "unvalidated"
+  | "none"
+  | "not_recorded"
+  | "unavailable";
+
+export interface TemporalEvidence {
+  evidence_version: number;
+  status: TemporalEvidenceStatus;
+  meaning: string;
+  /** Withheld from other organizations' view of a listing. */
+  dataset_version_id?: string;
+  dataset_canonical_hash?: string | null;
+  provenance_record_version?: number | null;
+  convention?: string | null;
+  timezone?: string | null;
+  bar_interval?: string | null;
+  user_declared_instruments?: string[];
+}
+
+export interface SpacingEvidence {
+  arithmetic: string;
+  instruments: Record<string, InstrumentSpacing>;
+  instrument_count: number;
+  one_interval_pairs: number;
+  longer_gaps: number;
+  accepted_on_confirmation: string[];
+  ambiguous: string[];
+  missing_observations_confirmed_for: string[];
+}
+
+export interface TimestampSemantics {
+  kind: string | null;
+  kinds: Record<string, number>;
+  requires_timezone: boolean;
+  conventions: string[];
+}
+
+/** What a version's timestamps mean and how AlphaLab read them; `{}` before declarations. */
+export interface TemporalRecord {
+  convention?: string;
+  timezone?: string | null;
+  bar_interval?: string;
+  bar_interval_source?: string;
+  record_version?: number;
+  missing_observations_confirmed_for?: string[];
+  spacing?: SpacingEvidence | null;
+  timestamp_kind?: string | null;
+  interpreted_by?: string;
+  rule?: string;
+  moved_to_interval_end?: number;
+}
+
+/** How a run modelled execution, as AlphaLab recorded it on the run. */
+export interface ExecutionAssumptions {
+  fill_timing: string;
+  routing: string;
+  fill_policy: string;
+  costs: string;
+  latency: string;
+  frictionless: boolean;
+  unlimited_liquidity: boolean;
+  optimistic: string[];
 }
 
 export interface DatasetVersion {
@@ -270,12 +365,32 @@ export interface DatasetVersion {
   symbol_count: number;
   start_timestamp: number | null;
   end_timestamp: number | null;
+  /** The most common gap between bars: descriptive only, never the bar interval. */
   inferred_frequency: string | null;
+  /** The declared bar interval, when validated provenance records one. */
+  bar_interval: string | null;
+  interval_status: IntervalStatus;
+  /** Instruments accepted only on the missing-observation confirmation. */
+  accepted_on_confirmation: string[];
   quality_score: number | null;
   canonical_hash: string | null;
   failure_reason: string | null;
   created_at: string;
   approved_at: string | null;
+}
+
+/**
+ * How far the data supported the declared bar interval: every instrument showed
+ * it; some were accepted on the missing-observation confirmation; no validated
+ * provenance (nothing runs on it); or the import failed.
+ */
+export type IntervalStatus = "validated" | "missing_observations_confirmed" | "unvalidated" | "none";
+
+export interface InstrumentSpacing {
+  bars: number;
+  one_interval_pairs: number;
+  longer_gaps: number;
+  accepted_on_confirmation: boolean;
 }
 
 export interface RejectedRow {
@@ -298,6 +413,7 @@ export interface DatasetVersionDetail extends DatasetVersion {
   quality: Quality;
   transformations: { logged: Transformation[]; counts: Record<string, number>; logged_is_truncated: boolean };
   cleaning_policy: Record<string, unknown>;
+  temporal: TemporalRecord;
   source: {
     kind?: string;
     origin?: string;
@@ -389,19 +505,24 @@ export interface BacktestResult {
     parameters: Record<string, unknown>;
     universe: string[];
     configuration: Record<string, unknown>;
+    temporal_evidence: TemporalEvidence;
   };
   metrics: Record<string, number | string | null>;
+  /** `null` unless the stored document is proven to be this run's (see `result_integrity`). */
   result: {
     valuation: Record<string, string | number | null>;
     positions: Array<Record<string, string | null>>;
     orders: Array<Record<string, string | number | null>>;
     fills: Array<Record<string, string | number | null>>;
+    /** Absent on results stored before execution assumptions were recorded. */
+    execution_assumptions?: ExecutionAssumptions;
     equity_curve: Array<{ timestamp: number; equity: string | null; cash: string | null }>;
     report: Record<string, never> | null | Record<string, Record<string, number | null> | number | string | null>;
     risk_refusals?: { count: number; logged: Array<Record<string, unknown>> };
     skipped_records?: Array<Record<string, unknown>>;
     unpriced_assets?: Array<Record<string, unknown>>;
-  };
+  } | null;
+  result_integrity?: { verified: boolean; reason?: string; artifact_sha256?: string };
 }
 
 export interface Listing {
@@ -423,7 +544,17 @@ export interface Listing {
   supported_data: string[];
   current_strategy_version_id: string | null;
   version_history: Array<{ strategy_version_id: string; release_notes: string; is_current: boolean; has_evidence: boolean }>;
-  evidence: {
+  evidence: ListingEvidence | null;
+  rating: { average: number | null; count: number };
+  published_at: string | null;
+}
+
+/** A listing's cited run, or a statement that it is gone. */
+export type ListingEvidence =
+  | ({ available: true; temporal_evidence: TemporalEvidence } & ListingRunEvidence)
+  | { available: false; backtest_run_id: string; temporal_evidence: TemporalEvidence };
+
+export interface ListingRunEvidence {
     backtest_run_id: string;
     records_processed: number;
     order_count: number;
@@ -437,9 +568,6 @@ export interface Listing {
     engine: string;
     seed: number;
     disclaimer: string;
-  } | null;
-  rating: { average: number | null; count: number };
-  published_at: string | null;
 }
 
 export interface BillingStatus {
@@ -496,6 +624,9 @@ export interface TradingSession {
   starting_cash: string;
   base_currency: string;
   seed: number;
+  fill_timing: string;
+  /** A paper session's snapshot; `null` for a live session, which reads no dataset. */
+  temporal_evidence: TemporalEvidence | null;
   records_processed: number;
   cash: string | null;
   equity: string | null;

@@ -2,15 +2,18 @@
 # for the reasoning behind each. A package appearing here is NOT a statement that
 # it is harmless — it is a statement that somebody worked out what it means here.
 #
-# scripts/audit-dependencies.sh fails on anything not in this list.
+# scripts/audit-dependencies.sh (scripts/check_advisories.py) fails on anything
+# not in this list, and on any audit it cannot read.
 
 # --- development tooling; never reaches the production bundle ---------------
-vitest              # test runner
-@vitest/mocker      # via vitest
-vite-node           # via vitest
-vite                # dev server and build tool
-esbuild             # via vite
+# None. vitest, @vitest/mocker, vite-node, vite, esbuild, tinypool and
+# source-map-js were resolved by moving vitest 2.1.9 -> 5.0.3 and source-map-js
+# 1.2.1 -> 1.2.2 (see docs/SECURITY.md). They are deliberately not kept here: an
+# entry for a resolved advisory would let it come back unnoticed.
 
 # --- shipped in the bundle; assessed as not reachable in this application ----
-react-router        # open redirect via a user-controlled `to`; none exists here
-react-router-dom    # via react-router
+# One "GHSA-id package" pair per line. Matched on both: a new advisory against
+# react-router fails the gate until it is assessed. react-router-dom is reported
+# only *via* react-router and carries no advisory of its own.
+GHSA-wrjc-x8rr-h8h6 react-router   # open redirect via backslash in a user-controlled `to`; none exists here
+GHSA-337j-9hxr-rhxg react-router   # constructor injection in SSR hydration (deserializeErrors); no SSR here

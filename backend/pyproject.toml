@@ -21,10 +21,27 @@ license = { text = "Proprietary" }
 authors = [{ name = "Varun Kumar Singh" }]
 
 dependencies = [
-  "alphalab==3.5.0",
+  # The engine, by direct reference to the published v4.1.0 release asset, with
+  # the SHA-256 that release's SHA256SUMS-4.1.0 records. Never a bare
+  # `alphalab==4.1.0`: AlphaLab is not on PyPI, and a bare name resolved against
+  # a public index installs whoever registers it (AlphaLab docs/INTEGRATION.md).
+  # pip refuses the download if its digest differs, so this one line is the pin
+  # and the integrity check for every install path — development, CI and the
+  # Docker image all install the package through it. To upgrade, replace both
+  # the URL and the hash from the new release's SHA256SUMS file; never type a
+  # hash by hand.
+  "alphalab @ https://github.com/VarunSingh022/AlphaLab/releases/download/v4.1.0/alphalab-4.1.0-py3-none-any.whl#sha256=c2c1e8ca916a025b47350b15da9bde6fb3c64e626f2b05736e4152896b7a0a09",
   "fastapi>=0.115,<1",
   "uvicorn[standard]>=0.32,<1",
-  "sqlalchemy>=2.0,<3",
+  # The 2.0 series, which this code's typing is written for. `>=2.0,<3` let a
+  # fresh resolve pick 2.1, where `Select` became variadic: the 2.0 spelling
+  # `Select[tuple[T]]` in `platform.tenancy.scoped` then means "one column of type
+  # tuple[T]", and mypy reports 97 errors downstream of it. The 524 tests pass on
+  # 2.1.4, so it is a typing difference, not a runtime one. Moving to 2.1 is
+  # `Select[tuple[T]]` -> `Select[T]` in `scoped` (mypy is clean on 2.1.4 with
+  # that one change) together with raising this floor to 2.1 — no spelling is
+  # correct under both.
+  "sqlalchemy>=2.0.52,<2.1",
   "alembic>=1.14,<2",
   # The [email] extra, not bare pydantic. `EmailStr` raises ImportError without
   # `email-validator`, so a fresh install per the documented instructions
@@ -64,6 +81,11 @@ iluvtrade = "iluvtrade.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["iluvtrade"]
+
+[tool.hatch.metadata]
+# Required for the AlphaLab dependency above, which is a URL rather than an
+# index name. Hatchling refuses direct references unless this is set.
+allow-direct-references = true
 
 [tool.ruff]
 line-length = 100

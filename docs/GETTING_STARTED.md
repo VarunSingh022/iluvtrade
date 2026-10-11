@@ -4,7 +4,8 @@
 
 - Python 3.12+
 - Node 20+ (for the frontend)
-- AlphaLab 3.5.0 — a wheel or an installable source tree
+- Network access to github.com: AlphaLab 4.1.0 is installed from its GitHub
+  release, not from PyPI
 
 ## Install
 
@@ -15,7 +16,6 @@ git clone <this repository> && cd iluvtrade
 cd backend
 python3 -m venv .venv
 ./.venv/bin/pip install --upgrade pip
-./.venv/bin/pip install /path/to/alphalab-3.5.0-py3-none-any.whl
 ./.venv/bin/pip install -e ".[dev]"
 
 # Frontend
@@ -23,15 +23,22 @@ cd ../frontend && npm install
 ```
 
 `alphalab` is a normal dependency with no source copied into this repository.
-Verify it:
+AlphaLab is **not on PyPI**, so `backend/pyproject.toml` names the v4.1.0
+release wheel by direct reference with the SHA-256 from that release's
+`SHA256SUMS-4.1.0`; the `pip install -e` above downloads it from GitHub and
+refuses it if a byte differs. Do not install it as a bare `alphalab==4.1.0`:
+against a public index that installs whoever registers the name.
+
+Verify what you got — the version, that it loads from this venv rather than a
+checkout, and the release's own consumer contract:
 
 ```bash
-cd backend && ./.venv/bin/python -c "import alphalab; print(alphalab.__version__)"
-# 3.5.0
+scripts/verify-alphalab.sh "$PWD/backend/.venv/bin/python"
 ```
 
-If this prints a different version, another `alphalab` is shadowing it — check
-`pip show alphalab` for its location.
+Run from the repository root. Its last line must be
+`==> AlphaLab 4.1.0 verified`, just after the contract's
+`consumer contract: 9 checks passed`.
 
 ## Configure
 

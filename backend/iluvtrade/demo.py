@@ -190,7 +190,12 @@ def run_demo() -> int:
             creator.post(
                 "/api/v1/datasets/upload",
                 files={"file": ("nse.csv", payload, "text/csv")},
-                data={"dataset_name": "NSE daily bars"},
+                data={
+                    "dataset_name": "NSE daily bars",
+                    # One bare date per bar: the NSE session of that date, IST.
+                    "timestamp_convention": "session_date",
+                    "timezone": "Asia/Kolkata",
+                },
                 headers=headers,
             ),
             201,
@@ -208,6 +213,13 @@ def run_demo() -> int:
         )
         print(f"     quality score    : {quality['score']}")
         print(f"     status           : {version['status']}  (nothing may use it yet)")
+        temporal = version["temporal"]
+        print(
+            f"     timestamps       : {temporal['convention']} in {temporal['timezone']}, "
+            f"{temporal['bar_interval']} bars ({temporal['bar_interval_source']}), "
+            f"read by {temporal['interpreted_by']}"
+        )
+        print(f"                        {temporal['rule']}")
 
         print("\n     every rejected row, with its reason:")
         for row in version["rejected_rows"]["logged"][:8]:
@@ -381,9 +393,22 @@ def run_demo() -> int:
             f"       strategy version  {repro['strategy_version_id'][:8]}  "
             f"hash {(repro['strategy_content_hash'] or '')[:16]}…"
         )
-        print(f"       seed              {repro['seed']}")
+        print(
+            f"       seed              {repro['seed']}"
+            "  (stored with the job; reused by every attempt)"
+        )
+        integrity = result.get("result_integrity") or {}
+        print(f"       result document   verified as this run's: {integrity.get('verified')}")
         print(f"       engine            {repro['engine']}")
         print(f"       universe          {repro['universe']}")
+        configuration = repro["configuration"]
+        print(f"       fill timing       {configuration.get('fill_timing')}  (as requested)")
+        applied = result["result"].get("execution_assumptions") or {}
+        print(
+            f"       engine applied    {applied.get('fill_timing')}  (read from AlphaLab's record)"
+        )
+        for sentence in applied.get("optimistic", []):
+            print(f"       optimistic        {sentence}")
 
         document = result["result"]
         refusals = document.get("risk_refusals", {})
@@ -562,7 +587,12 @@ def run_demo() -> int:
             buyer.post(
                 "/api/v1/datasets/upload",
                 files={"file": ("nse.csv", payload, "text/csv")},
-                data={"dataset_name": "My NSE bars"},
+                data={
+                    "dataset_name": "My NSE bars",
+                    # One bare date per bar: the NSE session of that date, IST.
+                    "timestamp_convention": "session_date",
+                    "timezone": "Asia/Kolkata",
+                },
                 headers=headers,
             ),
             201,

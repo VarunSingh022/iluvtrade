@@ -13,13 +13,20 @@ import os
 import random
 import tempfile
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tests.support import (
+    POSTGRES_ENV,
+    POSTGRES_PREFIX,
     RealDatabaseAccess,
+    create_postgres_database,
+    drop_postgres_database,
     live_application_threads,
+    postgres_server_url,
+    postgres_url_for,
     real_database_path,
 )
 
@@ -29,6 +36,147 @@ os.environ.setdefault("ILUVTRADE_ENVIRONMENT", "test")
 
 #: Set by the ``allows_real_database`` fixture, and by nothing else.
 _REAL_DATABASE_ALLOWED = False
+
+
+# ---------------------------------------------------------------------------
+# Which database backend this run tests
+# ---------------------------------------------------------------------------
+#
+# SQLite unless ILUVTRADE_TEST_DATABASE_URL names a PostgreSQL server (see
+# tests/support.py). Tests marked ``postgres`` need PostgreSQL and are refused --
+# not skipped, not run on SQLite -- when it was not supplied; tests marked
+# ``sqlite_only`` are about SQLite itself and are deselected on PostgreSQL. Both
+# deselections are printed, so neither can pass unnoticed.
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", "postgres: needs a PostgreSQL server (ILUVTRADE_TEST_DATABASE_URL)"
+    )
+    config.addinivalue_line("markers", "sqlite_only: about SQLite itself; not run on PostgreSQL")
+    server = postgres_server_url()
+    if server is not None and not server.startswith("postgresql"):
+        raise pytest.UsageError(
+            f"{POSTGRES_ENV} must name a PostgreSQL server (postgresql+psycopg://...); "
+            f"got {server.split('://', 1)[0]}://... . There is no fallback to another backend."
+        )
+
+
+def pytest_report_header(config: pytest.Config) -> str:
+    server = postgres_server_url()
+    if server is None:
+        return "database backend: sqlite (a temporary file per test)"
+    from sqlalchemy.engine import make_url
+
+    url = make_url(server)
+    return (
+        f"database backend: postgresql at {url.host}:{url.port or 5432} "
+        "(a database per test, cloned from a template built by alembic upgrade head)"
+    )
+
+
+def _postgres_tests_requested(config: pytest.Config) -> bool:
+    markexpr = getattr(config.option, "markexpr", "") or ""
+    explicit_mark = "postgres" in markexpr and "not postgres" not in markexpr
+    explicit_path = any("tests/postgres" in str(arg).replace("\\", "/") for arg in config.args)
+    return explicit_mark or explicit_path
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    on_postgres = postgres_server_url() is not None
+    if not on_postgres and _postgres_tests_requested(config):
+        raise pytest.UsageError(
+            f"PostgreSQL tests were requested but {POSTGRES_ENV} is not set. They are "
+            "refused rather than run against SQLite, which is what they exist to rule out."
+        )
+    unwanted = "sqlite_only" if on_postgres else "postgres"
+    deselected = [item for item in items if item.get_closest_marker(unwanted)]
+    if deselected:
+        items[:] = [item for item in items if not item.get_closest_marker(unwanted)]
+        config.hook.pytest_deselected(items=deselected)
+        config.stash[_DESELECTED] = (unwanted, [item.nodeid for item in deselected])
+
+
+_DESELECTED = pytest.StashKey[tuple[str, list[str]]]()
+
+
+def pytest_terminal_summary(terminalreporter: Any, config: pytest.Config) -> None:
+    # Printed even under -q, which hides the report header: every log says
+    # which backend the result it shows was produced on.
+    terminalreporter.write_line(pytest_report_header(config))
+    marker, nodeids = config.stash.get(_DESELECTED, ("", []))
+    if not nodeids:
+        return
+    backend = "PostgreSQL" if marker == "sqlite_only" else "SQLite"
+    terminalreporter.write_line(
+        f"{len(nodeids)} test(s) marked {marker} were not run on {backend}"
+        + (f" (set {POSTGRES_ENV} to run them):" if marker == "postgres" else ":")
+    )
+    for nodeid in nodeids:
+        terminalreporter.write_line(f"  {nodeid}")
+
+
+@pytest.fixture(scope="session")
+def _postgres_template() -> Iterator[str | None]:
+    """On PostgreSQL, a database migrated to head, which every test's is cloned from.
+
+    Built by Alembic -- not ``create_all`` -- so the PostgreSQL run tests the
+    schema the migrations produce. ``None`` on SQLite.
+    """
+
+    if postgres_server_url() is None:
+        yield None
+        return
+
+    import uuid
+
+    from alembic import command
+    from alembic.config import Config
+
+    from iluvtrade.config import get_settings
+
+    name = f"{POSTGRES_PREFIX}template_{uuid.uuid4().hex[:10]}"
+    create_postgres_database(name)
+    previous = os.environ.get("ILUVTRADE_DATABASE_URL")
+    os.environ["ILUVTRADE_DATABASE_URL"] = postgres_url_for(name)
+    get_settings.cache_clear()
+    try:
+        backend = Path(__file__).resolve().parents[1]
+        alembic_config = Config(str(backend / "alembic.ini"))
+        alembic_config.set_main_option("script_location", str(backend / "migrations"))
+        command.upgrade(alembic_config, "head")
+    finally:
+        if previous is None:
+            os.environ.pop("ILUVTRADE_DATABASE_URL", None)
+        else:
+            os.environ["ILUVTRADE_DATABASE_URL"] = previous
+        get_settings.cache_clear()
+    try:
+        yield name
+    finally:
+        drop_postgres_database(name)
+
+
+def _assert_backend(expected_database: str) -> None:
+    """Prove the application's engine reaches the PostgreSQL database this test owns."""
+
+    from sqlalchemy import text
+
+    from iluvtrade.db.session import get_engine
+
+    engine = get_engine()
+    if engine.dialect.name != "postgresql":
+        raise AssertionError(
+            f"A PostgreSQL test run resolved a {engine.dialect.name} engine. Nothing on "
+            "this run may fall back to another backend."
+        )
+    with engine.connect() as connection:
+        database = connection.execute(text("SELECT current_database()")).scalar_one()
+        version = connection.execute(text("SHOW server_version")).scalar_one()
+    if database != expected_database or not str(version)[:2].isdigit():
+        raise AssertionError(
+            f"Connected to {database!r} (server {version}), not {expected_database!r}."
+        )
 
 
 @pytest.fixture
@@ -136,7 +284,9 @@ def _the_real_database_is_byte_for_byte_unchanged() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def _isolated_storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+def _isolated_storage(
+    monkeypatch: pytest.MonkeyPatch, _postgres_template: str | None
+) -> Iterator[str]:
     """Point the database and blob storage at a fresh temporary directory.
 
     Rate limiting is **off** by default here. Otherwise a test that registers
@@ -151,12 +301,22 @@ def _isolated_storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     from iluvtrade.platform.ratelimit import reset_limiter
 
     workspace = tempfile.mkdtemp(prefix="iluvtrade-test-")
-    monkeypatch.setenv("ILUVTRADE_DATABASE_URL", f"sqlite:///{workspace}/test.db")
+    database: str | None = None
+    if _postgres_template is not None:
+        import uuid
+
+        database = f"{POSTGRES_PREFIX}{uuid.uuid4().hex[:16]}"
+        create_postgres_database(database, template=_postgres_template)
+        monkeypatch.setenv("ILUVTRADE_DATABASE_URL", postgres_url_for(database))
+    else:
+        monkeypatch.setenv("ILUVTRADE_DATABASE_URL", f"sqlite:///{workspace}/test.db")
     monkeypatch.setenv("ILUVTRADE_STORAGE_ROOT", f"{workspace}/storage")
     monkeypatch.setenv("ILUVTRADE_RATE_LIMIT_ENABLED", "false")
     get_settings.cache_clear()
     reset_engine()
     reset_limiter()
+    if database is not None:
+        _assert_backend(database)
     yield workspace
 
     # Every application-owned background thread is stopped and joined *before*
@@ -168,6 +328,8 @@ def _isolated_storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     get_settings.cache_clear()
     reset_engine()
     reset_limiter()
+    if database is not None:
+        drop_postgres_database(database)
 
     assert not leaked, (
         f"These application threads outlived their test: {leaked}. A daemon "

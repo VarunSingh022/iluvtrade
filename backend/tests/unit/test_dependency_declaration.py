@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 import sys
 import tomllib
 
@@ -140,3 +141,85 @@ def test_email_validation_actually_works() -> None:
             password="correct-horse-battery-staple",
             display_name="Someone",
         )
+
+
+#: The one acceptable shape for the engine requirement: AlphaLab's own GitHub
+#: release asset, by direct reference, with its SHA-256. AlphaLab is not on
+#: PyPI, so a bare ``alphalab==X`` resolves against a public index and installs
+#: whoever registers the name (AlphaLab ``docs/INTEGRATION.md``).
+_ALPHALAB_REQUIREMENT = re.compile(
+    r"^alphalab @ (?P<url>https://github\.com/VarunSingh022/AlphaLab/releases/download/"
+    r"v(?P<version>\d+\.\d+\.\d+)/alphalab-(?P=version)-py3-none-any\.whl)"
+    r"#sha256=(?P<sha256>[0-9a-f]{64})$"
+)
+
+
+def _alphalab_requirements() -> list[str]:
+    project = tomllib.loads(PYPROJECT.read_text())["project"]
+    requirements = list(project["dependencies"])
+    for extra in project.get("optional-dependencies", {}).values():
+        requirements += list(extra)
+    return [r for r in requirements if r.split("[")[0].split(" ")[0].split("=")[0] == "alphalab"]
+
+
+def test_alphalab_is_pinned_to_its_release_artifact_by_hash() -> None:
+    requirements = _alphalab_requirements()
+    assert len(requirements) == 1, f"Exactly one AlphaLab requirement expected: {requirements}"
+    assert _ALPHALAB_REQUIREMENT.match(requirements[0]), (
+        f"{requirements[0]!r} is not a hash-pinned direct reference to an AlphaLab "
+        "release wheel. Write it from the release's SHA256SUMS file."
+    )
+
+
+def test_the_installed_alphalab_is_the_declared_artifact() -> None:
+    """Not merely "a version 4.1.0 imports": the declared wheel, at its hash.
+
+    pip records where an installed distribution came from in
+    ``direct_url.json``. Comparing it with the declaration catches an engine
+    installed from a local wheel, an editable checkout or an index — any of
+    which can report the right version while being different code.
+    """
+
+    import importlib.metadata
+    import json
+
+    import alphalab
+
+    declared = _ALPHALAB_REQUIREMENT.match(_alphalab_requirements()[0])
+    assert declared is not None
+    distribution = importlib.metadata.distribution("alphalab")
+    origin = json.loads(distribution.read_text("direct_url.json") or "{}")
+
+    assert distribution.version == declared["version"]
+    assert alphalab.__version__ == declared["version"]
+    assert origin.get("url") == declared["url"], origin
+    assert origin.get("archive_info", {}).get("hashes", {}).get("sha256") == declared["sha256"]
+    assert "editable" not in origin.get("dir_info", {}), origin
+
+    # Inside *this interpreter's* site-packages — not merely a path containing
+    # "site-packages", and not a checkout that happens to be on sys.path.
+    import sysconfig
+
+    location = pathlib.Path(alphalab.__file__).resolve()
+    site_packages = pathlib.Path(sysconfig.get_paths()["purelib"]).resolve()
+    assert location == site_packages / "alphalab" / "__init__.py", (
+        f"alphalab imports from {location}, not from this environment's {site_packages}."
+    )
+
+
+def test_the_release_verification_script_names_the_pinned_release() -> None:
+    """``scripts/verify-alphalab.sh`` checks the version the pin installs.
+
+    It carries the release's version and its sdist digest (for the consumer
+    contract), so an upgrade that moves the pin and forgets the script would
+    verify an engine the application no longer installs. Read from both files.
+    """
+
+    script = (PYPROJECT.parent.parent / "scripts" / "verify-alphalab.sh").read_text()
+    declared = _ALPHALAB_REQUIREMENT.match(_alphalab_requirements()[0])
+    assert declared is not None
+
+    version = re.search(r'^VERSION="([^"]+)"$', script, re.MULTILINE)
+    sdist = re.search(r'^SDIST_SHA256="([0-9a-f]{64})"$', script, re.MULTILINE)
+    assert version is not None and version[1] == declared["version"]
+    assert sdist is not None, "the sdist the contract comes from must be hash-pinned"

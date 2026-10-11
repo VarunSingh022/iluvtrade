@@ -1,8 +1,10 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 
+import { TemporalEvidencePanel } from "../components/TemporalEvidence";
 import { Badge, Banner, Card, ErrorBanner, Loading, ModeBadge, Stat, StatusBadge, Tabs } from "../components/ui";
 import { ApiError, api } from "../lib/api";
+import { describeFillTiming } from "../lib/assumptions";
 import type { SessionEvent, SessionFill, SessionOrder, SessionPosition, TradingSession } from "../lib/api";
 import { epochDateTime, money, relative, shortId, signOf, titleCase, when } from "../lib/format";
 import { useAsync, usePolling } from "../lib/useAsync";
@@ -81,7 +83,9 @@ export default function SessionDetailPage() {
             <span className="mono">{shortId(data.strategy_version_id)}</span>
             {data.entitlement_id && <> · run under entitlement <span className="mono">{shortId(data.entitlement_id)}</span></>}
             {" · "}seed <span className="mono">{data.seed}</span>
+            {" · "}fills: <span title={describeFillTiming(data.fill_timing).meaning}>{describeFillTiming(data.fill_timing).label}</span>
           </p>
+          {data.temporal_evidence && <TemporalEvidencePanel evidence={data.temporal_evidence} />}
         </div>
         <div className="row">
           <Link className="btn" to="/sessions">All sessions</Link>

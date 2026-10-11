@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from tests.conftest import make_csv, register
+from tests.support import DECLARED
 
 pytestmark = pytest.mark.integration
 
@@ -13,7 +14,7 @@ def _approved_dataset(client, headers, *, symbols=("ACME",), bars=140) -> str:
     created = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(symbols=symbols, bars=bars), "text/csv")},
-        data={"dataset_name": "Test data"},
+        data={**DECLARED, "dataset_name": "Test data"},
         headers=headers,
     )
     assert created.status_code == 201, created.text
@@ -113,6 +114,7 @@ def test_a_dataset_cannot_be_used_before_approval(client, headers) -> None:
     created = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
     strategy_version_id = _published_strategy(client, headers)
@@ -134,6 +136,7 @@ def test_the_quality_report_names_every_defect(client, headers) -> None:
     created = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(flaws=True), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
 

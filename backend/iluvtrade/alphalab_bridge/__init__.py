@@ -13,6 +13,7 @@ authority on who is asking, what they are permitted to run, and what happened.
 The bridge translates between the two vocabularies and does nothing else:
 
 =============================  ==========================================
+:mod:`.temporal`               a declared timestamp convention → AlphaLab instants
 :mod:`.market`                 canonical dataset rows → ``MarketDataset``
 :mod:`.runconfig`              application settings → ``RunConfig``
 :mod:`.engine`                 drive ``BacktestEngine`` / ``TradingSession``

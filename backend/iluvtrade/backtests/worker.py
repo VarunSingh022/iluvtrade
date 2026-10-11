@@ -29,9 +29,9 @@ from typing import Any
 from iluvtrade.backtests import service
 from iluvtrade.backtests.requests import BacktestRequest
 from iluvtrade.backtests.runner import execute
-from iluvtrade.common import storage
 from iluvtrade.common.observability import correlated, set_context
 from iluvtrade.config import get_settings
+from iluvtrade.data import ingest
 from iluvtrade.db.base import utcnow
 from iluvtrade.db.models.backtest import BacktestJob, JobStatus
 from iluvtrade.db.models.data import DatasetVersion
@@ -46,7 +46,7 @@ __all__ = ["BacktestWorkerPool", "process_one", "requeue_orphans", "stop_all_poo
 def _load_rows(version: DatasetVersion) -> list[dict[str, Any]]:
     if not version.canonical_path:
         raise ValueError("The dataset version has no canonical data.")
-    return list(storage.read_jsonl(version.canonical_path))
+    return ingest.canonical_rows(version)
 
 
 def process_one() -> bool:
@@ -92,12 +92,18 @@ def _execute_claimed(job_id: str) -> bool:
                     "The strategy version's content hash no longer matches the one recorded "
                     "at publication; refusing to run it."
                 )
+            # Re-checked here, not only at submission: a job queued before an
+            # upgrade may reference a version that is no longer runnable.
+            ingest.require_runnable(version)
             rows = _load_rows(version)
             dataset_hash = version.canonical_hash
             strategy_hash = strategy_version.content_hash
             implementation_key = strategy_version.implementation_key
             version_defaults = json.loads(strategy_version.default_parameters_json or "{}")
-            frequency = version.inferred_frequency
+            frequency = ingest.bar_interval_of(version)
+            # Snapshotted from the exact version this run reads, now, so the
+            # run's evidence cannot drift with later imports or approvals.
+            temporal_evidence = ingest.temporal_evidence(version)
             account_name = f"{job.organization_id[:8]} backtest"
             cancelled = job.cancel_requested_at is not None
 
@@ -143,6 +149,7 @@ def _execute_claimed(job_id: str) -> bool:
                 dataset_canonical_hash=dataset_hash,
                 strategy_content_hash=strategy_hash,
                 starting_cash=request.starting_cash,
+                temporal_evidence=temporal_evidence,
             )
     except Exception as exc:
         logger.exception("Backtest job %s failed", job_id)

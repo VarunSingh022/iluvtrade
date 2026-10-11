@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from decimal import Decimal
 from typing import Any
@@ -10,11 +11,12 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DbSession
 
+from iluvtrade.alphalab_bridge import runconfig
 from iluvtrade.backtests.requests import BacktestRequest
 from iluvtrade.common import storage
 from iluvtrade.common.observability import correlation_id
 from iluvtrade.data import canonical, ingest
-from iluvtrade.db.base import utcnow
+from iluvtrade.db.base import new_id, utcnow
 from iluvtrade.db.models.backtest import BacktestJob, BacktestRun, JobStatus
 from iluvtrade.db.models.platform import Role
 from iluvtrade.db.models.strategy import StrategyVersion
@@ -72,13 +74,20 @@ def submit(
         ) from exc
     if Decimal(request.starting_cash) <= 0:
         raise BacktestSubmissionError("starting_cash must be positive.")
+    try:
+        runconfig.trading_day_zone(request.exchange)
+        runconfig.fill_timing_for(request.fill_timing)
+    except (runconfig.UnsupportedExchangeError, runconfig.UnsupportedFillTimingError) as exc:
+        raise BacktestSubmissionError(str(exc)) from exc
 
     job = BacktestJob(
         organization_id=principal.organization_id,
         submitted_by_user_id=principal.user_id,
         idempotency_key=key,
         status=JobStatus.QUEUED,
-        request_json=request.to_json(),
+        # Stored with the effective seed resolved: the idempotency key above is
+        # the request as asked, and every attempt reads this seed back.
+        request_json=request.resolved().to_json(),
         dataset_version_id=dataset_version.id,
         strategy_version_id=strategy_version.id,
         correlation_id=correlation_id(),
@@ -167,7 +176,7 @@ def result_document(session: DbSession, principal: Principal, job_id: str) -> di
     run = get_run(session, principal, job_id)
     if run is None or not run.artifact_path:
         raise BacktestSubmissionError("This job has no stored result.")
-    document = storage.read_json(run.artifact_path)
+    document, integrity = _verified_document(run)
     return {
         "run_id": run.id,
         "reproducibility": {
@@ -180,10 +189,57 @@ def result_document(session: DbSession, principal: Principal, job_id: str) -> di
             "parameters": json.loads(run.parameters_json),
             "universe": json.loads(run.universe_json),
             "configuration": json.loads(run.configuration_json),
+            # What the dataset's bar interval rested on when this run executed,
+            # from the run's own snapshot; "not_recorded" for older runs.
+            "temporal_evidence": ingest.evidence_snapshot(run.temporal_evidence_json),
+            # AlphaLab's own result_id / configuration_id. Absent from runs
+            # stored before the engine produced them, rather than invented.
+            "engine_identity": (document or {}).get("engine_identity"),
         },
         "metrics": json.loads(run.metrics_json),
+        # ``None`` unless the stored document is proven to be this run's; the
+        # headline metrics above come from the run's own row either way.
         "result": document,
+        "result_integrity": integrity,
     }
+
+
+def _verified_document(run: BacktestRun) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """The stored result document, only if it is provably this run's.
+
+    Three checks: the artifact sits at this run's own key, its bytes hash to the
+    digest recorded when it was written, and the document names this run. A run
+    stored before 0007 fails the first two -- its key was
+    ``backtests/None/result.json``, shared by every run in its organization, so
+    its document may be another run's -- and is answered with its headline
+    metrics and the reason, never with a document that merely exists.
+    """
+
+    expected_key = canonical.artifact_key(run.organization_id, run.id)
+    if run.artifact_path != expected_key or run.artifact_sha256 is None:
+        return None, {
+            "verified": False,
+            "reason": (
+                "Stored before results were keyed by run: this run's detailed result was "
+                "written to a location every run in its organization shared, so it may hold "
+                "another run's fills and report. Only the headline metrics, recorded on the "
+                "run itself, are shown."
+            ),
+        }
+    try:
+        payload = storage.read_bytes(run.artifact_path)
+    except storage.StorageError:
+        return None, {"verified": False, "reason": "The detailed result is missing from storage."}
+    if hashlib.sha256(payload).hexdigest() != run.artifact_sha256:
+        return None, {
+            "verified": False,
+            "reason": "The detailed result's bytes do not match the digest recorded when it was "
+            "written; it is not shown.",
+        }
+    document = json.loads(payload.decode("utf-8"))
+    if document.get("run_id") != run.id:
+        return None, {"verified": False, "reason": "The detailed result names a different run."}
+    return document, {"verified": True, "artifact_sha256": run.artifact_sha256}
 
 
 def record_success(
@@ -194,14 +250,31 @@ def record_success(
     dataset_canonical_hash: str | None,
     strategy_content_hash: str | None,
     starting_cash: str,
+    temporal_evidence: dict[str, Any],
 ) -> BacktestRun:
-    """Persist a finished run. Called by the worker, inside its own transaction."""
+    """Persist a finished run. Called by the worker, inside its own transaction.
+
+    ``temporal_evidence`` is ``ingest.temporal_evidence`` of the exact dataset
+    version the run read; it must name that version and its canonical hash.
+    """
+
+    if (
+        temporal_evidence.get("dataset_version_id") != job.dataset_version_id
+        or temporal_evidence.get("dataset_canonical_hash") != dataset_canonical_hash
+    ):
+        raise ValueError("The temporal evidence does not describe the dataset this run read.")
 
     request = BacktestRequest.from_json(job.request_json)
     headline = executed.headline
     valuation = executed.document["valuation"]
 
     run = BacktestRun(
+        # Assigned here, not left to the column default: the default only runs
+        # at flush, so the artifact key below was built from ``None`` and every
+        # backtest in an organization wrote ``backtests/None/result.json`` --
+        # each run overwrote the last, and an older run's page showed the
+        # newest run's fills and report beside its own configuration.
+        id=new_id(),
         organization_id=job.organization_id,
         job_id=job.id,
         dataset_version_id=job.dataset_version_id,
@@ -213,6 +286,7 @@ def record_success(
         ),
         universe_json=json.dumps(executed.document["run_configuration"]["universe"]),
         configuration_json=json.dumps(executed.document["run_configuration"], default=str),
+        temporal_evidence_json=json.dumps(temporal_evidence, sort_keys=True),
         seed=executed.seed,
         engine_name="alphalab",
         engine_version=executed.engine_version,
@@ -232,7 +306,18 @@ def record_success(
         metrics_json=json.dumps(headline, default=str),
     )
     key = canonical.artifact_key(job.organization_id, run.id)
-    storage.write_json(key, executed.document)
+    # The document says whose it is; the row records its digest. Retrieval
+    # checks both before serving it as this run's (``result_document``).
+    document = {
+        **executed.document,
+        "run_id": run.id,
+        "job_id": job.id,
+        "organization_id": job.organization_id,
+        # Inside the digested document too, so the stored result carries the
+        # limitation even when read on its own.
+        "temporal_evidence": temporal_evidence,
+    }
+    run.artifact_sha256 = storage.write_json(key, document)
     run.artifact_path = key
     session.add(run)
 

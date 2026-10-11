@@ -24,7 +24,7 @@ import threading
 
 import pytest
 
-from tests.support import RealDatabaseAccess, live_application_threads, real_database_path
+from tests.support import DECLARED, RealDatabaseAccess, live_application_threads, real_database_path
 
 # --- prevention -------------------------------------------------------------
 
@@ -86,11 +86,16 @@ def test_settings_inside_a_test_never_resolve_to_the_real_database() -> None:
     """Belt and braces: the URL a test would get is a temporary one."""
 
     from iluvtrade.config import get_settings
+    from tests.support import POSTGRES_PREFIX, postgres_server_url
 
     url = get_settings().database_url
-    assert url.startswith("sqlite:///")
     assert str(real_database_path()) not in url
-    assert "iluvtrade-test-" in url or "/tmp" in url or "/var/folders/" in url
+    if postgres_server_url() is not None:
+        # On a PostgreSQL run: this test's own database, never a shared one.
+        assert url.startswith("postgresql") and f"/{POSTGRES_PREFIX}" in url
+    else:
+        assert url.startswith("sqlite:///")
+        assert "iluvtrade-test-" in url or "/tmp" in url or "/var/folders/" in url
 
 
 # --- containment ------------------------------------------------------------
@@ -127,6 +132,7 @@ def test_a_session_runner_is_joined_rather_than_abandoned(client, headers) -> No
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=30), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
     client.post(f"/api/v1/datasets/versions/{version['id']}/approve", headers=headers)

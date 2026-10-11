@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from tests.conftest import make_csv, register
+from tests.support import DECLARED
 
 pytestmark = pytest.mark.security
 
@@ -31,7 +32,7 @@ def two_tenants(app):
         dataset = a.post(
             "/api/v1/datasets/upload",
             files={"file": ("a.csv", make_csv(bars=60), "text/csv")},
-            data={"dataset_name": "A data"},
+            data={**DECLARED, "dataset_name": "A data"},
             headers=headers,
         ).json()
         a.post(f"/api/v1/datasets/versions/{dataset['id']}/approve", headers=headers)

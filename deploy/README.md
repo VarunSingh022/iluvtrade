@@ -1,23 +1,18 @@
 # deploy/
 
-Deployment artifacts. Two things live here.
+Deployment artifacts.
 
 **`entrypoint.sh`** — the container entrypoint. It validates configuration,
 runs `alembic upgrade head`, then starts the API. Migrations run here and
 nowhere else; the application refuses to create tables in production.
 
-**`wheels/`** — where the AlphaLab wheel must be placed before building the
-image. It is git-ignored, and the directory is empty in a fresh checkout.
-
-```bash
-mkdir -p deploy/wheels
-cp /path/to/AlphaLab/dist/alphalab-3.5.0-py3-none-any.whl deploy/wheels/
-```
-
-AlphaLab is not published to PyPI. `pip install alphalab==3.5.0` fails with
-"No matching distribution found", so the wheel has to come from the engine's
-own build. The Dockerfile checks for it by exact filename and stops with that
-message rather than installing whatever else is in the directory.
+**The AlphaLab engine is not placed here.** It used to be: a wheel had to be
+copied into `deploy/wheels/` before the image could be built. Since the
+v4.1.0 integration, `backend/pyproject.toml` depends on the published release
+wheel by direct reference with its SHA-256, so the image build's
+`pip install "./backend[postgres]"` downloads exactly that artifact from the
+AlphaLab GitHub release and pip refuses it if its digest differs. The build
+needs network access to github.com, and nothing else.
 
 ## Status
 

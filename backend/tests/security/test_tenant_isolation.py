@@ -13,6 +13,7 @@ from iluvtrade.db.base import OrgScopedMixin
 from iluvtrade.db.models import Base
 from iluvtrade.platform.tenancy import NotFoundError, TenancyError, scoped
 from tests.conftest import make_csv, register
+from tests.support import DECLARED, session_date_ist
 
 pytestmark = pytest.mark.security
 
@@ -74,7 +75,7 @@ def test_a_user_cannot_read_another_users_dataset(app, headers) -> None:
         created = alice.post(
             "/api/v1/datasets/upload",
             files={"file": ("a.csv", make_csv(), "text/csv")},
-            data={"dataset_name": "Alice data"},
+            data={**DECLARED, "dataset_name": "Alice data"},
             headers=headers,
         )
         assert created.status_code == 201, created.text
@@ -108,6 +109,7 @@ def test_a_user_cannot_read_another_users_backtest(app, headers) -> None:
         version = alice.post(
             "/api/v1/datasets/upload",
             files={"file": ("a.csv", make_csv(), "text/csv")},
+            data=DECLARED,
             headers=headers,
         ).json()
         alice.post(f"/api/v1/datasets/versions/{version['id']}/approve", headers=headers)
@@ -141,7 +143,12 @@ def test_require_owned_refuses_another_tenants_row(db) -> None:
     alice = make_principal(db, "alice@example.com")
     bob = make_principal(db, "bob@example.com")
     outcome = ingest.ingest_upload(
-        db, alice, filename="a.csv", payload=make_csv(), dataset_name="A"
+        db,
+        alice,
+        filename="a.csv",
+        payload=make_csv(),
+        dataset_name="A",
+        temporal=session_date_ist(),
     )
 
     assert (

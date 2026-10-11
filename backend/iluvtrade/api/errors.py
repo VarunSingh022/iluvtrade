@@ -38,6 +38,10 @@ from iluvtrade.trading.sessions import SessionError
 
 logger = logging.getLogger("iluvtrade.api")
 
+#: PostgreSQL contention outcomes that rolled the transaction back and are safe
+#: to retry: lock_not_available, deadlock_detected, serialization_failure.
+_RETRYABLE_SQLSTATES = frozenset({"55P03", "40P01", "40001"})
+
 #: Status code → the ``error.code`` a client sees for framework-raised errors.
 _HTTP_CODES: dict[int, str] = {
     400: "BadRequest",
@@ -155,7 +159,21 @@ def install(app: FastAPI) -> None:
         """
 
         text = str(exc.orig if exc.orig is not None else exc).lower()
-        if "database is locked" not in text and "database table is locked" not in text:
+        # SQLite by its result code (SQLITE_BUSY = 5, SQLITE_LOCKED = 6; the low
+        # byte of an extended code), with the message only as a fallback for a
+        # driver that does not expose one.
+        code = getattr(exc.orig, "sqlite_errorcode", None)
+        sqlite_busy = (
+            (code & 0xFF) in (5, 6)
+            if isinstance(code, int)
+            else ("database is locked" in text or "database table is locked" in text)
+        )
+        # PostgreSQL's equivalents, by SQLSTATE rather than message text: a lock
+        # wait that exceeded ``lock_timeout`` (see ``db/session.py``), a deadlock
+        # the server broke, and a serialization failure. Each rolled back and
+        # each is safe to retry.
+        postgres_busy = getattr(exc.orig, "sqlstate", None) in _RETRYABLE_SQLSTATES
+        if not (sqlite_busy or postgres_busy):
             raise exc
 
         logger.warning("Database contention: %s", text)

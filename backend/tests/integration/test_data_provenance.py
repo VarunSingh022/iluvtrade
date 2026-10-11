@@ -12,6 +12,7 @@ import json
 import pytest
 
 from tests.conftest import make_csv, register
+from tests.support import DECLARED
 
 pytestmark = pytest.mark.integration
 
@@ -28,6 +29,7 @@ def test_the_bytes_as_uploaded_are_kept_and_hashed(client, headers) -> None:
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("original.csv", payload, "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
 
@@ -51,6 +53,7 @@ def test_the_canonical_file_is_hashed_and_the_run_records_that_hash(client, head
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=60), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
     client.post(f"/api/v1/datasets/versions/{version['id']}/approve", headers=headers)
@@ -83,6 +86,7 @@ def test_every_rejected_row_is_traceable_to_its_line(client, headers) -> None:
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=60, flaws=True), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
 
@@ -98,14 +102,21 @@ def test_every_rejected_row_is_traceable_to_its_line(client, headers) -> None:
 
 def test_every_transformation_is_recorded_with_before_and_after(client, headers) -> None:
     register(client, "a@example.com")
+    # No volume column, so every bar records the volume it was given. (This
+    # used to lean on VWAP being derived for every bar; VWAP is no longer
+    # invented, so the file has to need a transformation for real.)
+    without_volume = "\n".join(
+        line.rsplit(",", 1)[0] for line in make_csv(bars=40).decode().splitlines()
+    ).encode()
     version = client.post(
         "/api/v1/datasets/upload",
-        files={"file": ("d.csv", make_csv(bars=40), "text/csv")},
+        files={"file": ("d.csv", without_volume, "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
 
     transformations = version["transformations"]
-    assert transformations["counts"], "deriving VWAP alone guarantees entries"
+    assert transformations["counts"].get("defaulted_volume") == 40
     for entry in transformations["logged"]:
         assert entry["kind"]
         assert entry["column"]
@@ -119,6 +130,7 @@ def test_the_counts_and_the_logged_entries_agree(client, headers) -> None:
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=60, flaws=True), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
 
@@ -135,7 +147,7 @@ def test_the_cleaning_policy_that_ran_is_stored_with_the_version(client, headers
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=30), "text/csv")},
-        data={"policy_json": json.dumps({"duplicate_policy": "keep_last"})},
+        data={**DECLARED, "policy_json": json.dumps({"duplicate_policy": "keep_last"})},
         headers=headers,
     ).json()
     assert version["cleaning_policy"]["duplicate_policy"] == "keep_last"
@@ -146,6 +158,7 @@ def test_the_detected_schema_is_stored_with_the_version(client, headers) -> None
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=30), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
 
@@ -162,7 +175,7 @@ def test_an_approved_version_cannot_have_its_canonical_data_replaced(client, hea
     first = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=40, seed=1), "text/csv")},
-        data={"dataset_name": "Same name"},
+        data={**DECLARED, "dataset_name": "Same name"},
         headers=headers,
     ).json()
     client.post(f"/api/v1/datasets/versions/{first['id']}/approve", headers=headers)
@@ -170,7 +183,7 @@ def test_an_approved_version_cannot_have_its_canonical_data_replaced(client, hea
     second = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=40, seed=2), "text/csv")},
-        data={"dataset_name": "Same name"},
+        data={**DECLARED, "dataset_name": "Same name"},
         headers=headers,
     ).json()
 
@@ -193,7 +206,7 @@ def test_two_identical_uploads_produce_identical_canonical_hashes(client, header
         version = client.post(
             "/api/v1/datasets/upload",
             files={"file": ("d.csv", payload, "text/csv")},
-            data={"dataset_name": f"Run {index}"},
+            data={**DECLARED, "dataset_name": f"Run {index}"},
             headers=headers,
         ).json()
         hashes.append(version["canonical_hash"])
@@ -209,6 +222,7 @@ def test_alphalab_remains_the_only_source_of_result_numbers(client, headers) -> 
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=80), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
     client.post(f"/api/v1/datasets/versions/{version['id']}/approve", headers=headers)
@@ -266,6 +280,7 @@ def test_a_result_reports_what_the_engine_declined(client, headers) -> None:
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=50), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
     client.post(f"/api/v1/datasets/versions/{version['id']}/approve", headers=headers)

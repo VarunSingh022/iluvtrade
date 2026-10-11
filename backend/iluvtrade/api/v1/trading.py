@@ -19,6 +19,7 @@ from iluvtrade.api.v1.schemas import (
     SessionPositionResponse,
     TradingSessionResponse,
 )
+from iluvtrade.data import ingest
 from iluvtrade.db.base import utcnow
 from iluvtrade.db.models.trading import (
     SessionEvent,
@@ -59,6 +60,12 @@ def _session(row: TradingSession) -> TradingSessionResponse:
         starting_cash=row.starting_cash,
         base_currency=row.base_currency,
         seed=row.seed,
+        fill_timing=row.fill_timing,
+        # A paper session's snapshot ("not_recorded" for one created before
+        # snapshots); a live session reads no dataset, so it has none.
+        temporal_evidence=(
+            ingest.evidence_snapshot(row.temporal_evidence_json) if row.dataset_version_id else None
+        ),
         records_processed=row.records_processed,
         cash=row.cash,
         equity=row.equity,
@@ -114,6 +121,7 @@ def create_session(
         base_currency=payload.base_currency,
         risk_profile=payload.risk_profile,
         seed=payload.seed,
+        fill_timing=payload.fill_timing,
         live_confirmed=payload.live_confirmed,
     )
     return _session(sessions.create(session, principal, spec))

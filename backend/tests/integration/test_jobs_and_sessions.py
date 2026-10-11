@@ -11,6 +11,7 @@ import pytest
 from iluvtrade.db.models.backtest import BacktestJob, JobStatus
 from iluvtrade.db.models.trading import SessionStatus
 from tests.conftest import make_csv, register
+from tests.support import DECLARED, session_date_ist
 
 pytestmark = pytest.mark.integration
 
@@ -19,6 +20,7 @@ def _ready(client, headers, *, bars: int = 60) -> tuple[str, str]:
     version = client.post(
         "/api/v1/datasets/upload",
         files={"file": ("d.csv", make_csv(bars=bars), "text/csv")},
+        data=DECLARED,
         headers=headers,
     ).json()
     client.post(f"/api/v1/datasets/versions/{version['id']}/approve", headers=headers)
@@ -176,7 +178,12 @@ def test_a_job_is_claimed_by_exactly_one_worker(db) -> None:
 
     principal = make_principal(db)
     outcome = ingest.ingest_upload(
-        db, principal, filename="d.csv", payload=make_csv(bars=30), dataset_name="D"
+        db,
+        principal,
+        filename="d.csv",
+        payload=make_csv(bars=30),
+        dataset_name="D",
+        temporal=session_date_ist(),
     )
     strategy = strategies.create_strategy(db, principal, name="S")
     version = strategies.publish(
@@ -216,7 +223,12 @@ def test_orphaned_jobs_are_requeued_within_the_attempt_budget(db) -> None:
 
     principal = make_principal(db)
     outcome = ingest.ingest_upload(
-        db, principal, filename="d.csv", payload=make_csv(bars=30), dataset_name="D"
+        db,
+        principal,
+        filename="d.csv",
+        payload=make_csv(bars=30),
+        dataset_name="D",
+        temporal=session_date_ist(),
     )
     strategy = strategies.create_strategy(db, principal, name="S")
     version = strategies.publish(
@@ -258,7 +270,12 @@ def test_an_orphan_past_its_attempt_budget_fails_rather_than_looping(db) -> None
 
     principal = make_principal(db)
     outcome = ingest.ingest_upload(
-        db, principal, filename="d.csv", payload=make_csv(bars=30), dataset_name="D"
+        db,
+        principal,
+        filename="d.csv",
+        payload=make_csv(bars=30),
+        dataset_name="D",
+        temporal=session_date_ist(),
     )
     strategy = strategies.create_strategy(db, principal, name="S")
     version = strategies.publish(

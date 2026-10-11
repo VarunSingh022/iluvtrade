@@ -32,27 +32,31 @@ from alphalab.backtesting import (
     RunConfig,
     id_scope,
 )
-from alphalab.market.record import MarketRecord
-from alphalab.market.source import MarketDataSource
-from alphalab.runtime.execution_pipeline import ExecutionPipelineResult
-from alphalab.runtime.run import ExecutionMode, RunEngine, RunState
-from alphalab.runtime.session import TradingSession
-from alphalab.strategy.context import (
+from alphalab.market import MarketDataSource, MarketRecord
+from alphalab.runtime import (
+    ExecutionMode,
+    ExecutionPipelineResult,
+    RunEngine,
+    RunState,
+    TradingSession,
+)
+from alphalab.strategy import (
     NoMarket,
     NoOrders,
     NoPortfolio,
     NoRiskView,
+    RuntimeState,
     StrategyContext,
+    StrategyProtocol,
+    create_runtime,
+    start_strategy,
 )
-from alphalab.strategy.protocol import StrategyProtocol
-from alphalab.strategy.runtime import create_runtime, register_strategy
-from alphalab.strategy.state import RuntimeState
-from alphalab.strategy.supervisor import RuntimeSupervisor
 
 __all__ = [
     "BacktestResult",
     "RunState",
     "advance",
+    "close_final_slice",
     "context_factory_for",
     "finalize",
     "initialize_session",
@@ -131,25 +135,28 @@ def runtime_for(
     subscriptions: frozenset[str] = frozenset({"bars"}),
     start_timestamp: float = 0.0,
 ) -> RuntimeState:
-    """Register strategies and walk each to ``RUNNING``.
+    """Register strategies and take each to ``RUNNING``.
 
-    AlphaLab's supervisor enforces the transition order and refuses out-of-order
-    calls, so this sequence is the contract rather than a convention. A strategy
+    Through :func:`alphalab.strategy.start_strategy` (AlphaLab 4.0), which runs
+    the supervisor's ``configure`` → ``initialize`` → ``subscribe`` → ``start``
+    in order. This module used to make those four calls itself; AlphaLab now
+    owns the sequence, refuses a second strategy under a running one's
+    identity, and draws the transitions' identifiers from a stream of their own
+    so where a runtime is set up cannot shift a seeded run's ids. A strategy
     that never reaches ``RUNNING`` is not dispatched to, and produces an empty
     result that looks exactly like a strategy that found no signals.
     """
 
     state = create_runtime()
     for strategy_id, instance in strategies.items():
-        state = register_strategy(state, strategy_id, instance)
-        strategy_state = state.strategies[strategy_id]
-        strategy_state, _ = RuntimeSupervisor.configure(strategy_state, {}, start_timestamp)
-        strategy_state, _ = RuntimeSupervisor.initialize(strategy_state, start_timestamp)
-        strategy_state, _ = RuntimeSupervisor.subscribe(
-            strategy_state, subscriptions, start_timestamp
+        state = start_strategy(
+            state,
+            strategy_id,
+            instance,
+            config={},
+            subscriptions=subscriptions,
+            at=start_timestamp,
         )
-        strategy_state, _ = RuntimeSupervisor.start(strategy_state, start_timestamp)
-        state = replace(state, strategies={**state.strategies, strategy_id: strategy_state})
     return state
 
 
@@ -198,10 +205,13 @@ def run_backtest_observed(
             source_id=dataset.dataset_id,
         )
         for index, record in enumerate(dataset.records, start=1):
+            # The first record of an instant completes the one before it
+            # (AlphaLab EXE-004), exactly as ``BacktestEngine.run`` does.
+            state = RunEngine.close_slice(state, context_factory, before=record.timestamp)
             state, step = BacktestEngine.advance(state, record, context_factory)
             if on_step is not None and step is not None:
                 on_step(index, step)
-        return BacktestEngine.finalize(state)
+        return BacktestEngine.finalize(RunEngine.close_slice(state, context_factory))
 
 
 def run_scope(seed: int | None) -> Any:
@@ -232,10 +242,18 @@ def run_replay(
     return ReplayBacktest.run(config, dataset, runtime, context_factory)
 
 
-def initialize_session(config: RunConfig, runtime: RuntimeState) -> RunState:
-    """Fund the portfolio and produce the state a paper session starts from."""
+def initialize_session(config: RunConfig, runtime: RuntimeState, *, source_id: str) -> RunState:
+    """Fund the portfolio and produce the state a paper session starts from.
 
-    return TradingSession.initialize(config, runtime)
+    **Call it inside** :func:`run_scope`, as ``TradingSession.run`` does. Funding
+    mints identifiers, and outside the seeded scope they come from ``uuid4`` —
+    the figures are unaffected, but the run's record, and so AlphaLab's
+    ``result_id``, then differs on every run of the same seeded session.
+    ``source_id`` names the stream the run reads, as AlphaLab's own drivers
+    record it.
+    """
+
+    return replace(TradingSession.initialize(config, runtime), source_id=source_id)
 
 
 def advance(
@@ -246,10 +264,24 @@ def advance(
     Advancing record by record rather than calling ``TradingSession.run`` is what
     makes a paper session pausable, inspectable and stoppable — the loop lives in
     :mod:`iluvtrade.trading.runner`, which checks for a stop request between
-    records.
+    records. Each record first completes the instant before it (AlphaLab
+    EXE-004), as ``TradingSession.run`` does between records; a strategy
+    subscribed to slices sees an instant only once the driver closes it.
     """
 
+    state = RunEngine.close_slice(state, context_factory, before=record.timestamp)
     return TradingSession.advance(state, record, context_factory, now)
+
+
+def close_final_slice(state: RunState, context_factory: Any) -> RunState:
+    """Complete the last instant, once the data has run out.
+
+    ``TradingSession.run`` does this after its last record. Only at the end of
+    the data: a session stopped or paused mid-run leaves its current instant
+    open, because more records of it may yet come.
+    """
+
+    return RunEngine.close_slice(state, context_factory)
 
 
 def finalize(state: RunState) -> BacktestResult:

@@ -10,15 +10,25 @@ rather than a silently ignored setting.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 class Strict(BaseModel):
-    """Refuses unknown fields. Every request model inherits this."""
+    """Refuses unknown fields, and NUL characters in text. Every request model inherits this."""
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("*", mode="after")
+    @classmethod
+    def _no_nul(cls, value: Any) -> Any:
+        # PostgreSQL text cannot hold a NUL character, so one in a request field
+        # reached the driver and answered 500. A NUL is never meaningful text
+        # here; it is refused as invalid input on every backend alike.
+        if isinstance(value, str) and "\x00" in value:
+            raise ValueError("Text may not contain a NUL character.")
+        return value
 
 
 # --- auth ------------------------------------------------------------------
@@ -188,7 +198,6 @@ class CleaningPolicyModel(Strict):
     drop_out_of_order: bool = True
     fill_ohlc_from_close: bool = True
     default_volume_to_zero: bool = True
-    derive_vwap: bool = True
     enforce_ohlc_consistency: bool = True
     require_positive_prices: bool = True
     default_symbol: str = Field(default="INSTRUMENT", max_length=60)
@@ -200,6 +209,35 @@ class FetchDatasetRequest(Strict):
     dataset_name: str | None = Field(default=None, max_length=200)
     description: str = ""
     policy: CleaningPolicyModel | None = None
+    #: What the file's timestamps mean; see ``iluvtrade.data.temporal``. Required
+    #: for any file whose bars can be read -- the import refuses without it.
+    timestamp_convention: Literal["session_date", "interval_start", "interval_end"] | None = None
+    #: IANA zone, for bare dates and wall-clock times only.
+    timezone: str | None = Field(default=None, max_length=64)
+    #: The interval each bar covers (AlphaLab code: 15m, 1h, 1d...). Required
+    #: except for session_date, which implies 1d. Never inferred.
+    bar_interval: str | None = Field(default=None, max_length=16)
+    #: The instruments, by symbol, for which the user declares that the gaps are
+    #: missing observations of ``bar_interval`` bars -- not longer bars. Must name
+    #: exactly the instruments whose own bars never sit one interval apart
+    #: (``POST /datasets/inspect`` with the declaration lists them); any other
+    #: name is refused. A declaration, never a verification.
+    missing_observations_confirmed_for: list[Annotated[str, Field(max_length=60)]] = Field(
+        default_factory=list, max_length=10_000
+    )
+    #: Required with ``missing_observations_confirmed_for``: the ``preview_id``
+    #: from ``POST /datasets/inspect-url`` for these bytes and settings. The
+    #: server re-fetches, recomputes it, and refuses a mismatch (the resource
+    #: changed, or the settings differ).
+    preview_id: str | None = Field(default=None, max_length=64)
+
+
+class InspectUrlRequest(Strict):
+    url: str = Field(max_length=2000)
+    policy: CleaningPolicyModel | None = None
+    timestamp_convention: Literal["session_date", "interval_start", "interval_end"] | None = None
+    timezone: str | None = Field(default=None, max_length=64)
+    bar_interval: str | None = Field(default=None, max_length=16)
 
 
 class DatasetVersionResponse(BaseModel):
@@ -213,7 +251,17 @@ class DatasetVersionResponse(BaseModel):
     symbol_count: int
     start_timestamp: float | None
     end_timestamp: float | None
+    #: The most common gap between bars: a descriptive statistic, never the interval.
     inferred_frequency: str | None
+    #: The declared bar interval, when validated provenance records one.
+    bar_interval: str | None
+    #: validated (every instrument's own bars consistent with, and showing, the
+    #: declared interval -- consistency, not proof of bar length) |
+    #: missing_observations_confirmed (some instruments accepted only on the
+    #: user's named declaration; not verified) | unvalidated | none
+    interval_status: str
+    #: Instruments accepted only on the missing-observation confirmation.
+    accepted_on_confirmation: list[str]
     quality_score: float | None
     canonical_hash: str | None
     failure_reason: str | None
@@ -226,6 +274,9 @@ class DatasetVersionDetail(DatasetVersionResponse):
     quality: dict[str, Any]
     transformations: dict[str, Any]
     cleaning_policy: dict[str, Any]
+    #: What the timestamps mean and how AlphaLab read them; ``{}`` for a version
+    #: imported before conventions were declared.
+    temporal: dict[str, Any]
     source: dict[str, Any]
     rejected_rows: dict[str, Any]
 
@@ -306,6 +357,10 @@ class SubmitBacktestRequest(Strict):
     commission_kind: Literal["percentage", "per_share"] = "percentage"
     commission_rate: str = "0.0003"
     risk_free_rate: float = 0.0
+    #: When a simulated order fills. ``next_event`` -- the next bar, no
+    #: look-ahead -- unless ``same_event`` is asked for by name; AlphaLab calls
+    #: the latter optimistic by construction.
+    fill_timing: Literal["next_event", "same_event"] = "next_event"
     seed: int | None = None
     idempotency_key: str | None = Field(default=None, max_length=80)
 
@@ -331,7 +386,10 @@ class BacktestResultResponse(BaseModel):
     run_id: str
     reproducibility: dict[str, Any]
     metrics: dict[str, Any]
-    result: dict[str, Any]
+    #: The stored detailed result, or ``None`` when it cannot be proven to be
+    #: this run's (``result_integrity`` says why). ``metrics`` is the run's own.
+    result: dict[str, Any] | None
+    result_integrity: dict[str, Any]
 
 
 # --- reddesk ---------------------------------------------------------------
@@ -413,6 +471,7 @@ class CreateSessionRequest(Strict):
     starting_cash: str = "1000000.00"
     base_currency: str = Field(default="INR", max_length=8)
     risk_profile: Literal["research", "conservative"] = "conservative"
+    fill_timing: Literal["next_event", "same_event"] = "next_event"
     seed: int | None = None
     live_confirmed: bool = False
 
@@ -433,6 +492,11 @@ class TradingSessionResponse(BaseModel):
     starting_cash: str
     base_currency: str
     seed: int
+    fill_timing: str
+    #: What the dataset's bar interval rested on, snapshotted at creation from
+    #: the session's dataset version (``ingest.temporal_evidence``). Distinct
+    #: from ``fill_timing``: a property of the data, not of execution.
+    temporal_evidence: dict[str, Any] | None = None
     records_processed: int
     cash: str | None
     equity: str | None

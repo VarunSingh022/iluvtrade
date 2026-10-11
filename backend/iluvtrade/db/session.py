@@ -14,6 +14,11 @@ from iluvtrade.config import get_settings
 _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
 
+#: How long a statement waits for a lock before giving up, in milliseconds. The
+#: same five seconds as SQLite's ``busy_timeout`` below, so contention answers
+#: alike on both backends.
+_LOCK_TIMEOUT_MS = 5000
+
 
 def _configure_sqlite(engine: Engine) -> None:
     """Turn on the SQLite behaviours the schema assumes.
@@ -46,6 +51,19 @@ def get_engine() -> Engine:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
             _engine = create_engine(url, future=True, connect_args={"check_same_thread": False})
             _configure_sqlite(_engine)
+        elif url.startswith("postgresql"):
+            # A lock wait is bounded, as SQLite's busy_timeout bounds it there.
+            # PostgreSQL's default is to wait forever, so a writer blocked behind
+            # a transaction that cannot finish hangs its request — and, before
+            # the upload route stopped running database work on the event loop,
+            # froze the whole worker. The timeout surfaces as the same retryable
+            # 503 ``DatabaseBusy`` (see ``api/errors.py``).
+            _engine = create_engine(
+                url,
+                future=True,
+                pool_pre_ping=True,
+                connect_args={"options": f"-c lock_timeout={_LOCK_TIMEOUT_MS}"},
+            )
         else:
             _engine = create_engine(url, future=True, pool_pre_ping=True)
     return _engine

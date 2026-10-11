@@ -18,8 +18,7 @@ from decimal import Decimal
 from typing import Any
 
 from alphalab.backtesting import MarketDataset
-from alphalab.market.bar import Bar, TimeFrame
-from alphalab.market.source import OrderingGuarantee, SequenceSource
+from alphalab.market import Bar, OrderingGuarantee, SequenceSource, TimeFrame
 
 from iluvtrade.alphalab_bridge.instruments import InstrumentUniverse
 
@@ -45,14 +44,19 @@ TIMEFRAMES: dict[str, TimeFrame] = {
 
 
 def timeframe_for(label: str | None) -> TimeFrame:
-    """AlphaLab's timeframe for a label, defaulting to daily.
+    """AlphaLab's timeframe for a label, or a refusal.
 
-    A dataset whose spacing the importer could not classify is carried as daily.
-    That is a *label*, not a resampling: no bar is moved, merged or created, and
-    the quality report says the frequency is irregular.
+    It used to default to daily, labelling an irregular dataset's bars as daily
+    ones. A run is now refused before it gets here
+    (``ingest._require_runnable``); this refuses too, so no path can label a bar
+    with an interval nobody established.
     """
 
-    return TIMEFRAMES.get(label or "", TimeFrame.D1)
+    if not label:
+        raise ValueError(
+            "No bar interval is declared for this dataset; its bars cannot be labelled with one."
+        )
+    return TIMEFRAMES.get(label) or TimeFrame.parse(label)
 
 
 def bars_from_rows(
@@ -92,8 +96,9 @@ def bars_from_rows(
             low=Decimal(str(row["low"])),
             close=Decimal(str(row["close"])),
             volume=Decimal(str(row["volume"])),
-            vwap=Decimal(str(row["vwap"])),
-            trade_count=int(row.get("trade_count", 0)),
+            # Absent when the source did not report it -- AlphaLab's ``None``.
+            vwap=None if row.get("vwap") in (None, "") else Decimal(str(row["vwap"])),
+            trade_count=None if row.get("trade_count") is None else int(row["trade_count"]),
             timeframe=timeframe,
         )
 

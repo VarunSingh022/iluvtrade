@@ -66,6 +66,7 @@ def submit(
         commission_kind=payload.commission_kind,
         commission_rate=payload.commission_rate,
         risk_free_rate=payload.risk_free_rate,
+        fill_timing=payload.fill_timing,
         seed=payload.seed,
     )
     job, created = service.submit(

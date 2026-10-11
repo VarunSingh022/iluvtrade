@@ -22,6 +22,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session as DbSession
 
 from iluvtrade.billing import Charge, ChargeStatus, Refund, get_provider
+from iluvtrade.data import ingest
 from iluvtrade.db.base import utcnow
 from iluvtrade.db.models.backtest import BacktestRun
 from iluvtrade.db.models.broker import BrokerKind
@@ -435,6 +436,28 @@ def discover(
     return [summarise(session, listing) for listing in session.execute(statement).scalars()]
 
 
+#: Withheld from the public view: they identify the creator's private dataset
+#: (a buyer in another organization can never open it), and the limitation
+#: itself is fully described without them.
+_PRIVATE_EVIDENCE_FIELDS = ("dataset_version_id", "dataset_canonical_hash")
+
+
+def _public_temporal_evidence(stored: str | None, *, unavailable: bool = False) -> dict[str, Any]:
+    """A cited run's temporal evidence, as any organization may see it."""
+
+    if unavailable:
+        return {
+            "evidence_version": ingest.TEMPORAL_EVIDENCE_VERSION,
+            "status": "unavailable",
+            "meaning": (
+                "The cited backtest run no longer exists, so what its data's bar interval "
+                "rested on cannot be shown."
+            ),
+        }
+    snapshot = ingest.evidence_snapshot(stored)
+    return {k: v for k, v in snapshot.items() if k not in _PRIVATE_EVIDENCE_FIELDS}
+
+
 def summarise(session: DbSession, listing: Listing) -> dict[str, Any]:
     """A listing's public view, including its evidence and rating."""
 
@@ -450,8 +473,16 @@ def summarise(session: DbSession, listing: Listing) -> dict[str, Any]:
     evidence: dict[str, Any] | None = None
     if current is not None and current.evidence_backtest_run_id:
         run = session.get(BacktestRun, current.evidence_backtest_run_id)
-        if run is not None:
+        if run is None:
+            # Cited, but gone: say so rather than show nothing, or something.
             evidence = {
+                "backtest_run_id": current.evidence_backtest_run_id,
+                "available": False,
+                "temporal_evidence": _public_temporal_evidence(None, unavailable=True),
+            }
+        else:
+            evidence = {
+                "available": True,
                 "backtest_run_id": run.id,
                 "records_processed": run.records_processed,
                 "order_count": run.order_count,
@@ -464,6 +495,10 @@ def summarise(session: DbSession, listing: Listing) -> dict[str, Any]:
                 "volatility": run.volatility,
                 "engine": f"{run.engine_name} {run.engine_version}",
                 "seed": run.seed,
+                # From the cited run's own snapshot of its dataset version --
+                # never from the listing request -- so a creator cannot relabel
+                # a user-declared interval as validated.
+                "temporal_evidence": _public_temporal_evidence(run.temporal_evidence_json),
                 # Stated on every piece of evidence the marketplace shows.
                 "disclaimer": (
                     "A backtest is a simulation over historical data under stated "

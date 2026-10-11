@@ -10,6 +10,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import unquote_to_bytes
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -60,6 +61,35 @@ class CorrelationMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             response.headers["X-Request-ID"] = identifier
             return response
+
+
+class NulCharacterMiddleware(BaseHTTPMiddleware):
+    """Refuse a request whose path or query carries a NUL character.
+
+    Starlette percent-decodes the path, so ``/datasets/versions/%00`` hands a
+    handler an id containing ``\\x00``. SQLite compared it and found nothing;
+    PostgreSQL text cannot hold NUL at all, so the driver raised and the request
+    answered 500. No identifier or parameter here is meaningful with one in it,
+    so it is refused before routing, on every backend alike. (Request bodies are
+    covered by ``api.v1.schemas.Strict``.)
+    """
+
+    async def dispatch(
+        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if "\x00" in request.scope.get("path", "") or b"\x00" in unquote_to_bytes(
+            request.scope.get("query_string", b"")
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": "BadRequest",
+                        "message": "The request path or query contains a NUL character.",
+                    }
+                },
+            )
+        return await call_next(request)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -146,6 +176,7 @@ def create_app(*, start_workers: bool = True, create_tables: bool = True) -> Fas
 
     # Added last so it runs first: every other middleware's logging should
     # already carry the correlation id.
+    app.add_middleware(NulCharacterMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(CorrelationMiddleware)
     if settings.allowed_origins:

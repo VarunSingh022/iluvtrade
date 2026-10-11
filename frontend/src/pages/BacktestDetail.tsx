@@ -3,9 +3,11 @@ import { Link, useParams } from "react-router-dom";
 
 import { ConfirmButton } from "../components/Confirm";
 import { EquityCurve } from "../components/EquityCurve";
+import { TemporalEvidencePanel } from "../components/TemporalEvidence";
 import { Badge, Banner, Card, ErrorBanner, Loading, Stat, StatusBadge, Tabs } from "../components/ui";
 import { api } from "../lib/api";
-import type { BacktestJob, BacktestResult } from "../lib/api";
+import type { BacktestJob, BacktestResult, ExecutionAssumptions } from "../lib/api";
+import { describeFillTiming } from "../lib/assumptions";
 import { count, epochDateTime, money, percent, ratio, shortId, signOf, when } from "../lib/format";
 import { useAsync, usePolling } from "../lib/useAsync";
 
@@ -56,7 +58,10 @@ export default function BacktestDetailPage() {
             <ConfirmButton
               label="Cancel run"
               confirmLabel="Cancel this backtest"
-              consequence="The job stops and no result is stored. Submitting it again starts from the beginning."
+              consequence={
+                "A queued job never starts. A running one is checked only when it finishes: it runs to " +
+                "the end and its result is discarded, not stored. Submitting it again starts from the beginning."
+              }
               onConfirm={cancel}
             />
           )}
@@ -78,6 +83,21 @@ export default function BacktestDetailPage() {
       )}
       {job.data.status === "cancelled" && <Banner tone="warn">This run was cancelled; no result was stored.</Banner>}
 
+      {job.data.status === "completed" && result.data && !document && (
+        <>
+          <Banner tone="warn">
+            {result.data.result_integrity?.reason ??
+              "The detailed result could not be verified as this run's, so it is not shown."}
+          </Banner>
+          <div className="grid cols-4">
+            <Stat label="Ending equity" value={money(String(metrics.ending_equity ?? ""))} mono />
+            <Stat label="Total return" value={percent(metrics.total_return as number | null)} />
+            <Stat label="Sharpe" value={ratio(metrics.sharpe_ratio as number | null)} />
+            <Stat label="Max drawdown" value={percent(metrics.max_drawdown as number | null)} />
+          </div>
+        </>
+      )}
+
       {job.data.status === "completed" && result.data && document && repro && (
         <>
           <div className="grid cols-4">
@@ -96,6 +116,11 @@ export default function BacktestDetailPage() {
             <Stat label="Commission" value={money(String(metrics.commission_paid ?? ""))} mono />
             <Stat label="Orders / fills" value={`${count(metrics.order_count as number)} / ${count(metrics.fill_count as number)}`} sub={`${count(metrics.records_processed as number)} records`} />
           </div>
+
+          <ExecutionPanel
+            assumptions={document.execution_assumptions}
+            requested={repro.configuration.fill_timing}
+          />
 
           {refusals && refusals.count > 0 && (
             <Banner tone="warn">
@@ -223,6 +248,9 @@ export default function BacktestDetailPage() {
                   Everything needed to re-derive this result. AlphaLab produced every figure above;
                   these are the inputs it was given.
                 </p>
+                <h3>What the data&apos;s bar interval rests on</h3>
+                <TemporalEvidencePanel evidence={repro.temporal_evidence} />
+                <h3 style={{ marginTop: "0.8rem" }}>Inputs</h3>
                 <div className="table-wrap">
                   <table>
                     <tbody>
@@ -245,5 +273,51 @@ export default function BacktestDetailPage() {
         </>
       )}
     </>
+  );
+}
+
+
+/**
+ * How the run modelled execution, read from AlphaLab's record of the run --
+ * not echoed from the request -- with every optimistic assumption it lists.
+ */
+export function ExecutionPanel({
+  assumptions,
+  requested,
+}: {
+  assumptions: ExecutionAssumptions | undefined;
+  requested: unknown;
+}) {
+  if (!assumptions) {
+    const legacy = describeFillTiming(requested ?? "same_event");
+    return (
+      <Banner tone="warn">
+        This result was stored before execution assumptions were recorded. It ran with{" "}
+        <strong>{legacy.label}</strong> fills. {legacy.meaning}
+      </Banner>
+    );
+  }
+  const timing = describeFillTiming(assumptions.fill_timing);
+  return (
+    <div style={{ marginTop: "0.75rem" }}>
+      <Card title="Execution assumptions">
+        <p className="small">
+          <strong>Fill timing:</strong> {timing.label}. {timing.meaning}
+        </p>
+        <p className="tiny dim">
+          Fill policy: {assumptions.fill_policy}. Costs: {assumptions.costs}. Latency: {assumptions.latency}.
+        </p>
+        {assumptions.optimistic.length > 0 && (
+          <Banner tone="warn">
+            Optimistic assumptions in force, as AlphaLab records them:
+            <ul style={{ margin: "0.3rem 0 0" }}>
+              {assumptions.optimistic.map((sentence) => (
+                <li key={sentence}>{sentence}</li>
+              ))}
+            </ul>
+          </Banner>
+        )}
+      </Card>
+    </div>
   );
 }

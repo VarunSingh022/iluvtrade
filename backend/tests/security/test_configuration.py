@@ -333,14 +333,20 @@ def test_the_escape_hatch_matrix(label: str, overrides: dict) -> None:
     assert _problems(**overrides) == {}, f"{label}: should be allowed once acknowledged"
 
 
-def test_development_defaults_cannot_silently_become_production_settings() -> None:
+def test_development_defaults_cannot_silently_become_production_settings(monkeypatch) -> None:
     """Take the development defaults wholesale and call it production.
 
     Every one of them should be refused. This is the scenario the whole matrix
     exists for: someone sets ILUVTRADE_ENVIRONMENT=production and changes
     nothing else.
+
+    The test fixture points ``ILUVTRADE_DATABASE_URL`` at a per-test database;
+    it is removed here so the *default* -- SQLite -- is what is judged. (On a
+    PostgreSQL test run the fixture's URL is not SQLite, and this test only
+    passed on SQLite because the fixture's URL happened to be one too.)
     """
 
+    monkeypatch.delenv("ILUVTRADE_DATABASE_URL", raising=False)
     settings = Settings(_env_file=None, environment="production")
     refused = {p.variable for p in settings.deployment_problems()}
     assert {

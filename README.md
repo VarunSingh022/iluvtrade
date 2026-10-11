@@ -44,7 +44,7 @@ license, and deploy an exact version to paper trading.
                 engine · results · broker vocab
                                  │
                                  ▼
-                        AlphaLab v3.5.0
+                        AlphaLab v4.1.0
         market data · strategy dispatch · allocation · risk
         OMS · execution · portfolio accounting · analytics
                                  │
@@ -65,7 +65,7 @@ Three authorities, and nothing crosses them:
 
 | Authority | Owns | Lives in |
 |---|---|---|
-| **AlphaLab** | every quantitative and trading semantic — market data, strategy dispatch, allocation, risk, OMS, execution, portfolio accounting, analytics | installed package `alphalab==3.5.0` |
+| **AlphaLab** | every quantitative and trading semantic — market data, strategy dispatch, allocation, risk, OMS, execution, portfolio accounting, analytics | installed package `alphalab` 4.1.0, the hash-pinned release wheel |
 | **RedDesk** | marketplace and licensing: what an organization is *permitted* to run | `backend/iluvtrade/reddesk/` |
 | **Platform** | identity, tenancy, authorization, audit: *who is asking* | `backend/iluvtrade/platform/` |
 
@@ -90,7 +90,8 @@ The tables named `session_orders` / `session_fills` / `session_positions` are
 # 1. Backend
 cd backend
 python3 -m venv .venv
-./.venv/bin/pip install /path/to/alphalab-3.5.0-py3-none-any.whl
+# Also installs AlphaLab 4.1.0: pyproject.toml pins the release wheel by URL
+# and SHA-256, and pip refuses it if the digest differs.
 ./.venv/bin/pip install -e ".[dev]"
 
 # 2. Configuration
@@ -210,6 +211,7 @@ Stated plainly, because a trading platform that overstates itself is dangerous.
 |---|---|
 | [STATUS.md](docs/STATUS.md) | **What is implemented, tested, disabled or absent — read this first** |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | The three authorities, the AlphaLab boundary, data flow, persistence |
+| [ALPHALAB_CAPABILITY_MAP.md](docs/ALPHALAB_CAPABILITY_MAP.md) | The whole AlphaLab 4.1 engine mapped onto product workflows: what is integrated, what is available, what is missing, and the roadmap |
 | [GETTING_STARTED.md](docs/GETTING_STARTED.md) | Install, configure, run, develop |
 | [API.md](docs/API.md) | Every endpoint, the error envelope, authentication |
 | [RESEARCH.md](docs/RESEARCH.md) | Data ingestion, backtests, reproducibility |

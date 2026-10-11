@@ -18,12 +18,29 @@ from decimal import Decimal
 from typing import Any
 
 from alphalab.backtesting import BacktestResult
+from alphalab.lifecycle import digest_run
 
-__all__ = ["extract", "headline", "positions_of", "valuation_of"]
+__all__ = [
+    "assumptions_of",
+    "extract",
+    "failures_of",
+    "headline",
+    "identity_of",
+    "positions_of",
+    "valuation_of",
+]
 
 
 def _money(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
+
+
+def _label(value: Any) -> str | None:
+    """An enum member's name, or a plain value's text; ``None`` stays ``None``."""
+
+    if value is None:
+        return None
+    return str(getattr(value, "name", value))
 
 
 def _float(value: Any) -> float | None:
@@ -176,9 +193,16 @@ def report_of(result: BacktestResult) -> dict[str, Any] | None:
             "cagr": _float(report.returns.cagr),
             "arithmetic_return": _float(report.returns.arithmetic_return),
             "geometric_return": _float(report.returns.geometric_return),
-            "daily_return_count": len(report.returns.daily_returns or ()),
+            # Period, not daily: since AlphaLab 3.10 the report states the
+            # periodicity it observed and the periods-per-year it annualized
+            # with, rather than assuming every series is daily.
+            "period_return_count": len(report.returns.period_returns or ()),
+            "periodicity": _label(report.returns.periodicity),
+            "periods_per_year": _float(report.returns.periods_per_year),
+            "years_elapsed": _float(report.returns.years_elapsed),
         },
         "risk": {
+            "risk_free_rate": _float(report.risk.risk_free_rate),
             "sharpe_ratio": _float(report.risk.sharpe_ratio),
             "sortino_ratio": _float(report.risk.sortino_ratio),
             "calmar_ratio": _float(report.risk.calmar_ratio),
@@ -242,6 +266,71 @@ def skipped_of(result: BacktestResult) -> list[dict[str, Any]]:
     return rows
 
 
+def failures_of(result: BacktestResult) -> list[dict[str, Any]]:
+    """Every strategy that failed during the run, as AlphaLab recorded it.
+
+    **Read this before any figure** (AlphaLab EXE-006, ``docs/INTEGRATION.md``).
+    A strategy whose hook raises, or which emits an invalid intent, is isolated
+    and the run *continues without it*: the valuation, the report and the
+    equity curve are all still produced, and look exactly like a strategy that
+    simply stopped finding signals. Works on an unfinished run too, which is
+    how a paper session notices between records.
+    """
+
+    return [
+        {
+            "strategy_id": failure.strategy_id,
+            "timestamp": failure.timestamp,
+            "error": failure.error[:2000],
+        }
+        for failure in result.strategy_failures
+    ]
+
+
+def assumptions_of(result: BacktestResult) -> dict[str, Any]:
+    """How the run modelled execution, as AlphaLab recorded it on the run.
+
+    Read from the engine rather than echoed from this application's request, so
+    the stored evidence says what the simulator actually did -- the fill timing
+    included -- and ``optimistic`` lists, in AlphaLab's words, every assumption
+    in force that flatters the result.
+    """
+
+    assumptions = result.execution_assumptions
+    return {
+        "fill_timing": _label(assumptions.fill_timing.value),
+        "routing": _label(assumptions.routing),
+        "fill_policy": assumptions.fill_policy,
+        "costs": assumptions.costs,
+        "latency": assumptions.latency,
+        "frictionless": assumptions.frictionless,
+        "unlimited_liquidity": assumptions.unlimited_liquidity,
+        "optimistic": list(assumptions.optimistic),
+    }
+
+
+def identity_of(result: BacktestResult) -> dict[str, Any]:
+    """AlphaLab's own identities for a finished run.
+
+    ``result_id`` is the SHA-256 of the run's complete canonical record and
+    ``configuration_id`` of how it was configured; both are host-independent
+    since AlphaLab 4.1 (REP-005). Recorded with every result, as AlphaLab's
+    integration guide asks, so a rerun can be checked against the engine's
+    own record rather than only against figures this application copied.
+    """
+
+    digest = digest_run(result)
+    return {
+        "result_id": digest.result_id,
+        "configuration_id": digest.configuration_id,
+        "mode": _label(digest.mode),
+        "seed": digest.seed,
+        "dataset_id": digest.dataset_id,
+        "strategy_ids": list(digest.strategy_ids),
+        "live_objects": list(digest.live_objects),
+    }
+
+
 def headline(result: BacktestResult) -> dict[str, Any]:
     """The small set of figures a listing row shows."""
 
@@ -270,6 +359,8 @@ def extract(result: BacktestResult) -> dict[str, Any]:
         "dataset_id": result.dataset_id,
         "seed": result.seed,
         "records_processed": result.records_processed,
+        "strategy_failures": failures_of(result),
+        "execution_assumptions": assumptions_of(result),
         "valuation": valuation_of(result),
         "positions": positions_of(result),
         "orders": orders_of(result),

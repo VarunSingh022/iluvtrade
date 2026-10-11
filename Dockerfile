@@ -8,20 +8,16 @@
 # configuration to solve a problem this application does not have.
 #
 # ---------------------------------------------------------------------------
-# BEFORE YOU BUILD: the AlphaLab wheel
+# The engine
 # ---------------------------------------------------------------------------
 #
-# ``alphalab==3.5.0`` is NOT on PyPI. It is built from its own repository and
-# installed from a local wheel, which means this image cannot be built from a
-# clean checkout alone. Put the wheel in ``deploy/wheels/`` first:
-#
-#     mkdir -p deploy/wheels
-#     cp /path/to/AlphaLab/dist/alphalab-3.5.0-py3-none-any.whl deploy/wheels/
-#
-# Stating this here rather than letting the build fail at the pip step, and
-# pinning the version rather than taking whatever wheel is present, is the
-# difference between a reproducible image and one that silently picks up a
-# different engine build.
+# AlphaLab is not on PyPI. ``backend/pyproject.toml`` depends on the v4.1.0
+# release wheel by direct reference with its SHA-256, so ``pip install
+# "./backend[postgres]"`` below downloads exactly that artifact from the
+# AlphaLab GitHub release and refuses it if its digest differs. The build
+# therefore needs network access to github.com, as it already needs PyPI, and
+# nothing has to be placed in the build context first. There is no second
+# source: an image cannot be built against a different engine by accident.
 
 # --- stage 1: the frontend -------------------------------------------------
 FROM node:22-bookworm-slim AS frontend
@@ -50,20 +46,16 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# The engine, from the wheel that must be present in the build context.
-COPY deploy/wheels/ /tmp/wheels/
-RUN test -f /tmp/wheels/alphalab-3.5.0-py3-none-any.whl \
-      || (echo "ERROR: deploy/wheels/alphalab-3.5.0-py3-none-any.whl is missing. See the header of this Dockerfile." >&2; exit 1) \
- && pip install /tmp/wheels/alphalab-3.5.0-py3-none-any.whl
-
 COPY backend/pyproject.toml backend/alembic.ini ./backend/
 COPY backend/iluvtrade/ ./backend/iluvtrade/
 COPY backend/migrations/ ./backend/migrations/
 # One command, one source of truth: the PostgreSQL driver comes from the
-# package's own `postgres` extra rather than a version pinned separately here.
+# package's own `postgres` extra, and AlphaLab from the package's hash-pinned
+# reference (see the header), rather than versions pinned separately here.
 # Two pins for one dependency drift apart, and the one in a Dockerfile nobody
-# has built drifts silently.
-RUN pip install "./backend[postgres]"
+# has built drifts silently. `pip check` stops the build on a broken set.
+RUN pip install "./backend[postgres]" \
+ && python -m pip check
 
 COPY --from=frontend /build/dist/ ./frontend/dist/
 COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh

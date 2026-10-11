@@ -18,6 +18,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Enum,
     Float,
@@ -91,7 +92,20 @@ class TradingSession(Base, IdMixin, OrgScopedMixin, TimestampMixin):
     risk_config_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     starting_cash: Mapped[str] = mapped_column(String(40), nullable=False)
     base_currency: Mapped[str] = mapped_column(String(8), nullable=False, default="INR")
-    seed: Mapped[int] = mapped_column(Integer, nullable=False)
+    # BigInteger: a derived seed is a 32-bit *unsigned* value (up to 2**32 - 1),
+    # past PostgreSQL's 32-bit signed INTEGER. SQLite's integers are 64-bit,
+    # which is why this only failed once the suite ran on PostgreSQL.
+    seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: When a simulated order fills (``next_event`` / ``same_event``). No
+    #: default: a session that did not state it must not quietly get one.
+    #: Sessions created before this column existed are backfilled
+    #: ``same_event``, which is what they ran with.
+    fill_timing: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: What the paper session's dataset version's bar times rested on, captured
+    #: at creation from that immutable version (``ingest.temporal_evidence``).
+    #: ``NULL`` for a live session (no dataset) and for a session created before
+    #: the snapshot existed -- which the runner refuses rather than upgrade.
+    temporal_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # --- the live gate, recorded rather than assumed ----------------------
     live_confirmed_at: Mapped[datetime | None] = mapped_column(UtcDateTime, nullable=True)

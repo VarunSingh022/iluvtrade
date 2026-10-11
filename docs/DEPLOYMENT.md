@@ -194,42 +194,40 @@ python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
 
-`alphalab==3.5.0` is **not on PyPI**. It comes from the engine's own build:
+That one command also installs the engine. AlphaLab is **not on PyPI**:
+`backend/pyproject.toml` depends on the v4.1.0 release wheel by direct reference,
 
-```bash
-.venv/bin/pip install /path/to/AlphaLab/dist/alphalab-3.5.0-py3-none-any.whl
+```text
+alphalab @ https://github.com/VarunSingh022/AlphaLab/releases/download/v4.1.0/alphalab-4.1.0-py3-none-any.whl#sha256=c2c1e8ca916a025b47350b15da9bde6fb3c64e626f2b05736e4152896b7a0a09
 ```
 
-`pip install alphalab==3.5.0` fails with "No matching distribution found". This
-is the single most common way a fresh setup stalls, which is why it is stated
-before the step that needs it rather than after.
+with the SHA-256 that release's `SHA256SUMS-4.1.0` records. pip downloads that
+artifact and refuses it — "THESE PACKAGES DO NOT MATCH THE HASHES" — if one
+byte differs, so a development install, CI and the Docker build all get the
+same verified engine through the same line, and none of them can quietly get a
+different one. Never write it as a bare `alphalab==4.1.0`: AlphaLab is not
+published to PyPI, and a bare name resolved against a public index installs
+whoever registers it (AlphaLab `docs/INTEGRATION.md`).
 
-### GitHub Actions: required AlphaLab wheel configuration
+To upgrade, take the new release's `SHA256SUMS-<version>` file and replace the
+URL and the hash together, then update `scripts/verify-alphalab.sh` the same
+way; `tests/unit/test_dependency_declaration.py` fails if the two disagree or
+if the installed package is not the declared artifact.
 
-A clean CI runner has the same requirement as a fresh local environment: it
-must be able to fetch the exact `alphalab==3.5.0` wheel before installing the
-backend. The workflow in `.github/workflows/ci.yml` looks for a repository
-variable named `ALPHALAB_WHEEL_URL`, then downloads the wheel into
-`deploy/wheels/` before running the backend checks.
+### GitHub Actions
 
-Set the value in GitHub at:
+A clean CI runner installs exactly as above: `pip install -e ".[dev]"` fetches
+the pinned wheel from the AlphaLab GitHub release and verifies it. There is
+nothing to configure. The workflow used to read an `ALPHALAB_WHEEL_URL`
+repository variable and download whatever it pointed at into `deploy/wheels/`
+without checking it; that mechanism is gone, and the variable is read by
+nothing — it can be deleted under
+`Settings -> Secrets and variables -> Actions -> Variables`.
 
-`Settings -> Secrets and variables -> Actions -> Variables -> New repository variable`
-
-The variable must contain only a non-sensitive direct HTTPS URL to the wheel,
-for example a public package index URL or a public release asset URL. The
-workflow uses `curl -fsSL` against that URL, so it is not a secret and should
-not contain credentials or bearer-style signed URLs embedded in the repository
-itself.
-
-If the AlphaLab wheel is private and requires authentication, the auth must use
-an appropriate GitHub Actions secret/token or another authenticated artifact
-mechanism. Do not place credentials or an authenticated bearer-style URL in a
-normal repository variable, and do not prescribe a private-artifact mechanism the
-current workflow does not actually support.
-
-If no value is configured and no wheel exists in `deploy/wheels/`, the backend
-job fails immediately with a clear error instead of silently passing or skipping.
+If the release asset cannot be downloaded, or its digest differs, the install
+step fails and the backend job stops there: nothing runs against a missing or
+different engine. The next step, `scripts/verify-alphalab.sh`, checks the
+installed version and location and runs the release's own consumer contract.
 
 Verify the install actually took, rather than assuming it did:
 
@@ -313,7 +311,7 @@ have to assume:
 ```json
 {
   "status": "ok",
-  "engine": {"name": "alphalab", "version": "3.5.0"},
+  "engine": {"name": "alphalab", "version": "4.1.0"},
   "live_trading_enabled": false,
   "rate_limiting": {
     "enabled": true,
@@ -361,14 +359,9 @@ Neither was found by running anything. Both were found by checking the file
 against what it would actually do — which is all that is available without
 Docker, and is why "written" and "verified" are different words on this page.
 
-Before building, place the AlphaLab wheel where the Dockerfile expects it:
-
-```bash
-mkdir -p deploy/wheels
-cp /path/to/AlphaLab/dist/alphalab-3.5.0-py3-none-any.whl deploy/wheels/
-```
-
-Then:
+Nothing has to be placed in the build context first: the build installs the
+backend package, which fetches the hash-pinned AlphaLab wheel from its GitHub
+release (above), so it needs network access to github.com. Then:
 
 ```bash
 cp .env.example .env     # set ILUVTRADE_SECRET_KEY and POSTGRES_PASSWORD
@@ -526,13 +519,90 @@ classified. `tests/integration/test_database_portability.py` pins the
 | `batch_alter_table` | COMPATIBLE | Alembic's SQLite table-rebuild workaround; on PostgreSQL it emits a plain `ALTER` |
 | Concurrent writes | SQLITE-SPECIFIC | The limitation above. PostgreSQL uses row-level locking and does not serialise writers |
 | State transitions | COMPATIBLE | A single conditional `UPDATE ... WHERE status IN (...)`, so the database picks the winner. Correct under both, and on PostgreSQL correct at real concurrency |
-| Constraint-violation behaviour | UNKNOWN UNTIL POSTGRES TEST | A failed `INSERT` aborts the whole transaction on PostgreSQL and not always on SQLite. Every request already rolls back on any exception, so the outcome should be identical — but "should be" is why this row exists |
-| Isolation and locking under load | UNKNOWN UNTIL POSTGRES TEST | The audit chain's read-head-then-insert serialises on a unique constraint. Correct in principle on both; unmeasured on PostgreSQL |
+| Constraint-violation behaviour | COMPATIBLE — **tested on PostgreSQL** | A failed `INSERT` aborts the transaction; the request rolls back and the next request on the pool succeeds (`tests/postgres`: `test_a_constraint_violation_rolls_back_and_the_next_request_succeeds`) |
+| Isolation and locking | REQUIRED CHANGES → **fixed, tested on PostgreSQL** | Three defects the first real PostgreSQL run found. (1) `POST /datasets/upload` was `async` and ran blocking database work on the event loop: a second upload waiting for the first's audit-row lock blocked the loop the first needed to commit — a permanent hang (a frozen worker in production); SQLite's `busy_timeout` had turned it into a 503. The route now runs database work in the thread pool. (2) The audit chain's read-head-then-insert made a concurrent writer fail on the unique sequence; it now takes `FOR NO KEY UPDATE` on the organization row (not `FOR UPDATE`, which deadlocks against the `FOR KEY SHARE` every foreign-key insert takes). (3) Lock waits are bounded by `lock_timeout = 5s`, matching SQLite's `busy_timeout`, and answer the same retryable 503 `DatabaseBusy` |
+| Integer width | REQUIRED CHANGE → **fixed** | `backtest_runs.seed` / `trading_sessions.seed` were `INTEGER`; a derived seed reaches 2**32 − 1, so roughly half of all backtests failed to save on PostgreSQL. `BIGINT` since migration 0006 |
+| NUL characters | REQUIRED CHANGE → **fixed** | PostgreSQL text cannot hold NUL; `/datasets/versions/%00` reached the driver and answered 500. Refused with 400 before routing (path, query) and 422 in request bodies |
+| Downgrade path | REQUIRED CHANGE → **fixed** | `0001_baseline`'s downgrade dropped two indexes `0002` creates and drops; SQLite's batch mode never noticed |
 | The driver | REQUIRES CHANGE → **fixed** | `psycopg` was installed by the Dockerfile and absent from `pyproject.toml`, so `pip install -e .` plus a PostgreSQL URL failed with `ModuleNotFoundError`. It is now the `postgres` extra |
 
 **The honest summary:** the schema contains no SQLite-only construct, and the
-two open questions are both about behaviour under concurrency rather than about
-syntax. The CI job below is what turns them into answers.
+two open questions were both about behaviour under concurrency rather than about
+syntax. Running the whole suite on PostgreSQL answered them — and found the
+defects in the rows above, every one of which SQLite had hidden.
+
+## Upgrading an existing database to 0008
+
+`0008_temporal_evidence` adds a nullable `temporal_evidence_json` to
+`backtest_runs` and `trading_sessions`. Existing rows stay `NULL`: shown as
+"not recorded", never backfilled. A paper session created before 0008 is
+refused at start (create a new one); a queued backtest job snapshots its
+evidence when it executes. Downgrading below 0008 is refused while any row holds
+a snapshot. Back up first, as below.
+
+## Upgrading an existing database to 0006 / 0007
+
+Back the database **and** the storage directory up first (`iluvtrade backup
+--verify` for SQLite; `pg_dump` for PostgreSQL). Then `alembic upgrade head`.
+What the upgrade does to existing rows, and what it means:
+
+| Existing | After upgrade | Consequence |
+|---|---|---|
+| Dataset versions | `temporal_json = '{}'` — no timestamp provenance | Refused for new backtests and paper sessions (approval, submission, worker, session creation, runner). Re-import the retained source file with a declaration; that creates a **new** version and changes nothing about past results |
+| Paper sessions | `fill_timing = 'same_event'` — what they ran | Truthful; shown as such |
+| Seeds | `BIGINT`, values unchanged | Every stored seed still representable |
+| Backtest runs | `artifact_sha256 = NULL` | The detailed result is never served as verified (see below); headline metrics on the row are unaffected |
+| Queued jobs / created sessions on a legacy version | — | Fail at the worker / runner with the reason instead of running |
+
+**Downgrading.** Below 0007 drops the digests: every run becomes "unverified"
+(the safe direction). Below 0006 is **refused** while any session records a fill
+timing other than the backfilled `same_event`, or any dataset version records
+timestamp provenance — re-upgrading would invent values rather than restore them
+— and PostgreSQL also refuses it while a seed exceeds 2**31 − 1. Restore the
+pre-upgrade backup instead.
+
+**Historical backtest results.** Before 2026-10-11 every run's detailed result
+was written to `org/<organization>/backtests/None/result.json`, so in an
+organization with more than one run, later runs overwrote earlier ones' documents.
+Exposure per organization is the number of runs sharing that path minus one; the
+surviving file belongs to the most recent run, but nothing in it proves which.
+Such documents are no longer served as a run's own. Headline metrics stored on
+each `backtest_runs` row (equity, P&L, return, Sharpe, drawdown, counts) were
+written per run and remain trustworthy. Overwritten documents are not recoverable
+from the database; only a copy of the storage directory taken between two runs
+would hold an earlier one. A legacy run cannot be re-run as it was: its dataset
+version has no validated timestamp provenance and is refused. Re-importing the
+source with a declaration produces a new version whose bars sit at different
+(correct) instants, so a backtest on it is a **new run with different inputs**,
+not a reproduction of the old one, and must not be presented as recovering it.
+
+**Versions imported by the unreleased hardening build.** A dataset version
+imported by the hardening build records timestamp provenance version 2 (bar
+interval validated across the whole file: one instrument's bars could vouch for
+another's) or 3 (a dataset-wide missing-observation checkbox, given before the
+user could see which instruments it covered). No migration changes those rows;
+the application simply no longer accepts versions 2 or 3 as validated, so such versions are refused at the same gates and show "not
+validated". Re-import the retained source to get a per-instrument-validated
+version. (No released build wrote version 2 or 3; the local development database at
+the time of the review held none — it is at revision 0005, and its two dataset
+versions predate declarations.)
+
+## Running the tests on PostgreSQL
+
+```bash
+ILUVTRADE_TEST_DATABASE_URL=postgresql+psycopg://USER:PASSWORD@localhost:5432/postgres ./.venv/bin/pytest -q
+```
+
+The URL names a **server** whose user may create databases (it connects to the
+maintenance database). Every test gets its own database, cloned from a template
+that `alembic upgrade head` built at the start of the run, and dropped afterwards;
+only names starting `iluvtrade_test_` are ever created or dropped. Each test first
+asserts the application's engine is PostgreSQL and connected to its own database.
+`tests/postgres` holds the PostgreSQL-specific tests; requesting them
+(`pytest tests/postgres` or `-m postgres`) without the variable is refused, not
+skipped. Tests marked `sqlite_only` are listed, not run, on PostgreSQL. The run
+prints which backend it used, even under `-q`. Install the driver with
+`pip install -e ".[dev,postgres]"`.
 
 ---
 
@@ -544,22 +614,20 @@ syntax. The CI job below is what turns them into answers.
 |---|---|
 | `frontend` | `npm ci`, typecheck, tests, production build |
 | `dependency-advisories` | `scripts/audit-dependencies.sh` — fails on an advisory nobody has assessed |
-| `backend` | ruff, ruff format, mypy, `check-config`, the AlphaLab boundary, the isolation suite, the full suite, `alembic upgrade`+`check`, and the demo |
-| `postgres` | `alembic upgrade head` and the full suite against a real PostgreSQL 16 service container |
+| `backend` | the pinned AlphaLab install and `scripts/verify-alphalab.sh` (version, location, the release's consumer contract), ruff, ruff format, mypy, `check-config`, the AlphaLab boundary, the isolation suite, the full suite, `alembic upgrade`+`check`, and the demo |
+| `postgres` | against a PostgreSQL 16 service container, as separate steps: `pg_isready`; `alembic upgrade head` + `check`; `tests/postgres`; then the application suite with `ILUVTRADE_TEST_DATABASE_URL` set. (Until 2026-10-11 its "suite against PostgreSQL" ran on SQLite — an autouse fixture replaced the URL.) |
 
 **It has never run.** There is no CI history for this repository, and the
 workflow is written, not proven.
 
 ## Why the backend jobs fail closed
 
-`alphalab==3.5.0` is not on PyPI, and this repository does not vendor the
-wheel. The backend jobs obtain it from the `ALPHALAB_WHEEL_URL` repository
-variable, or from a wheel committed to `deploy/wheels/`, and they **fail
-immediately with a clear error** when neither is configured.
-
-The workflow does not silently skip backend or PostgreSQL checks: the
-provisioning step exits with status 1 if the AlphaLab 3.5.0 wheel is not
-available. The frontend and dependency jobs have no such dependency and always
+AlphaLab is not on PyPI, and this repository does not vendor it. The backend
+and PostgreSQL jobs install it through the hash-pinned direct reference in
+`backend/pyproject.toml`; if the release asset is unreachable or its digest
+differs, `pip install` exits non-zero and the job fails at that step. No later
+step runs against a missing or substituted engine, and nothing is skipped
+quietly. The frontend and dependency jobs have no such dependency and always
 run.
 
 ## What CI is never given

@@ -117,6 +117,10 @@ class DatasetVersion(Base, IdMixin, OrgScopedMixin, TimestampMixin):
     quality_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     transformations_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     cleaning_policy_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    #: What the timestamps mean and how AlphaLab read them
+    #: (:mod:`iluvtrade.data.temporal`). ``{}`` for a version imported before
+    #: conventions were declared, which nothing may run on.
+    temporal_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
 
     # --- summary, denormalized for listing screens ------------------------
     row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

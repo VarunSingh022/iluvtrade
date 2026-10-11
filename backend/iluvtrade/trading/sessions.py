@@ -34,6 +34,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session as DbSession
 
 from iluvtrade.alphalab_bridge import runconfig
+from iluvtrade.common.seeds import derive_seed
 from iluvtrade.config import get_settings
 from iluvtrade.data import ingest
 from iluvtrade.db.base import utcnow
@@ -78,11 +79,16 @@ class SessionSpec:
     strategy_version_id: str
     dataset_version_id: str | None = None
     broker_account_id: str | None = None
+    temporal_evidence: dict[str, Any] | None = None
     parameters: dict[str, Any] | None = None
     starting_cash: str = "1000000.00"
     base_currency: str = "INR"
     risk_profile: str = "conservative"
     seed: int | None = None
+    #: When a simulated order fills: ``next_event`` (the default, no look-ahead)
+    #: or ``same_event`` (optimistic; only when asked for). Stored on the
+    #: session, so a restart replays it under the same execution.
+    fill_timing: str = runconfig.DEFAULT_FILL_TIMING
     #: Must be ``True`` for a live session. Recorded on the row with who set it.
     live_confirmed: bool = False
 
@@ -100,6 +106,10 @@ def create(session: DbSession, principal: Principal, spec: SessionSpec) -> Tradi
 
     principal.require(Role.TRADER)
     settings = get_settings()
+    try:
+        runconfig.fill_timing_for(spec.fill_timing)
+    except runconfig.UnsupportedFillTimingError as exc:
+        raise SessionError(str(exc)) from exc
 
     # --- entitlement: resolves to one concrete version, or refuses ---------
     grant = entitlements.resolve_version(
@@ -112,6 +122,7 @@ def create(session: DbSession, principal: Principal, spec: SessionSpec) -> Tradi
     # --- mode-specific inputs ---------------------------------------------
     dataset_version_id: str | None = None
     broker_account_id: str | None = None
+    temporal_evidence: dict[str, Any] | None = None
 
     if spec.mode is TradingMode.PAPER:
         if not spec.dataset_version_id:
@@ -120,6 +131,9 @@ def create(session: DbSession, principal: Principal, spec: SessionSpec) -> Tradi
             session, principal.organization_id, spec.dataset_version_id
         )
         dataset_version_id = dataset_version.id
+        # What the version's bar times rest on, from that immutable version,
+        # kept with the session for as long as it exists.
+        temporal_evidence = ingest.temporal_evidence(dataset_version)
     else:
         # Three gates, each named separately so the user is told which one to fix.
         if not settings.live_trading_enabled:
@@ -149,6 +163,12 @@ def create(session: DbSession, principal: Principal, spec: SessionSpec) -> Tradi
                 "label simulated fills as live."
             )
         broker_account_id = account.id
+        if spec.dataset_version_id:
+            dataset_version = ingest.require_approved(
+                session, principal.organization_id, spec.dataset_version_id
+            )
+            dataset_version_id = dataset_version.id
+            temporal_evidence = ingest.temporal_evidence(dataset_version)
 
     capital = Decimal(spec.starting_cash)
     if capital <= 0:
@@ -167,9 +187,34 @@ def create(session: DbSession, principal: Principal, spec: SessionSpec) -> Tradi
         broker_account_id=broker_account_id,
         parameters_json=json.dumps(spec.parameters or {}, sort_keys=True),
         risk_config_json=json.dumps(risk.to_dict(), sort_keys=True),
+        fill_timing=spec.fill_timing,
+        temporal_evidence_json=(
+            json.dumps(temporal_evidence, sort_keys=True) if temporal_evidence else None
+        ),
         starting_cash=str(capital),
         base_currency=spec.base_currency,
-        seed=spec.seed if spec.seed is not None else abs(hash(version.id)) % (2**31),
+        # Derived from the session's material inputs by the documented digest
+        # (``common.seeds``), then stored; the runner only ever reads it back.
+        # It was ``abs(hash(version.id))``: randomized per process, and blind to
+        # the dataset and configuration.
+        seed=spec.seed
+        if spec.seed is not None
+        else derive_seed(
+            {
+                "kind": "trading_session",
+                "mode": spec.mode.value,
+                "strategy_version_id": version.id,
+                "dataset_version_id": (
+                    dataset_version_id if spec.mode is TradingMode.PAPER else None
+                ),
+                "broker_account_id": broker_account_id,
+                "parameters": spec.parameters or {},
+                "starting_cash": str(capital),
+                "base_currency": spec.base_currency,
+                "risk": risk.to_dict(),
+                "fill_timing": spec.fill_timing,
+            }
+        ),
         live_confirmed_at=utcnow() if spec.mode is TradingMode.LIVE else None,
         live_confirmed_by_user_id=(principal.user_id if spec.mode is TradingMode.LIVE else None),
     )
