@@ -48,6 +48,10 @@ def backup_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[
         "ILUVTRADE_BACKUP_DEPLOYMENT_ID": "9b2f8c6e-6c5a-4f7d-8a1b-3c4d5e6f7081",
         "ILUVTRADE_BACKUP_STAGING_ENCRYPTED": "1",
         "ILUVTRADE_BACKUP_APP_COMMIT": "a" * 40,
+        "ILUVTRADE_BACKUP_REHEARSAL_PROJECT_NAME": (
+            "iluvtrade-rehearsal-1b2f8c6e-6c5a-4f7d-8a1b-3c4d5e6f7082"
+        ),
+        "ILUVTRADE_BACKUP_REHEARSAL_ISOLATION_CONFIRMED": "1",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -116,6 +120,16 @@ def test_staging_encryption_requires_explicit_operator_confirmation(
         backup.BackupConfig.from_environment(environment)
 
 
+def test_capture_only_also_requires_staging_encryption_acknowledgement(
+    backup_environment: dict[str, str],
+) -> None:
+    environment = backup_environment.copy()
+    environment["ILUVTRADE_BACKUP_STAGING_ENCRYPTED"] = "true"
+
+    with pytest.raises(backup.BackupError, match="must be 1"):
+        backup.BackupConfig.from_environment(environment, capture_only=True)
+
+
 def test_backup_deployment_id_must_be_a_canonical_uuid(
     backup_environment: dict[str, str],
 ) -> None:
@@ -124,6 +138,73 @@ def test_backup_deployment_id_must_be_a_canonical_uuid(
 
     with pytest.raises(backup.BackupError, match="canonical UUID"):
         backup.BackupConfig.from_environment(environment)
+
+
+def test_capture_only_configuration_does_not_require_remote_repository_credentials(
+    backup_environment: dict[str, str],
+) -> None:
+    environment = backup_environment.copy()
+    for name in (
+        "RESTIC_REPOSITORY",
+        "RESTIC_PASSWORD_FILE",
+        "B2_ACCOUNT_ID",
+        "B2_ACCOUNT_KEY",
+        "ILUVTRADE_BACKUP_TAG",
+    ):
+        environment.pop(name)
+
+    config = backup.BackupConfig.from_environment(environment, capture_only=True)
+
+    assert config.restic_password_file is None
+    assert config.restic_repository == ""
+
+
+def test_capture_only_requires_unique_explicit_rehearsal_identity(
+    backup_environment: dict[str, str],
+) -> None:
+    config = backup.BackupConfig.from_environment(
+        backup_environment,
+        capture_only=True,
+    )
+
+    with pytest.raises(backup.BackupError, match="unique lowercase UUID"):
+        backup._rehearsal_config(
+            config,
+            {
+                **backup_environment,
+                "ILUVTRADE_BACKUP_REHEARSAL_PROJECT_NAME": "",
+            },
+        )
+
+    with pytest.raises(backup.BackupError, match="unique lowercase UUID"):
+        backup._rehearsal_config(
+            config,
+            {
+                **backup_environment,
+                "ILUVTRADE_BACKUP_REHEARSAL_PROJECT_NAME": "iluvtrade",
+            },
+        )
+
+    with pytest.raises(backup.BackupError, match="ISOLATION_CONFIRMED"):
+        backup._rehearsal_config(
+            config,
+            {
+                **backup_environment,
+                "ILUVTRADE_BACKUP_REHEARSAL_ISOLATION_CONFIRMED": "",
+            },
+        )
+
+
+def test_capture_only_rejects_application_repository_as_project_directory(
+    backup_environment: dict[str, str],
+) -> None:
+    environment = backup_environment.copy()
+    environment["ILUVTRADE_BACKUP_PROJECT_DIR"] = str(backup._REPO_ROOT)
+    environment["ILUVTRADE_BACKUP_COMPOSE_FILE"] = str(backup._REPO_ROOT / "docker-compose.yml")
+    config = backup.BackupConfig.from_environment(environment, capture_only=True)
+
+    with pytest.raises(backup.BackupError, match="separate from the application repository"):
+        backup._rehearsal_config(config, environment)
 
 
 def test_staging_inside_compose_project_is_rejected(
@@ -277,6 +358,328 @@ def test_capture_resumes_running_writers_after_failure(
     assert writers_at_dump == [{"db"}]
     assert running == {"db", "api"}
     assert not list(config.staging_dir.glob(".capture-*"))
+
+
+def _mock_capture_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+    config: backup.BackupConfig,
+    *,
+    fail_dump: bool = False,
+    fail_start: bool = False,
+    initially_running: set[str] | None = None,
+    effective_compose_config: bytes = b'{"services":{},"volumes":{"storage":{}}}',
+    compose_config_returncode: int = 0,
+) -> tuple[list[list[str]], set[str]]:
+    calls: list[list[str]] = []
+    running = {"db", "api"} if initially_running is None else set(initially_running)
+    project_name = config.compose_project_name
+    assert project_name is not None
+    project_volume = f"{project_name}_storage"
+    project_root = config.project_dir
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append(command)
+        if command[:2] == ["docker", "compose"]:
+            assert "--project-name" in command
+            assert command[command.index("--project-name") + 1] == project_name
+            if "config" in command:
+                if "--format" in command:
+                    return _completed(
+                        effective_compose_config,
+                        returncode=compose_config_returncode,
+                    )
+                return _completed(b"db\napi\n")
+            if "ps" in command:
+                if "--quiet" in command:
+                    return _completed(
+                        b"database-container\n" if command[-1] == "db" else b"storage-container\n"
+                    )
+                if "--status" in command:
+                    return _completed(("\n".join(sorted(running)) + "\n").encode())
+                return _completed(b"db\napi\n")
+            if "stop" in command:
+                running.discard("api")
+                return _completed()
+            if "start" in command:
+                if fail_start:
+                    return _completed(returncode=1)
+                running.add("api")
+                return _completed()
+            if "pg_stat_activity" in " ".join(command):
+                return _completed(b"0\n")
+            if "version_num" in " ".join(command):
+                return _completed(b"0008_temporal_evidence\n")
+            if "pg_dump" in " ".join(command):
+                if fail_dump:
+                    return _completed(returncode=1)
+                kwargs["stdout"].write(b"synthetic-postgresql-dump")
+                return _completed()
+        if command[:2] == ["docker", "inspect"]:
+            template = command[3]
+            if "com.docker.compose.project" in template:
+                return _completed(
+                    (
+                        f"{project_name}\nvolume|{project_volume}|"
+                        f"/var/lib/docker/volumes/{project_volume}/_data\n"
+                    ).encode()
+                )
+            if "{{range .Mounts}}{{.Source}}" in template:
+                return _completed(f"{project_root / 'volume-source'}\n".encode())
+            if ".Destination" in template:
+                return _completed(
+                    (
+                        f"volume|{project_volume}|/var/lib/docker/volumes/{project_volume}/_data\n"
+                    ).encode()
+                )
+        if command[:3] == ["docker", "volume", "inspect"]:
+            return _completed(f"{project_name}\n".encode())
+        if command[:2] == ["docker", "cp"]:
+            (Path(command[-1]) / "fixture.csv").write_bytes(b"synthetic fixture data")
+            return _completed()
+        pytest.fail(f"Unexpected mocked subprocess command: {command!r}")
+
+    monkeypatch.setattr(backup.subprocess, "run", fake_run)
+    return calls, running
+
+
+@pytest.mark.parametrize(
+    "effective_compose_config",
+    [
+        b'{"services":{},"volumes":{"storage":{"external":true}}}',
+        b'{"services":{},"volumes":{"storage":{"external":{"name":"shared"}}}}',
+        # `docker compose config` resolves interpolation before producing JSON.
+        b'{"services":{},"volumes":{"storage":{"external":true,"name":"shared"}}}',
+    ],
+    ids=["external-boolean", "external-mapping", "interpolated-external"],
+)
+def test_capture_only_rejects_effective_external_volume_before_capture(
+    backup_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    effective_compose_config: bytes,
+) -> None:
+    config = backup.BackupConfig.from_environment(capture_only=True)
+    rehearsal_config = backup._rehearsal_config(config, backup_environment)
+    calls, _running = _mock_capture_subprocess(
+        monkeypatch,
+        rehearsal_config,
+        effective_compose_config=effective_compose_config,
+    )
+
+    with pytest.raises(backup.BackupError, match="External Compose volumes are refused"):
+        backup._capture_only(rehearsal_config)
+
+    compose_config_call = calls[0]
+    assert compose_config_call[compose_config_call.index("config") :] == [
+        "config",
+        "--format",
+        "json",
+    ]
+    assert len(calls) == 1
+    assert not any("stop" in call for call in calls)
+    assert not any("pg_dump" in " ".join(call) or call[:2] == ["docker", "cp"] for call in calls)
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize(
+    ("effective_compose_config", "returncode", "error"),
+    [
+        (b"not-json", 0, "could not be parsed"),
+        (b"", 1, "configuration validation failed"),
+    ],
+    ids=["invalid-json", "compose-config-unavailable"],
+)
+def test_capture_only_fails_closed_on_unavailable_or_invalid_effective_config(
+    backup_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    effective_compose_config: bytes,
+    returncode: int,
+    error: str,
+) -> None:
+    config = backup.BackupConfig.from_environment(capture_only=True)
+    rehearsal_config = backup._rehearsal_config(config, backup_environment)
+    calls, _running = _mock_capture_subprocess(
+        monkeypatch,
+        rehearsal_config,
+        effective_compose_config=effective_compose_config,
+        compose_config_returncode=returncode,
+    )
+
+    with pytest.raises(backup.BackupError, match=error):
+        backup._capture_only(rehearsal_config)
+
+    assert len(calls) == 1
+    assert not any("stop" in call for call in calls)
+    assert not any("pg_dump" in " ".join(call) or call[:2] == ["docker", "cp"] for call in calls)
+
+
+def test_capture_only_keeps_verified_bundle_without_restic_or_retention(
+    backup_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = backup.BackupConfig.from_environment(capture_only=True)
+    rehearsal_config = backup._rehearsal_config(config, backup_environment)
+    calls, running = _mock_capture_subprocess(monkeypatch, rehearsal_config)
+
+    assert backup.main(["--capture-only"]) == 0
+    message = capsys.readouterr().out
+    assert "Local recovery bundle captured and verified:" in message
+    bundle = Path(message.rsplit(":", 1)[1].strip())
+    assert bundle.is_absolute()
+    assert bundle.parent == config.staging_dir
+    assert bundle.is_dir()
+    manifest = backup._verify_bundle(bundle)
+    assert manifest["storage_file_count"] == 1
+    assert (bundle / "database.dump").read_bytes() == b"synthetic-postgresql-dump"
+    assert running == {"db", "api"}
+    assert not any(call[0] == "restic" for call in calls)
+    assert not any("forget" in call or "--prune" in call for call in calls)
+    assert not any(call[:2] == ["docker", "compose"] and "down" in call for call in calls)
+
+
+def test_capture_only_does_not_start_services_that_were_already_stopped(
+    backup_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = backup.BackupConfig.from_environment(capture_only=True)
+    rehearsal_config = backup._rehearsal_config(config, backup_environment)
+    calls, running = _mock_capture_subprocess(
+        monkeypatch,
+        rehearsal_config,
+        initially_running={"db"},
+    )
+
+    bundle = backup._capture_only(rehearsal_config)
+
+    assert backup._verify_bundle(bundle)
+    assert running == {"db"}
+    assert not any("stop" in call or "start" in call for call in calls)
+
+
+def test_capture_only_failure_keeps_partial_evidence_and_resumes_writers(
+    backup_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = backup.BackupConfig.from_environment(capture_only=True)
+    rehearsal_config = backup._rehearsal_config(config, backup_environment)
+    calls, running = _mock_capture_subprocess(
+        monkeypatch,
+        rehearsal_config,
+        fail_dump=True,
+    )
+
+    assert backup.main(["--capture-only"]) == 1
+    error = capsys.readouterr().err
+    assert "Partial capture evidence retained at" in error
+    retained = list(config.staging_dir.glob("failed-capture-*"))
+    assert len(retained) == 1
+    assert str(retained[0].resolve()) in error
+    assert retained[0].is_dir()
+    assert running == {"db", "api"}
+    assert any("stop" in call for call in calls)
+    assert any("start" in call for call in calls)
+    assert not any(call[0] == "restic" for call in calls)
+
+
+def test_capture_and_resume_failures_preserve_capture_error_and_partial_evidence(
+    backup_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = backup.BackupConfig.from_environment(capture_only=True)
+    rehearsal_config = backup._rehearsal_config(config, backup_environment)
+    calls, running = _mock_capture_subprocess(
+        monkeypatch,
+        rehearsal_config,
+        fail_dump=True,
+        fail_start=True,
+    )
+
+    assert backup.main(["--capture-only"]) == 1
+    error = capsys.readouterr().err
+    assert "PostgreSQL consistent dump failed" in error
+    assert "Writer resumption also failed" in error
+    assert "Partial capture evidence retained at" in error
+    assert len(list(config.staging_dir.glob("failed-capture-*"))) == 1
+    assert running == {"db"}
+    assert any("start" in call for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("inspect_output", "volume_label", "message"),
+    [
+        ("another-project\n", "another-project", "project label"),
+        (
+            "iluvtrade-rehearsal-1b2f8c6e-6c5a-4f7d-8a1b-3c4d5e6f7082\nbind||/production/storage\n",
+            "",
+            "bind mounts",
+        ),
+        (
+            "iluvtrade-rehearsal-1b2f8c6e-6c5a-4f7d-8a1b-3c4d5e6f7082\n"
+            "volume|shared-volume|/var/lib/docker/volumes/shared-volume/_data\n",
+            "another-project",
+            "non-project-scoped",
+        ),
+    ],
+)
+def test_capture_only_rejects_unowned_containers_and_volumes(
+    backup_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    inspect_output: str,
+    volume_label: str,
+    message: str,
+) -> None:
+    config = backup.BackupConfig.from_environment(capture_only=True)
+    rehearsal_config = backup._rehearsal_config(config, backup_environment)
+    monkeypatch.setattr(
+        backup,
+        "_service_container_ids",
+        lambda _config, _service: ["container-id"],
+    )
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        if command[:2] == ["docker", "inspect"]:
+            return _completed(inspect_output.encode())
+        if command[:3] == ["docker", "volume", "inspect"]:
+            return _completed(f"{volume_label}\n".encode())
+        pytest.fail(f"Unexpected mocked subprocess command: {command!r}")
+
+    monkeypatch.setattr(backup.subprocess, "run", fake_run)
+    with pytest.raises(backup.BackupError, match=message):
+        backup._validate_rehearsal_containers(rehearsal_config, {"api"})
+
+
+def test_capture_only_rejects_volume_with_wrong_project_ownership_label(
+    backup_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = backup.BackupConfig.from_environment(capture_only=True)
+    rehearsal_config = backup._rehearsal_config(config, backup_environment)
+    project_name = rehearsal_config.compose_project_name
+    assert project_name is not None
+    monkeypatch.setattr(
+        backup,
+        "_service_container_ids",
+        lambda _config, _service: ["container-id"],
+    )
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        if command[:2] == ["docker", "inspect"]:
+            return _completed(
+                (
+                    f"{project_name}\nvolume|{project_name}_storage|"
+                    "/var/lib/docker/volumes/storage/_data\n"
+                ).encode()
+            )
+        if command[:3] == ["docker", "volume", "inspect"]:
+            return _completed(b"another-project\n")
+        pytest.fail(f"Unexpected mocked subprocess command: {command!r}")
+
+    monkeypatch.setattr(backup.subprocess, "run", fake_run)
+    with pytest.raises(backup.BackupError, match="not labeled as owned"):
+        backup._validate_rehearsal_containers(rehearsal_config, {"api"})
 
 
 def test_capture_creates_manifest_and_resumes_compose_writers(

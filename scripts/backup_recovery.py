@@ -23,13 +23,17 @@ import tomllib
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import IO
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SERVICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_REHEARSAL_PROJECT_NAME = re.compile(
+    r"^iluvtrade-rehearsal-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 _MANIFEST_NAME = "manifest.json"
 _CHECKSUMS_NAME = "storage-checksums.jsonl"
 
@@ -47,17 +51,24 @@ class BackupConfig:
     storage_path: str
     staging_dir: Path
     restic_repository: str
-    restic_password_file: Path
+    restic_password_file: Path | None
     backup_tag: str
     deployment_id: str
     deployment_tag: str
     stop_timeout: int
     app_commit: str
+    compose_project_name: str | None = None
+    rehearsal: bool = False
     docker_command: str = "docker"
     restic_command: str = "restic"
 
     @classmethod
-    def from_environment(cls, environment: dict[str, str] | None = None) -> BackupConfig:
+    def from_environment(
+        cls,
+        environment: dict[str, str] | None = None,
+        *,
+        capture_only: bool = False,
+    ) -> BackupConfig:
         env = os.environ if environment is None else environment
         project_dir = Path(env.get("ILUVTRADE_BACKUP_PROJECT_DIR", _REPO_ROOT)).expanduser()
         if not project_dir.is_absolute():
@@ -74,18 +85,23 @@ class BackupConfig:
         deployment_id = env.get("ILUVTRADE_BACKUP_DEPLOYMENT_ID", "").strip()
 
         required = {
-            "RESTIC_REPOSITORY": repository,
-            "RESTIC_PASSWORD_FILE": password_value,
-            "B2_ACCOUNT_ID": env.get("B2_ACCOUNT_ID", "").strip(),
-            "B2_ACCOUNT_KEY": env.get("B2_ACCOUNT_KEY", "").strip(),
             "ILUVTRADE_BACKUP_STAGING_DIR": staging_value,
-            "ILUVTRADE_BACKUP_TAG": backup_tag,
             "ILUVTRADE_BACKUP_DEPLOYMENT_ID": deployment_id,
             "ILUVTRADE_BACKUP_STAGING_ENCRYPTED": env.get(
                 "ILUVTRADE_BACKUP_STAGING_ENCRYPTED", ""
             ).strip(),
             "ILUVTRADE_BACKUP_APP_COMMIT": env.get("ILUVTRADE_BACKUP_APP_COMMIT", "").strip(),
         }
+        if not capture_only:
+            required.update(
+                {
+                    "RESTIC_REPOSITORY": repository,
+                    "RESTIC_PASSWORD_FILE": password_value,
+                    "B2_ACCOUNT_ID": env.get("B2_ACCOUNT_ID", "").strip(),
+                    "B2_ACCOUNT_KEY": env.get("B2_ACCOUNT_KEY", "").strip(),
+                    "ILUVTRADE_BACKUP_TAG": backup_tag,
+                }
+            )
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise BackupError(f"Required backup configuration is missing: {', '.join(missing)}.")
@@ -94,14 +110,15 @@ class BackupConfig:
                 "ILUVTRADE_BACKUP_STAGING_ENCRYPTED must be 1 after independently verifying "
                 "that the staging filesystem is encrypted at rest."
             )
-        repository_parts = repository.split(":", 2)
-        if (
-            not repository.startswith("b2:")
-            or len(repository_parts) != 3
-            or not repository_parts[1]
-            or not repository_parts[2]
-        ):
-            raise BackupError("RESTIC_REPOSITORY must identify a Backblaze B2 repository.")
+        if not capture_only:
+            repository_parts = repository.split(":", 2)
+            if (
+                not repository.startswith("b2:")
+                or len(repository_parts) != 3
+                or not repository_parts[1]
+                or not repository_parts[2]
+            ):
+                raise BackupError("RESTIC_REPOSITORY must identify a Backblaze B2 repository.")
 
         db_service = env.get("ILUVTRADE_BACKUP_DB_SERVICE", "db")
         storage_service = env.get("ILUVTRADE_BACKUP_STORAGE_SERVICE", "api")
@@ -113,7 +130,7 @@ class BackupConfig:
                 raise BackupError(f"{name} is not a valid Compose service name.")
         if db_service == storage_service:
             raise BackupError("The database and storage services must be distinct.")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", backup_tag):
+        if backup_tag and not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", backup_tag):
             raise BackupError(
                 "ILUVTRADE_BACKUP_TAG must contain only letters, digits, '.', '_' or '-'."
             )
@@ -134,21 +151,23 @@ class BackupConfig:
         if posix_storage_path == PurePosixPath("/"):
             raise BackupError("The container root cannot be used as the storage root.")
 
-        password_file = Path(password_value).expanduser()
-        if password_file.is_symlink():
-            raise BackupError("RESTIC_PASSWORD_FILE must not be a symbolic link.")
-        try:
-            password_stat = password_file.stat()
-        except OSError as exc:
-            raise BackupError("RESTIC_PASSWORD_FILE is missing or inaccessible.") from exc
-        if (
-            not stat.S_ISREG(password_stat.st_mode)
-            or stat.S_IMODE(password_stat.st_mode) & 0o077
-            or not os.access(password_file, os.R_OK)
-        ):
-            raise BackupError(
-                "RESTIC_PASSWORD_FILE must be a regular file with mode 0600 or stricter."
-            )
+        password_file: Path | None = None
+        if password_value:
+            password_file = Path(password_value).expanduser()
+            if password_file.is_symlink():
+                raise BackupError("RESTIC_PASSWORD_FILE must not be a symbolic link.")
+            try:
+                password_stat = password_file.stat()
+            except OSError as exc:
+                raise BackupError("RESTIC_PASSWORD_FILE is missing or inaccessible.") from exc
+            if (
+                not stat.S_ISREG(password_stat.st_mode)
+                or stat.S_IMODE(password_stat.st_mode) & 0o077
+                or not os.access(password_file, os.R_OK)
+            ):
+                raise BackupError(
+                    "RESTIC_PASSWORD_FILE must be a regular file with mode 0600 or stricter."
+                )
 
         project_dir = project_dir.resolve()
         compose_file = compose_file.resolve()
@@ -184,12 +203,14 @@ class BackupConfig:
             storage_path=str(posix_storage_path),
             staging_dir=staging_dir.resolve(),
             restic_repository=repository,
-            restic_password_file=password_file.resolve(),
+            restic_password_file=password_file.resolve() if password_file is not None else None,
             backup_tag=backup_tag,
             deployment_id=deployment_id,
             deployment_tag=f"deployment-{deployment_id}",
             stop_timeout=stop_timeout,
             app_commit=app_commit,
+            compose_project_name=None,
+            rehearsal=False,
             docker_command=env.get("ILUVTRADE_BACKUP_DOCKER", "docker"),
             restic_command=env.get("ILUVTRADE_BACKUP_RESTIC", "restic"),
         )
@@ -234,15 +255,70 @@ def _decode_lines(payload: bytes, stage: str) -> list[str]:
 
 
 def _compose(config: BackupConfig, *arguments: str) -> list[str]:
-    return [
+    command = [
         config.docker_command,
         "compose",
         "--project-directory",
         str(config.project_dir),
         "--file",
         str(config.compose_file),
-        *arguments,
     ]
+    if config.compose_project_name is not None:
+        command.extend(["--project-name", config.compose_project_name])
+    return [*command, *arguments]
+
+
+def _rehearsal_config(
+    config: BackupConfig,
+    environment: dict[str, str] | None = None,
+) -> BackupConfig:
+    env = os.environ if environment is None else environment
+    project_name = env.get("ILUVTRADE_BACKUP_REHEARSAL_PROJECT_NAME", "").strip()
+    if not _REHEARSAL_PROJECT_NAME.fullmatch(project_name):
+        raise BackupError(
+            "ILUVTRADE_BACKUP_REHEARSAL_PROJECT_NAME must be "
+            "'iluvtrade-rehearsal-' followed by a unique lowercase UUID."
+        )
+    if env.get("ILUVTRADE_BACKUP_REHEARSAL_ISOLATION_CONFIRMED") != "1":
+        raise BackupError(
+            "Set ILUVTRADE_BACKUP_REHEARSAL_ISOLATION_CONFIRMED=1 only after confirming "
+            "the disposable Docker context, project directory, database, and storage."
+        )
+    if not env.get("ILUVTRADE_BACKUP_PROJECT_DIR", "").strip():
+        raise BackupError(
+            "ILUVTRADE_BACKUP_PROJECT_DIR must explicitly identify the disposable Compose "
+            "project directory."
+        )
+    if not env.get("ILUVTRADE_BACKUP_COMPOSE_FILE", "").strip():
+        raise BackupError(
+            "ILUVTRADE_BACKUP_COMPOSE_FILE must explicitly identify the rehearsal Compose file."
+        )
+    if not Path(env["ILUVTRADE_BACKUP_PROJECT_DIR"]).expanduser().is_absolute():
+        raise BackupError("The rehearsal Compose project directory must be an absolute path.")
+    if not Path(env["ILUVTRADE_BACKUP_COMPOSE_FILE"]).expanduser().is_absolute():
+        raise BackupError("The rehearsal Compose file path must be absolute.")
+    if not config.compose_file.is_relative_to(config.project_dir):
+        raise BackupError("The rehearsal Compose file must be inside its project directory.")
+    if (
+        config.project_dir == _REPO_ROOT
+        or config.project_dir.is_relative_to(_REPO_ROOT)
+        or _REPO_ROOT.is_relative_to(config.project_dir)
+    ):
+        raise BackupError(
+            "The rehearsal Compose project directory must be separate from the application "
+            "repository."
+        )
+    inferred_name = re.sub(r"[^a-z0-9_-]", "", config.project_dir.name.lower())
+    if inferred_name == project_name:
+        raise BackupError(
+            "The rehearsal project name must differ from the Compose directory-derived identity."
+        )
+    inherited_project = env.get("COMPOSE_PROJECT_NAME", "").strip()
+    if inherited_project and inherited_project != project_name:
+        raise BackupError(
+            "COMPOSE_PROJECT_NAME conflicts with the explicit rehearsal project identity."
+        )
+    return replace(config, compose_project_name=project_name, rehearsal=True)
 
 
 def _compose_text(config: BackupConfig, *arguments: str, stage: str) -> list[str]:
@@ -257,6 +333,8 @@ def _compose_text(config: BackupConfig, *arguments: str, stage: str) -> list[str
 
 
 def _restic_environment(config: BackupConfig) -> dict[str, str]:
+    if config.restic_password_file is None:
+        raise BackupError("RESTIC_PASSWORD_FILE is required for Restic operations.")
     environment = os.environ.copy()
     environment.pop("RESTIC_PASSWORD", None)
     environment.pop("RESTIC_PASSWORD_COMMAND", None)
@@ -358,6 +436,96 @@ def _service_container_ids(config: BackupConfig, service: str) -> list[str]:
         service,
         stage="Compose container lookup",
     )
+
+
+def _validate_rehearsal_compose_volumes(config: BackupConfig) -> None:
+    if not config.rehearsal or config.compose_project_name is None:
+        raise BackupError("The rehearsal Compose project identity was not validated.")
+    output = _checked_run(
+        _compose(config, "config", "--format", "json"),
+        stage="Rehearsal Compose configuration validation",
+        cwd=config.project_dir,
+    )
+    try:
+        effective_config = json.loads(output)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BackupError(
+            "The effective rehearsal Compose configuration could not be parsed."
+        ) from exc
+    if not isinstance(effective_config, dict):
+        raise BackupError("The effective rehearsal Compose configuration is invalid.")
+    if not isinstance(effective_config.get("services"), dict):
+        raise BackupError("The effective rehearsal Compose service declarations are invalid.")
+    volumes = effective_config.get("volumes", {})
+    if not isinstance(volumes, dict):
+        raise BackupError("The effective rehearsal Compose volume declarations are invalid.")
+    for volume in volumes.values():
+        if not isinstance(volume, dict):
+            raise BackupError("The effective rehearsal Compose volume declaration is invalid.")
+        if "external" in volume and volume["external"] is not False:
+            raise BackupError("External Compose volumes are refused for a capture-only rehearsal.")
+
+
+def _validate_rehearsal_containers(config: BackupConfig, services: set[str]) -> None:
+    project_name = config.compose_project_name
+    if not config.rehearsal or project_name is None:
+        raise BackupError("The rehearsal Compose project identity was not validated.")
+    template = (
+        '{{index .Config.Labels "com.docker.compose.project"}}{{"\\n"}}'
+        '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}{{"\\n"}}{{end}}'
+    )
+    for service in sorted(services):
+        for container_id in _service_container_ids(config, service):
+            lines = _decode_lines(
+                _checked_run(
+                    [
+                        config.docker_command,
+                        "inspect",
+                        "--format",
+                        template,
+                        container_id,
+                    ],
+                    stage="Rehearsal Compose project verification",
+                ),
+                "Rehearsal Compose project verification",
+            )
+            if not lines or lines[0] != project_name:
+                raise BackupError(
+                    "A rehearsal container does not carry the explicit disposable project label."
+                )
+            for mount in lines[1:]:
+                fields = mount.split("|", 2)
+                if len(fields) != 3:
+                    raise BackupError("A rehearsal container has an unrecognized mount.")
+                mount_type, volume_name, _source = fields
+                if mount_type == "bind":
+                    raise BackupError(
+                        "Rehearsal bind mounts are refused; use project-scoped named volumes."
+                    )
+                if mount_type == "tmpfs":
+                    continue
+                if mount_type != "volume" or not volume_name.startswith(f"{project_name}_"):
+                    raise BackupError(
+                        "A rehearsal container uses a non-project-scoped persistent volume."
+                    )
+                volume_project = _decode_lines(
+                    _checked_run(
+                        [
+                            config.docker_command,
+                            "volume",
+                            "inspect",
+                            "--format",
+                            '{{index .Labels "com.docker.compose.project"}}',
+                            volume_name,
+                        ],
+                        stage="Rehearsal volume ownership verification",
+                    ),
+                    "Rehearsal volume ownership verification",
+                )
+                if volume_project != [project_name]:
+                    raise BackupError(
+                        "A rehearsal volume is not labeled as owned by the disposable project."
+                    )
 
 
 def _container_mount_sources(config: BackupConfig, container_id: str) -> list[Path]:
@@ -582,8 +750,8 @@ def _safe_tar_info(info: tarfile.TarInfo) -> tarfile.TarInfo:
     return info
 
 
-def _capture_bundle(config: BackupConfig) -> Path:
-    _, initially_running, writer_services = _services(config)
+def _capture_bundle(config: BackupConfig, *, preserve_failed: bool = False) -> Path:
+    configured_services, initially_running, writer_services = _services(config)
     if config.storage_service not in writer_services:
         raise BackupError("The storage service must be one of the quiesced application services.")
 
@@ -595,6 +763,8 @@ def _capture_bundle(config: BackupConfig) -> Path:
     database_containers = _service_container_ids(config, config.db_service)
     if len(database_containers) != 1:
         raise BackupError("Exactly one configured PostgreSQL service container is required.")
+    if config.rehearsal:
+        _validate_rehearsal_containers(config, configured_services)
     _ensure_staging_outside_mounts(config, database_containers)
     _ensure_staging_outside_mounts(config, storage_containers)
     mount_sources = []
@@ -627,6 +797,10 @@ def _capture_bundle(config: BackupConfig) -> Path:
     os.chmod(temporary, 0o700)
     completed_bundle = config.staging_dir / bundle_name
     stopped = False
+    captured_bundle: Path | None = None
+    capture_error: BaseException | None = None
+    failed_bundle: Path | None = None
+    evidence_error: OSError | None = None
     try:
         running_writers = sorted(initially_running & writer_services)
         if running_writers:
@@ -739,40 +913,79 @@ def _capture_bundle(config: BackupConfig) -> Path:
             os.fsync(staging_descriptor)
         finally:
             os.close(staging_descriptor)
-        return completed_bundle
-    except BaseException:
+        captured_bundle = completed_bundle
+    except BaseException as exc:
+        capture_error = exc
         if temporary.exists():
-            shutil.rmtree(temporary, ignore_errors=True)
-        raise
-    finally:
-        if stopped and initially_running & writer_services:
+            if preserve_failed:
+                failed_bundle = config.staging_dir / (
+                    f"failed-capture-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-"
+                    f"{uuid.uuid4().hex[:8]}"
+                )
+                try:
+                    os.replace(temporary, failed_bundle)
+                except OSError as move_error:
+                    evidence_error = move_error
+                    failed_bundle = temporary
+            else:
+                shutil.rmtree(temporary, ignore_errors=True)
+        elif preserve_failed and completed_bundle.exists():
+            failed_bundle = config.staging_dir / (
+                f"failed-capture-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-"
+                f"{uuid.uuid4().hex[:8]}"
+            )
             try:
-                _checked_run(
-                    _compose(config, "start", *sorted(initially_running & writer_services)),
-                    stage="Application writer resumption",
-                    cwd=config.project_dir,
+                os.replace(completed_bundle, failed_bundle)
+            except OSError as move_error:
+                evidence_error = move_error
+                failed_bundle = completed_bundle
+
+    resume_error: BackupError | None = None
+    if stopped and initially_running & writer_services:
+        try:
+            _checked_run(
+                _compose(config, "start", *sorted(initially_running & writer_services)),
+                stage="Application writer resumption",
+                cwd=config.project_dir,
+            )
+            resumed = set(
+                _compose_text(
+                    config,
+                    "ps",
+                    "--status",
+                    "running",
+                    "--services",
+                    stage="Application writer resumption verification",
                 )
-                resumed = set(
-                    _compose_text(
-                        config,
-                        "ps",
-                        "--status",
-                        "running",
-                        "--services",
-                        stage="Application writer resumption verification",
-                    )
+            )
+            if not (initially_running & writer_services).issubset(resumed):
+                raise BackupError(
+                    "One or more previously running application services did not resume."
                 )
-                if not (initially_running & writer_services).issubset(resumed):
-                    raise BackupError(
-                        "One or more previously running application services did not resume."
-                    )
-            except BackupError as exc:
-                if completed_bundle.exists():
-                    raise BackupError(
-                        f"{exc} Local recovery bundle retained at {completed_bundle}; "
-                        "verify and start the previously running application services."
-                    ) from exc
-                raise
+        except BackupError as exc:
+            resume_error = exc
+
+    if capture_error is not None:
+        if not isinstance(capture_error, Exception):
+            raise capture_error
+        message = f"Capture failed: {capture_error}"
+        if failed_bundle is not None:
+            message += f" Partial capture evidence retained at {failed_bundle.resolve()}."
+        if evidence_error is not None:
+            message += f" Partial evidence could not be moved: {evidence_error}."
+        if resume_error is not None:
+            message += f" Writer resumption also failed: {resume_error}"
+        raise BackupError(message) from capture_error
+    if resume_error is not None:
+        if captured_bundle is not None:
+            raise BackupError(
+                f"{resume_error} Completed local recovery bundle retained at "
+                f"{captured_bundle.resolve()}."
+            ) from resume_error
+        raise resume_error
+    if captured_bundle is None:
+        raise BackupError("The capture finished without producing a recovery bundle.")
+    return captured_bundle
 
 
 def _verify_bundle(bundle: Path) -> dict[str, object]:
@@ -964,6 +1177,20 @@ def _perform_backup(config: BackupConfig) -> str:
         return snapshot_id
 
 
+def _capture_only(config: BackupConfig) -> Path:
+    _validate_rehearsal_compose_volumes(config)
+    with _backup_lock(config.staging_dir):
+        bundle = _capture_bundle(config, preserve_failed=True)
+        try:
+            _verify_bundle(bundle)
+        except BackupError as exc:
+            raise BackupError(
+                f"The local recovery bundle failed verification and was retained at "
+                f"{bundle.resolve()}."
+            ) from exc
+        return bundle.resolve()
+
+
 def _upload_pending(config: BackupConfig, bundle: Path) -> str:
     requested_bundle = bundle.expanduser()
     if requested_bundle.is_symlink():
@@ -998,6 +1225,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--execute",
         action="store_true",
         help="Capture and upload a recovery bundle. Without this flag, no commands are run.",
+    )
+    actions.add_argument(
+        "--capture-only",
+        action="store_true",
+        help="Capture and verify a local bundle for an explicitly isolated rehearsal; no Restic.",
     )
     actions.add_argument(
         "--upload-bundle",
@@ -1036,7 +1268,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{unhashed} have no application-recorded content hash."
             )
             return 0
-        config = BackupConfig.from_environment()
+        config = BackupConfig.from_environment(capture_only=args.capture_only)
+        if args.capture_only:
+            config = _rehearsal_config(config)
+            bundle = _capture_only(config)
+            print(f"Local recovery bundle captured and verified: {bundle}")
+            return 0
         if args.upload_bundle is not None:
             snapshot_id = _upload_pending(config, args.upload_bundle)
             print(f"Backup verified; retention applied. Snapshot: {snapshot_id[:12]}")

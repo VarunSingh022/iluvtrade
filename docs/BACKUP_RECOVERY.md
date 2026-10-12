@@ -72,8 +72,9 @@ Offsite upload and retention happen **after** the writers have resumed.
 
 ## Host configuration
 
-Install the Restic client and a Docker Compose-compatible Docker CLI on the
-future host. Run the module with the application Python environment. The local
+Install a Docker Compose-compatible Docker CLI on the future host. Install the
+Restic client for remote upload operations. Invoke the script with a compatible
+Python environment. The local
 staging directory must be on a filesystem with enough free space for a full
 database dump, full storage archive, and temporary copy; it must be outside the
 repository and outside the application data volumes. Local database dumps and
@@ -104,14 +105,19 @@ Required variables:
 
 | Variable | Purpose |
 |---|---|
-| `RESTIC_REPOSITORY` | B2 repository identifier in the form `b2:<bucket>:<prefix>`; use a repository dedicated to this deployment |
-| `RESTIC_PASSWORD_FILE` | Path to the separately protected Restic password file |
-| `B2_ACCOUNT_ID`, `B2_ACCOUNT_KEY` | Restricted B2 application-key credentials, supplied only to the process environment |
 | `ILUVTRADE_BACKUP_STAGING_DIR` | Absolute host path for private recovery bundles and the overlap lock; outside the project and data volumes |
 | `ILUVTRADE_BACKUP_STAGING_ENCRYPTED` | Must be `1` after independently confirming that the staging filesystem is encrypted at rest; acknowledgement only, not automatic detection |
-| `ILUVTRADE_BACKUP_TAG` | Explicit tag unique to this deployment; retention applies only to snapshots carrying this tag |
 | `ILUVTRADE_BACKUP_DEPLOYMENT_ID` | Canonical UUID generated once for this deployment; non-secret ownership tag, never reuse or copy to another deployment |
 | `ILUVTRADE_BACKUP_APP_COMMIT` | Full Git commit hash of the application version actually deployed |
+
+Remote upload operations additionally require:
+
+| Variable | Purpose |
+|---|---|
+| `RESTIC_REPOSITORY` | B2 repository identifier in the form `b2:<bucket>:<prefix>`; use a repository dedicated to this deployment |
+| `RESTIC_PASSWORD_FILE` | Path to the separately protected Restic password file; regular file, mode `0600` or stricter |
+| `B2_ACCOUNT_ID`, `B2_ACCOUNT_KEY` | Restricted B2 application-key credentials, supplied only to the process environment |
+| `ILUVTRADE_BACKUP_TAG` | Explicit tag unique to this deployment; retention applies only to snapshots carrying this tag |
 
 Optional variables:
 
@@ -125,15 +131,41 @@ Optional variables:
 | `ILUVTRADE_BACKUP_STOP_TIMEOUT` | `60` | Graceful Compose stop timeout in seconds, from 5 to 600 |
 | `ILUVTRADE_BACKUP_DOCKER`, `ILUVTRADE_BACKUP_RESTIC` | `docker`, `restic` | Executable names or paths |
 
+Capture-only rehearsal additionally requires these explicit isolation settings:
+
+| Variable | Requirement |
+|---|---|
+| `ILUVTRADE_BACKUP_PROJECT_DIR` | Absolute directory for the disposable Compose project, outside and separate from this application repository |
+| `ILUVTRADE_BACKUP_COMPOSE_FILE` | Absolute Compose file inside that dedicated project directory |
+| `ILUVTRADE_BACKUP_REHEARSAL_PROJECT_NAME` | Unique `iluvtrade-rehearsal-<lowercase UUID>` identity; it is passed explicitly to every Compose command and may not equal the directory-derived project name |
+| `ILUVTRADE_BACKUP_REHEARSAL_ISOLATION_CONFIRMED` | Must be `1` only after confirming the Docker context, project, database, volumes, and storage are disposable |
+
+The separate project directory must include the matching Compose file and
+`backend/pyproject.toml` used to record the application version. Its Compose
+environment file, if needed, must contain only synthetic rehearsal settings;
+the script does not copy or log that file.
+
+Before capture starts, the script obtains the effective, interpolated Compose
+configuration as JSON internally and rejects named volumes declared as
+external. The resolved configuration is not logged or printed. It then checks
+that rehearsal containers carry the explicit Compose project label, rejects
+bind mounts and volumes not named and labeled for that project, and verifies
+that staging does not overlap container mounts. The project name, labels, and
+confirmation flag do not prove that the Docker daemon itself is disposable or
+that its volumes contain no valuable data. The operator must positively
+identify the Docker context and project data before capture; stop if any
+boundary is uncertain. The isolated Compose directory must not reuse the
+application's `.env` or volume declarations that name external/shared data.
+
 Restic reads its repository password from the password file and uses B2's
 standard environment variables. Neither credentials nor the repository name
 are passed as shell-expanded command text or printed by the script. Docker
 daemon access is highly privileged; grant it only to the trusted host service
 that runs the backup.
 
-Initialize the Restic repository once, under the protected host configuration,
-using the installed Restic client. Do not let a scheduled job silently
-initialize an absent or mistyped repository.
+For remote upload, initialize the Restic repository once, under the protected
+host configuration, using the installed Restic client. Do not let a scheduled
+job silently initialize an absent or mistyped repository.
 
 ## Running a backup
 
@@ -153,9 +185,27 @@ action:
 <python> /path/to/iluvtrade/scripts/backup_recovery.py --execute
 ```
 
-The process takes an exclusive `flock` in the private staging directory. It
-validates Restic repository access before downtime, discovers Compose services
-and running containers, verifies the storage mount, stops all currently
+For an isolated local rehearsal, capture and verify a bundle without invoking
+Restic, B2, upload, retention, or completed-bundle cleanup:
+
+```text
+<python> /path/to/iluvtrade/scripts/backup_recovery.py --capture-only
+```
+
+This mode requires the explicit rehearsal project directory, Compose file,
+UUID-scoped project name, and isolation confirmation above. It validates the
+local bundle checksums and storage archive before printing its absolute path
+inside the staging directory. Successful bundles remain there. If capture
+fails after staging begins, the partial files are retained under a
+`failed-capture-*` directory for diagnosis; services that were running before
+capture are resumed, and any resume error is reported alongside the original
+capture failure. Capture-only does not need the Restic password file or B2
+credentials; upload modes continue to validate the Restic password-file
+permissions and deployment-scoped snapshot ownership before retention.
+
+For `--execute`, the process takes an exclusive `flock` in the private staging
+directory. It validates Restic repository access before downtime, discovers
+Compose services and running containers, verifies the storage mount, stops all currently
 running non-database services, checks for remaining database clients, captures
 the dump and storage, writes checksums/manifest, then resumes the services.
 Restic encrypts the completed bundle client-side before upload. Each snapshot
