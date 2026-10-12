@@ -12,7 +12,7 @@ import json
 import pyotp
 import pytest
 
-from iluvtrade.platform import accounts, mfa
+from iluvtrade.platform import accounts, mfa, security
 from tests.conftest import make_principal, register
 
 pytestmark = pytest.mark.security
@@ -149,6 +149,52 @@ def test_a_code_cannot_be_replayed(db) -> None:
 
     with pytest.raises(mfa.MfaError, match="already been used"):
         mfa.verify_challenge(user, code)
+
+
+def test_login_rejects_a_totp_if_the_stored_secret_changed_after_loading(
+    db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sqlalchemy import func, select, update
+
+    from iluvtrade.db.models.platform import Session, User
+
+    user = _user(db, "stale-mfa-secret@example.com")
+    enrolment = mfa.begin_enrolment(user)
+    mfa.confirm_enrolment(user, _code(enrolment.secret))
+    user.mfa_last_counter = None
+    db.commit()
+
+    session_count = db.scalar(
+        select(func.count()).select_from(Session).where(Session.user_id == user.id)
+    )
+    original_verify_password = security.verify_password
+    changed_secret = False
+
+    def change_secret_after_password_check(stored: str, supplied: str) -> bool:
+        nonlocal changed_secret
+        password_matches = original_verify_password(stored, supplied)
+        if password_matches and not changed_secret:
+            db.connection().execute(
+                update(User).where(User.id == user.id).values(mfa_secret=b"changed factor")
+            )
+            changed_secret = True
+        return password_matches
+
+    monkeypatch.setattr(security, "verify_password", change_secret_after_password_check)
+    with pytest.raises(accounts.AuthError, match="verification code"):
+        accounts.login(
+            db,
+            email="stale-mfa-secret@example.com",
+            password=PASSWORD,
+            mfa_code=_code(enrolment.secret),
+        )
+
+    assert changed_secret
+    assert (
+        db.scalar(select(func.count()).select_from(Session).where(Session.user_id == user.id))
+        == session_count
+    )
 
 
 def test_a_wrong_code_is_refused(db) -> None:

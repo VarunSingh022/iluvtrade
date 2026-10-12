@@ -36,6 +36,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pyotp
+from sqlalchemy import update
+from sqlalchemy.orm import object_session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from iluvtrade.brokers.crypto import CredentialError, decrypt_credentials, encrypt_credentials
 from iluvtrade.db.base import utcnow
@@ -180,6 +183,11 @@ def verify_challenge(user: User, code: str) -> str:
     if not is_enabled(user):
         raise MfaError("Two-factor authentication is not enabled on this account.")
 
+    expected_secret = user.mfa_secret
+    expected_enabled_at = user.mfa_enabled_at
+    if expected_secret is None or expected_enabled_at is None:
+        raise MfaError("Two-factor authentication is not enabled on this account.")
+
     supplied = _normalise(code)
     totp = pyotp.TOTP(_secret_of(user))
 
@@ -187,11 +195,28 @@ def verify_challenge(user: User, code: str) -> str:
         counter = _counter(totp, supplied)
         if counter is None:
             raise MfaError("That code is not valid.")
-        if user.mfa_last_counter is not None and counter <= user.mfa_last_counter:
-            # The same code is valid for its whole window; without this, one
-            # observed code could be used more than once inside it.
+        session = object_session(user)
+        if session is None:
+            raise MfaError("The account must be attached to a database transaction.")
+        # Core connection execution bypasses the ORM's normal autoflush.
+        session.flush()
+        consumed = session.connection().execute(
+            update(User)
+            .where(
+                User.id == user.id,
+                User.mfa_enabled_at.is_not(None),
+                User.mfa_enabled_at == expected_enabled_at,
+                User.mfa_secret == expected_secret,
+                (User.mfa_last_counter.is_(None)) | (User.mfa_last_counter < counter),
+            )
+            .values(mfa_last_counter=counter)
+        )
+        if consumed.rowcount != 1:
+            # The conditional UPDATE arbitrates concurrent requests against
+            # the database's current row, not this session's possibly stale
+            # ORM object.
             raise MfaError("That code has already been used. Wait for the next one.")
-        user.mfa_last_counter = counter
+        set_committed_value(user, "mfa_last_counter", counter)
         return "totp"
 
     hashes: list[str] = json.loads(user.mfa_recovery_hashes or "[]")
@@ -200,7 +225,25 @@ def verify_challenge(user: User, code: str) -> str:
             # Single use: remove it before returning, so a replayed recovery
             # code fails even if the same request is repeated.
             del hashes[index]
-            user.mfa_recovery_hashes = json.dumps(hashes)
+            updated_hashes = json.dumps(hashes)
+            session = object_session(user)
+            if session is None:
+                raise MfaError("The account must be attached to a database transaction.")
+            # Flush pending state before the conditional UPDATE reads the row.
+            session.flush()
+            consumed = session.connection().execute(
+                update(User)
+                .where(
+                    User.id == user.id,
+                    User.mfa_enabled_at.is_not(None),
+                    User.mfa_secret.is_not(None),
+                    User.mfa_recovery_hashes == user.mfa_recovery_hashes,
+                )
+                .values(mfa_recovery_hashes=updated_hashes)
+            )
+            if consumed.rowcount != 1:
+                raise MfaError("That code is not valid.")
+            set_committed_value(user, "mfa_recovery_hashes", updated_hashes)
             return "recovery"
 
     raise MfaError("That code is not valid.")
