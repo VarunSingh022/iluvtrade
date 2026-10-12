@@ -16,7 +16,7 @@ Postgres database and a persistent volume.
 | A shared rate-limit store, or a single worker | The application limiter is per-process, so N workers means N x the limit. |
 | Rate limiting at the proxy too | The application limits per principal; the proxy should limit per address. |
 | `alembic upgrade head` before every start | The schema is the migrations', and production will not create tables. |
-| A backup of the storage root | Canonical datasets and run artifacts are files, and losing them makes every run unreproducible. |
+| A coordinated database-and-storage backup | Configure and schedule the host-side workflow in [BACKUP_RECOVERY.md](BACKUP_RECOVERY.md); losing files referenced by database rows makes runs unreproducible. |
 
 ## Configuration
 
@@ -387,6 +387,12 @@ Three decisions worth knowing:
 
 # Backup and recovery
 
+For the single-VPS PostgreSQL Compose deployment, use the coordinated,
+host-side [backup and recovery runbook](BACKUP_RECOVERY.md). The tooling is
+implemented in the repository but has **not** been installed, scheduled, or
+run against a production host. A successful test suite is not evidence of a
+real Docker capture, B2 upload, or restore.
+
 ## SQLite
 
 ```bash
@@ -415,31 +421,23 @@ is taken rather than when it is needed.
 
 ## PostgreSQL
 
-```bash
-pg_dump --format=custom --file=/backups/iluvtrade-$(date +%F).dump "$ILUVTRADE_DATABASE_URL"
-pg_restore --clean --if-exists --dbname="$ILUVTRADE_DATABASE_URL" /backups/…dump
-```
-
-`iluvtrade backup` prints this rather than running it. Shelling out to `pg_dump`
-means depending on a tool that may be absent or version-mismatched with the
-server, and passing a URL containing a password as a process argument puts it in
-every process listing on the host.
+The existing `iluvtrade backup` command supports SQLite only. For Compose
+PostgreSQL, the host-side workflow runs `pg_dump` inside the configured database
+service, keeps PostgreSQL available, and coordinates the dump with the storage
+root. Do not pass a password-bearing database URL as a `pg_dump` process
+argument; follow [BACKUP_RECOVERY.md](BACKUP_RECOVERY.md).
 
 ## Restoring
 
-1. Stop the application. A restore under a running process is a torn database.
-2. Move the damaged file aside — never delete it. It is evidence, and a
-   corrupt database still contains most of the data.
-3. Put the backup in place.
-4. **Run `alembic upgrade head`.** A backup carries the schema revision it was
-   taken at. If the application has since been upgraded, the restored database
-   is behind and every query against a newer column fails.
-5. `alembic current` — confirm the revision.
-6. Start, and check `/api/health`.
+Use the isolated restore rehearsal in [BACKUP_RECOVERY.md](BACKUP_RECOVERY.md)
+before relying on a recovery point. Never rehearse over production data. For
+actual recovery, preserve the damaged resources, restore the matching database
+and storage recovery point into controlled replacement resources, confirm the
+captured schema revision and required application key versions, then follow the
+documented application migration and health-check process.
 
-The restore path was exercised during the audit: a backup taken from a live
-database was opened as the application's database, reported revision
-`0005_teams_and_reset`, and its rows read back through the ORM.
+The prior restore evidence applies to SQLite only. The new PostgreSQL/Restic
+restore procedure remains unverified until an isolated rehearsal completes.
 
 ## What recovery does and does not give back
 
@@ -453,10 +451,12 @@ database was opened as the application's database, reported revision
 That last row is the one that costs people a weekend. Back up the secret key
 with the same seriousness as the database, and separately from it.
 
-## Not implemented
+## Operational status
 
-Scheduling, retention, offsite replication, and a rehearsed disaster-recovery
-drill. The commands above are correct and tested; nothing runs them for you.
+Host scheduling, retention execution, offsite replication, alert configuration,
+and a rehearsed disaster-recovery drill are not active. The documented
+PostgreSQL/Restic tooling is repository code only; an operator must configure
+and verify it on the deployment host.
 
 ---
 

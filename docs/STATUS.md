@@ -128,7 +128,7 @@ operated, load-tested, penetration-tested, or run against a real venue.
 | (c) PostgreSQL — application suite | TESTED LOCALLY | Against PostgreSQL 16.15 on this machine (2026-10-11), each test on its own database cloned from a template `alembic upgrade head` built, with a per-test assertion that the engine is PostgreSQL and connected to that database (`ILUVTRADE_TEST_DATABASE_URL`; `docs/DEPLOYMENT.md`). `pytest -q -m "not postgres"` → **574 passed, 13 deselected**; `pytest -q tests/postgres` → **13 passed**; `pytest -q` (both) → **587 passed** = 574 + 13. 0 failed, 0 skipped; no test database or connection left afterwards. It found defects SQLite hid (a worker-freezing upload route, colliding audit appends, a 32-bit seed, NUL → 500, a baseline downgrade dropping indexes it did not own). **Not yet run in CI**: the CI step that claimed this before ran on SQLite, because an autouse fixture replaced the URL |
 | PostgreSQL driver | IMPLEMENTED | `pip install -e ".[postgres]"`. It was installed by the Dockerfile and absent from `pyproject.toml`, so the documented production path failed with `ModuleNotFoundError` |
 | **Backup (SQLite)** | **TESTED LOCALLY** | `iluvtrade backup --verify` uses SQLite's online backup API — taken against a *live, running* deployment and restored from |
-| Backup (PostgreSQL) | NOT IMPLEMENTED | The command prints the `pg_dump` invocation rather than shelling out to a tool that may be absent or version-mismatched |
+| **Backup (PostgreSQL / Compose)** | **TOOLING IMPLEMENTED, NOT DEPLOYED** | `iluvtrade.backup_recovery` coordinates Compose writer quiescence, PostgreSQL dump, storage capture, and Restic/B2 retention. Host credentials, schedule, alerting, real upload, and restore rehearsal are not configured or verified; see `docs/BACKUP_RECOVERY.md` |
 
 ## Frontend
 
@@ -165,8 +165,8 @@ operated, load-tested, penetration-tested, or run against a real venue.
 ## Not addressed at all
 
 Load testing, penetration testing, log aggregation, metrics/tracing, alerting,
-automated backup scheduling, disaster-recovery rehearsal, data retention and
-erasure, and multi-node deployment.
+host backup scheduling and alert configuration, disaster-recovery rehearsal,
+data retention and erasure, and multi-node deployment.
 
 ## The five things this build will not do, and why
 
