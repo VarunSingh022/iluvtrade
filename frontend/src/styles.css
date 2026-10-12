@@ -16,6 +16,7 @@
   --text-faint: #8b8b96;
 
   --accent: #2f5bd4;
+  --accent-button: #2f5bd4;
   --accent-soft: #eaf0ff;
 
   --ok: #17794a;
@@ -185,10 +186,19 @@ button, .btn {
   color: var(--text);
   cursor: pointer;
 }
-button:hover:not(:disabled), .btn:hover { background: var(--surface-2); text-decoration: none; }
+button:hover:not(:disabled), .btn:hover:not(:disabled) { background: var(--surface-2); text-decoration: none; }
+button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
-button.primary, .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+button.primary, .btn.primary { background: var(--accent-button); border-color: var(--accent-button); color: #fff; }
+button.primary:hover:not(:disabled), .btn.primary:hover:not(:disabled),
+button.primary:focus-visible, .btn.primary:focus-visible,
+button.primary:active:not(:disabled), .btn.primary:active:not(:disabled) {
+  background: var(--accent-button);
+  border-color: var(--accent-button);
+  color: #fff;
+}
+button.primary:hover:not(:disabled), .btn.primary:hover:not(:disabled) { filter: brightness(0.92); }
+button.primary:active:not(:disabled), .btn.primary:active:not(:disabled) { filter: brightness(0.84); }
 button.danger { background: var(--err); border-color: var(--err); color: #fff; }
 button.small { padding: 0.25rem 0.55rem; font-size: 0.78rem; }
 
