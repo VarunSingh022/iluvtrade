@@ -49,8 +49,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session as DbSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from iluvtrade.db.base import utcnow
 from iluvtrade.db.models.platform import PasswordResetToken, Session, User, UserStatus
@@ -254,10 +255,9 @@ def consume(
     that may have been stolen and is the reason the reset is happening.
     """
 
+    token_hash = security.hash_token(token)
     row = session.execute(
-        select(PasswordResetToken).where(
-            PasswordResetToken.token_hash == security.hash_token(token)
-        )
+        select(PasswordResetToken).where(PasswordResetToken.token_hash == token_hash)
     ).scalar_one_or_none()
     now = utcnow()
     if row is None or row.consumed_at is not None or row.expires_at <= now:
@@ -271,7 +271,20 @@ def consume(
     # locked out of their own reset by a typo.
     password_hash = security.hash_password(new_password)
 
-    row.consumed_at = now
+    now = utcnow()
+    claimed = session.connection().execute(
+        update(PasswordResetToken)
+        .where(
+            PasswordResetToken.id == row.id,
+            PasswordResetToken.token_hash == token_hash,
+            PasswordResetToken.consumed_at.is_(None),
+            PasswordResetToken.expires_at > now,
+        )
+        .values(consumed_at=now)
+    )
+    if claimed.rowcount != 1:
+        raise ResetError("That reset link is not valid. Request a new one.")
+    set_committed_value(row, "consumed_at", now)
     user.password_hash = password_hash
 
     revoked = 0
