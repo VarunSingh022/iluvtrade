@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import stat
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from iluvtrade import backup_recovery as backup
+_BACKUP_SPEC = importlib.util.spec_from_file_location(
+    "iluvtrade_backup_recovery",
+    Path(__file__).resolve().parents[3] / "scripts" / "backup_recovery.py",
+)
+assert _BACKUP_SPEC is not None and _BACKUP_SPEC.loader is not None
+backup = importlib.util.module_from_spec(_BACKUP_SPEC)
+sys.modules[_BACKUP_SPEC.name] = backup
+_BACKUP_SPEC.loader.exec_module(backup)
 
 
 @pytest.fixture

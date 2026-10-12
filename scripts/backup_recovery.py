@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import IO
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 _SERVICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _MANIFEST_NAME = "manifest.json"
 _CHECKSUMS_NAME = "storage-checksums.jsonl"

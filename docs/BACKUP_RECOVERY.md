@@ -2,10 +2,13 @@
 
 ## Status and scope
 
-`iluvtrade.backup_recovery` is host-side tooling for the initial single-VPS
-Compose deployment. It is **not scheduled, provisioned, or verified against the
-live deployment**. It has not performed a real Docker capture, Restic upload, or
-restore. Repository tests mock Docker and Restic.
+`scripts/backup_recovery.py` is standalone host-side tooling for the initial
+single-VPS Compose deployment. It deliberately lives outside the
+`backend/iluvtrade` runtime package: its Docker/Restic subprocess calls and
+host-side staging file operations are not application request-path behavior.
+It is **not scheduled, provisioned, or verified against the live deployment**.
+It has not performed a real Docker capture, Restic upload, or restore.
+Repository tests mock Docker and Restic.
 
 The design uses the existing PostgreSQL service and file-backed storage. It
 does not move data to object storage. It uses Restic's client-side encryption
@@ -134,18 +137,20 @@ initialize an absent or mistyped repository.
 
 ## Running a backup
 
-The default invocation is a configuration-only dry run. It does not call
-Docker, PostgreSQL, or Restic:
+Invoke the script by its repository path (preferably an absolute path); it does
+not need to be installed as an application module or run from a particular
+working directory. The default invocation is a configuration-only dry run. It
+does not call Docker, PostgreSQL, or Restic:
 
 ```text
-<python> -m iluvtrade.backup_recovery
+<python> /path/to/iluvtrade/scripts/backup_recovery.py
 ```
 
 An actual coordinated capture and upload requires the explicit `--execute`
 action:
 
 ```text
-<python> -m iluvtrade.backup_recovery --execute
+<python> /path/to/iluvtrade/scripts/backup_recovery.py --execute
 ```
 
 The process takes an exclusive `flock` in the private staging directory. It
@@ -175,7 +180,7 @@ If upload or retention fails, the local bundle is retained. After correcting
 the external failure, retry that exact bundle explicitly:
 
 ```text
-<python> -m iluvtrade.backup_recovery --upload-bundle <absolute-bundle-path>
+<python> /path/to/iluvtrade/scripts/backup_recovery.py --upload-bundle <absolute-bundle-path>
 ```
 
 That operation verifies local checksums and does not stop Compose services. A
@@ -259,7 +264,7 @@ volumes.
    verification before extracting or restoring:
 
    ```text
-   <python> -m iluvtrade.backup_recovery --verify-bundle <restored-bundle>
+   <python> /path/to/iluvtrade/scripts/backup_recovery.py --verify-bundle <restored-bundle>
    ```
 
    This validates the database-dump checksum, storage archive checksum,
@@ -295,7 +300,7 @@ volumes.
    DB-recorded digest with the bundle's storage inventory:
 
    ```text
-   <python> -m iluvtrade.backup_recovery --verify-references \
+   <python> /path/to/iluvtrade/scripts/backup_recovery.py --verify-references \
      <bundle>/storage-checksums.jsonl <scratch>/database-references.tsv
    ```
 
