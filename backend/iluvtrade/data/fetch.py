@@ -13,7 +13,9 @@ DNS-resolution address check  Every resolved address is checked against the
                               private, loopback, link-local, multicast and
                               reserved ranges *before* connecting, which is
                               what stops a public hostname pointing at
-                              ``169.254.169.254`` or ``10.0.0.1``.
+                              ``169.254.169.254`` or ``10.0.0.1``. The checked
+                              addresses are pinned into the transport so the
+                              connection cannot resolve the hostname again.
 Redirect policy               Redirects are followed manually, at most
                               ``fetch_max_redirects`` times, and **every hop is
                               re-validated**. A permitted host redirecting to
@@ -40,10 +42,13 @@ import gzip
 import ipaddress
 import socket
 import zlib
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
+from typing import NoReturn
 from urllib.parse import urlparse
 
+import httpcore
 import httpx
 
 from iluvtrade.config import Settings
@@ -77,6 +82,154 @@ class FetchResult:
     content_type: str | None
     retrieved_at: datetime
     redirect_chain: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedDestination:
+    hostname: str
+    port: int
+    addresses: tuple[str, ...]
+
+
+class _PinnedSyncBackend(httpcore.SyncBackend):
+    """Connect only to the addresses validated for the current request hop."""
+
+    def __init__(self) -> None:
+        self._addresses: dict[tuple[str, int], tuple[str, ...]] = {}
+
+    def pin(self, hostname: str, port: int, addresses: tuple[str, ...]) -> None:
+        self._addresses[(_host_key(hostname), port)] = addresses
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.NetworkStream:
+        addresses = self._addresses.get((_host_key(host), port))
+        if not addresses:
+            raise httpcore.ConnectError(f"No validated addresses for {host!r}:{port}.")
+
+        last_error: httpcore.ConnectError | httpcore.ConnectTimeout | None = None
+        for address in addresses:
+            try:
+                return super().connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
+                last_error = exc
+
+        if last_error is None:
+            raise httpcore.ConnectError(f"No validated addresses for {host!r}:{port}.")
+        raise last_error
+
+
+class _PinnedResponseStream(httpx.SyncByteStream):
+    def __init__(self, response: httpcore.Response) -> None:
+        self._response = response
+
+    def __iter__(self) -> Iterator[bytes]:
+        try:
+            yield from self._response.iter_stream()
+        except Exception as exc:
+            _raise_httpx_exception(exc)
+
+    def close(self) -> None:
+        try:
+            self._response.close()
+        except Exception as exc:
+            _raise_httpx_exception(exc)
+
+
+class _PinnedHTTPTransport(httpx.BaseTransport):
+    """HTTPX transport extension backed by a pool using validated IPs."""
+
+    def __init__(self, backend: _PinnedSyncBackend) -> None:
+        limits = httpx.Limits()
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=httpx.create_ssl_context(),
+            max_connections=limits.max_connections,
+            max_keepalive_connections=limits.max_keepalive_connections,
+            keepalive_expiry=limits.keepalive_expiry,
+            network_backend=backend,
+        )
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        core_request = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
+        )
+        try:
+            response = self._pool.handle_request(core_request)
+        except Exception as exc:
+            _raise_httpx_exception(exc)
+        return httpx.Response(
+            status_code=response.status,
+            headers=response.headers,
+            stream=_PinnedResponseStream(response),
+            extensions=response.extensions,
+            request=request,
+        )
+
+    def close(self) -> None:
+        try:
+            self._pool.close()
+        except Exception as exc:
+            _raise_httpx_exception(exc)
+
+
+_HTTPCORE_HTTPX_EXCEPTIONS: dict[type[Exception], type[httpx.HTTPError]] = {
+    httpcore.ConnectTimeout: httpx.ConnectTimeout,
+    httpcore.ReadTimeout: httpx.ReadTimeout,
+    httpcore.WriteTimeout: httpx.WriteTimeout,
+    httpcore.PoolTimeout: httpx.PoolTimeout,
+    httpcore.TimeoutException: httpx.TimeoutException,
+    httpcore.ConnectError: httpx.ConnectError,
+    httpcore.ReadError: httpx.ReadError,
+    httpcore.WriteError: httpx.WriteError,
+    httpcore.NetworkError: httpx.NetworkError,
+    httpcore.ProxyError: httpx.ProxyError,
+    httpcore.UnsupportedProtocol: httpx.UnsupportedProtocol,
+    httpcore.LocalProtocolError: httpx.LocalProtocolError,
+    httpcore.RemoteProtocolError: httpx.RemoteProtocolError,
+    httpcore.ProtocolError: httpx.ProtocolError,
+}
+
+
+def _raise_httpx_exception(error: Exception) -> NoReturn:
+    mapped_type: type[httpx.HTTPError] | None = None
+    for core_type, httpx_type in _HTTPCORE_HTTPX_EXCEPTIONS.items():
+        if isinstance(error, core_type) and (
+            mapped_type is None or issubclass(httpx_type, mapped_type)
+        ):
+            mapped_type = httpx_type
+    if mapped_type is None:
+        raise error
+    raise mapped_type(str(error)) from error
+
+
+def _host_key(hostname: str) -> str:
+    """Canonical key shared by URL parsing and the HTTP transport."""
+
+    hostname = hostname.strip("[]")
+    try:
+        return ipaddress.ip_address(hostname).compressed
+    except ValueError:
+        return hostname.encode("idna").decode("ascii").lower()
 
 
 #: Ranges that must never be reached, stated explicitly.
@@ -151,9 +304,7 @@ def _is_public_address(address: str) -> bool:
     )
 
 
-def validate_url(url: str, settings: Settings) -> str:
-    """Refuse a URL this deployment must not fetch. Returns the hostname."""
-
+def _validated_destination(url: str, settings: Settings) -> _ValidatedDestination:
     parsed = urlparse(url)
     if parsed.scheme.lower() not in _ALLOWED_SCHEMES:
         raise FetchError(
@@ -186,13 +337,16 @@ def validate_url(url: str, settings: Settings) -> str:
         raise FetchError(f"Host {host!r} is not in this deployment's data-source allowlist.")
 
     try:
-        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        infos = socket.getaddrinfo(host, port)
     except socket.gaierror as exc:
         raise FetchError(f"Host {host!r} could not be resolved.") from exc
 
     # ``getaddrinfo`` types its sockaddr loosely; only the string forms are
     # addresses, and anything else is not something to connect to anyway.
-    addresses = {str(info[4][0]) for info in infos if isinstance(info[4][0], str)}
+    addresses = tuple(
+        dict.fromkeys(str(info[4][0]) for info in infos if isinstance(info[4][0], str))
+    )
     if not addresses:
         raise FetchError(f"Host {host!r} resolved to no addresses.")
     for address in addresses:
@@ -204,7 +358,13 @@ def validate_url(url: str, settings: Settings) -> str:
             f"Host {host!r} resolves to {address}, which is not a public address. "
             "Fetching it could reach an internal service."
         )
-    return host
+    return _ValidatedDestination(host, port, addresses)
+
+
+def validate_url(url: str, settings: Settings) -> str:
+    """Refuse a URL this deployment must not fetch. Returns the hostname."""
+
+    return _validated_destination(url, settings).hostname
 
 
 def _decompress(body: bytes, encoding: str | None, limit: int) -> bytes:
@@ -235,14 +395,19 @@ def fetch_csv(url: str, settings: Settings) -> FetchResult:
     requested = url
     chain: list[str] = []
     current = url
+    backend = _PinnedSyncBackend()
 
     with httpx.Client(
+        transport=_PinnedHTTPTransport(backend),
         follow_redirects=False,
         timeout=httpx.Timeout(settings.fetch_timeout_seconds),
         headers={"User-Agent": "iluvtrade-data-fetcher/0.1", "Accept-Encoding": "gzip, deflate"},
+        # A proxy would resolve the URL hostname outside the pinned backend.
+        trust_env=False,
     ) as client:
-        for _hop in range(settings.fetch_max_redirects + 1):
-            validate_url(current, settings)
+        for _ in range(settings.fetch_max_redirects + 1):
+            destination = _validated_destination(current, settings)
+            backend.pin(destination.hostname, destination.port, destination.addresses)
             try:
                 with client.stream("GET", current) as response:
                     if response.is_redirect:

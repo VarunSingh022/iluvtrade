@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import socket
+import ssl
 import threading
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 import pytest
 
 from iluvtrade.common import storage
 from iluvtrade.config import Settings
+from iluvtrade.data import fetch as fetch_module
 from iluvtrade.data.fetch import FetchError, fetch_csv, validate_url
 from tests.support import session_date_ist
 
@@ -191,6 +196,13 @@ class _Server(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/identity":
+            body = f"{self.server.server_address[0]} {self.headers['Host']}\n".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
@@ -224,6 +236,154 @@ def test_an_allowed_source_is_fetched(local_server: int) -> None:
     result = fetch_csv(f"http://127.0.0.1:{local_server}/ok", _loopback_settings(local_server))
     assert b"ACME" in result.content
     assert result.content_type.startswith("text/csv")
+
+
+def test_dns_rebinding_cannot_change_the_connected_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changing hostname remains pinned to the address checked for this hop."""
+
+    server = HTTPServer(("127.0.0.1", 0), _Server)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    original_getaddrinfo = socket.getaddrinfo
+    lookups = 0
+
+    def changing_dns(host: str, port: int, *args, **kwargs):
+        nonlocal lookups
+        if host == "data.example.com":
+            lookups += 1
+            resolved = "127.0.0.1" if lookups == 1 else "127.0.0.2"
+            return original_getaddrinfo(resolved, port, *args, **kwargs)
+        return original_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(fetch_module.socket, "getaddrinfo", changing_dns)
+    try:
+        result = fetch_csv(
+            f"http://data.example.com:{server.server_port}/identity",
+            _settings(
+                fetch_allowed_hosts=("data.example.com",),
+                fetch_allow_loopback=True,
+                fetch_allowed_ports=(server.server_port,),
+            ),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert lookups == 1
+    assert result.content == f"127.0.0.1 data.example.com:{server.server_port}\n".encode()
+
+
+@pytest.mark.parametrize("address", ["93.184.216.34", "2001:4860:4860::8888"])
+def test_transport_passes_the_validated_ipv4_or_ipv6_literal(
+    monkeypatch: pytest.MonkeyPatch,
+    address: str,
+) -> None:
+    backend = fetch_module._PinnedSyncBackend()
+    connected: list[tuple[str, int]] = []
+    stream = object()
+
+    def connect_tcp(_backend, host, port, **_kwargs):
+        connected.append((host, port))
+        return stream
+
+    monkeypatch.setattr(fetch_module.httpcore.SyncBackend, "connect_tcp", connect_tcp)
+    backend.pin("data.example.com", 443, (address,))
+
+    assert backend.connect_tcp("data.example.com", 443) is stream
+    assert connected == [(address, 443)]
+
+
+def test_pinned_https_keeps_hostname_for_sni_and_certificate_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The socket is pinned while HTTPX still validates the original hostname."""
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "data.example.com")])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=1))
+        .not_valid_after(datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("data.example.com")]),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    certificate_path = tmp_path / "server.pem"
+    key_path = tmp_path / "server-key.pem"
+    certificate_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(certificate_path, key_path)
+    received_sni: list[str | None] = []
+    server_context.set_servername_callback(
+        lambda _socket, hostname, _context: received_sni.append(hostname)
+    )
+    server = HTTPServer(("127.0.0.1", 0), _Server)
+    server.socket = server_context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    original_getaddrinfo = socket.getaddrinfo
+
+    def resolve_to_localhost(host: str, port: int, *args, **kwargs):
+        if host in {"data.example.com", "other.example.com"}:
+            host = "127.0.0.1"
+        return original_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(fetch_module.socket, "getaddrinfo", resolve_to_localhost)
+    monkeypatch.setattr(
+        "httpx.create_ssl_context",
+        lambda: ssl.create_default_context(cafile=str(certificate_path)),
+    )
+    try:
+        result = fetch_csv(
+            f"https://data.example.com:{server.server_port}/identity",
+            _settings(
+                fetch_allowed_hosts=("data.example.com",),
+                fetch_allow_loopback=True,
+                fetch_allowed_ports=(server.server_port,),
+            ),
+        )
+        with pytest.raises(FetchError, match="could not be reached"):
+            fetch_csv(
+                f"https://other.example.com:{server.server_port}/identity",
+                _settings(
+                    fetch_allowed_hosts=("other.example.com",),
+                    fetch_allow_loopback=True,
+                    fetch_allowed_ports=(server.server_port,),
+                ),
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert result.content == f"127.0.0.1 data.example.com:{server.server_port}\n".encode()
+    assert received_sni == ["data.example.com", "other.example.com"]
 
 
 def test_an_oversized_response_is_refused(local_server: int) -> None:
