@@ -46,6 +46,7 @@ from alphalab.market import (
     MarketValidationError,
     NormalizationPolicy,
     TimeFrame,
+    is_valid_timestamp,
     normalize_wire_bar,
 )
 
@@ -55,6 +56,7 @@ __all__ = [
     "end_of_interval",
     "instant",
     "interval",
+    "require_market_timestamp",
     "require_zone",
 ]
 
@@ -128,6 +130,24 @@ def instant(text: str, kind: TimestampKind, zone: str | None) -> float:
         )
     except DataValidationError as exc:
         raise TemporalInterpretationError(str(exc)) from None
+
+
+def require_market_timestamp(timestamp: float) -> float:
+    """``timestamp`` if AlphaLab market data accepts it, else a refusal.
+
+    AlphaLab 4.1.0's market validation contract is deliberately small:
+    :func:`alphalab.market.is_valid_timestamp` accepts only strictly
+    positive Unix seconds. This bridge check keeps canonical rows from reaching
+    the engine only to fail on the first market event.
+    """
+
+    value = float(timestamp)
+    if not is_valid_timestamp(value):
+        raise TemporalInterpretationError(
+            "AlphaLab market data requires timestamps to be strictly positive Unix seconds; "
+            f"got {timestamp!r}."
+        )
+    return value
 
 
 def end_of_interval(

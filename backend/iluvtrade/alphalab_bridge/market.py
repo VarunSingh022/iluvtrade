@@ -21,6 +21,10 @@ from alphalab.backtesting import MarketDataset
 from alphalab.market import Bar, OrderingGuarantee, SequenceSource, TimeFrame
 
 from iluvtrade.alphalab_bridge.instruments import InstrumentUniverse
+from iluvtrade.alphalab_bridge.temporal import (
+    TemporalInterpretationError,
+    require_market_timestamp,
+)
 
 __all__ = [
     "TIMEFRAMES",
@@ -88,9 +92,17 @@ def bars_from_rows(
                 f"Symbol {symbol!r} is not in the declared instrument universe "
                 f"({', '.join(sorted(universe.by_symbol)) or 'empty'})."
             )
+        timestamp = float(row["timestamp"])
+        try:
+            require_market_timestamp(timestamp)
+        except TemporalInterpretationError as exc:
+            raise ValueError(
+                f"Canonical row for {symbol!r} has timestamp {timestamp!r}, which "
+                f"AlphaLab 4.1.0 market data rejects: {exc}"
+            ) from None
         yield Bar(
             asset_id=asset_id,
-            timestamp=float(row["timestamp"]),
+            timestamp=timestamp,
             open=Decimal(str(row["open"])),
             high=Decimal(str(row["high"])),
             low=Decimal(str(row["low"])),

@@ -279,6 +279,12 @@ def clean(
             + " ".join(schema.warnings)
         ).strip()
         return result
+    if schema.symbol_ambiguous:
+        result.fatal = (
+            "The instruments in this file could not be identified unambiguously. "
+            + " ".join(schema.warnings)
+        ).strip()
+        return result
 
     idx = {role: schema.index_for(role) for role in FieldRole}
     reader = csv.reader(io.StringIO(text), delimiter=schema.delimiter)
@@ -360,7 +366,9 @@ def clean(
         if raw_symbol:
             symbol = raw_symbol
         else:
-            symbol = policy.default_symbol
+            # The instrument the price headers name (``AAPL.Close``), or the
+            # policy's default for a file that names none.
+            symbol = schema.header_symbol or policy.default_symbol
             result._transform(
                 Transformation(
                     line_number, TransformationKind.DEFAULTED_SYMBOL, "symbol", "", symbol

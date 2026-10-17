@@ -87,6 +87,7 @@ def universe_for(
     own.
     """
 
+    provider_symbols = sorted(set(symbols))
     records = tuple(
         InstrumentRecord(
             symbol=symbol,
@@ -95,10 +96,27 @@ def universe_for(
             currency=currency,
             aliases={DATASET_PROVIDER: symbol},
         )
-        for symbol in sorted(set(symbols))
+        for symbol in provider_symbols
     )
+    # Keyed on the dataset's own spelling. ``InstrumentRecord`` normalizes its
+    # ``symbol`` to AlphaLab's canonical upper-case form (which the asset id is
+    # derived from), but canonical rows keep the source's spelling: keyed on
+    # ``record.symbol``, a dataset whose symbols were not already upper case
+    # ("Increasing", "aapl") failed at its first bar as "not in the declared
+    # instrument universe".
+    identities: dict[str, list[str]] = {}
+    for symbol, record in zip(provider_symbols, records, strict=True):
+        identities.setdefault(record.asset_id, []).append(symbol)
+    if collisions := [names for names in identities.values() if len(names) > 1]:
+        raise ValueError(
+            "These dataset symbols are one AlphaLab instrument once normalized, so their "
+            "bars cannot be told apart: "
+            + "; ".join(", ".join(repr(n) for n in names) for names in collisions)
+        )
     registry = register_instruments(InstrumentRegistry(), records)
-    by_symbol = {record.symbol: record.asset_id for record in records}
+    by_symbol = {
+        symbol: record.asset_id for symbol, record in zip(provider_symbols, records, strict=True)
+    }
     return InstrumentUniverse(
         registry=registry,
         by_symbol=by_symbol,

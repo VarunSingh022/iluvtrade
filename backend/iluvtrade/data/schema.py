@@ -156,6 +156,14 @@ class DetectedSchema:
     timestamp_ambiguous: bool
     sample_rows: tuple[tuple[str, ...], ...]
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    #: The one instrument a file without a symbol column names in its price
+    #: headers (``AAPL.Open``, ``AAPL.Close`` ... -> ``AAPL``), or ``None``.
+    header_symbol: str | None = None
+    #: The file's instruments cannot be identified without guessing (see the
+    #: warnings): several columns could be the symbol, a column partitions the
+    #: rows but does not look like instrument codes, or the price headers name
+    #: more than one instrument. Such a file is refused, never split on a guess.
+    symbol_ambiguous: bool = False
 
     def column_for(self, role: FieldRole) -> str | None:
         match = self.matches.get(role)
@@ -186,6 +194,8 @@ class DetectedSchema:
             "timestamp_ambiguous": self.timestamp_ambiguous,
             "missing_required": [role.value for role in self.missing_required],
             "ohlc_complete": self.is_ohlc_complete,
+            "header_symbol": self.header_symbol,
+            "symbol_ambiguous": self.symbol_ambiguous,
             "sample_rows": [list(row) for row in self.sample_rows[:10]],
             "warnings": list(self.warnings),
         }
@@ -515,26 +525,30 @@ def detect_schema(text: str) -> DetectedSchema:
                 taken.add(index)
                 break
 
-    # Likewise a symbol column: non-numeric, low cardinality relative to rows.
+    # The instrument, when no column is named as the symbol. Two sources, both
+    # requiring evidence rather than a guess: the price headers themselves
+    # (``AAPL.Close``), or a column that demonstrably partitions the rows into
+    # instruments. A text column with few distinct values is *not* such
+    # evidence on its own -- ``direction`` (Increasing / Decreasing) in a
+    # single-stock file split it into two fake instruments.
+    header_symbol: str | None = None
+    symbol_ambiguous = False
     if not matches[FieldRole.SYMBOL].found:
-        for index, header in enumerate(headers):
-            if index in taken:
-                continue
-            sample = [c.strip() for c in columns[index] if c.strip()]
-            if len(sample) < 3 or _numeric_ratio(sample) > 0.2:
-                continue
-            distinct = len(set(sample))
-            if distinct <= max(1, len(sample) // 2):
-                matches[FieldRole.SYMBOL] = FieldMatch(
-                    FieldRole.SYMBOL,
-                    header,
-                    index,
-                    0.45,
-                    "content-symbol",
-                    f"{distinct} distinct values across {len(sample)} sampled rows.",
-                )
-                taken.add(index)
-                break
+        header_symbol, header_finding = _instrument_from_headers(headers, matches)
+        if header_finding:
+            symbol_ambiguous = True
+            warnings.append(header_finding)
+        elif header_symbol is None:
+            symbol_match, finding, ambiguous_content = _symbol_from_content(
+                text, delimiter, has_header, headers, columns, taken, matches
+            )
+            if finding:
+                warnings.append(finding)
+            if ambiguous_content:
+                symbol_ambiguous = True
+            if symbol_match is not None and symbol_match.column_index is not None:
+                matches[FieldRole.SYMBOL] = symbol_match
+                taken.add(symbol_match.column_index)
 
     timestamp_index = matches[FieldRole.TIMESTAMP].column_index
     if timestamp_index is None:
@@ -563,7 +577,13 @@ def detect_schema(text: str) -> DetectedSchema:
             "Only a close price was found. Bars will be built with open, high and "
             "low set to the close, which is recorded as a transformation."
         )
-    if not matches[FieldRole.SYMBOL].found:
+    if header_symbol is not None:
+        price_columns = ", ".join(str(matches[r].column) for r in _PRICE_ROLES if matches[r].found)
+        warnings.append(
+            f"No symbol column was found. The price columns ({price_columns}) name one "
+            f"instrument, {header_symbol!r}; every row is attributed to it."
+        )
+    elif not matches[FieldRole.SYMBOL].found and not symbol_ambiguous:
         warnings.append(
             "No symbol column was found. Every row will be attributed to a single "
             "instrument named after the dataset."
@@ -578,4 +598,158 @@ def detect_schema(text: str) -> DetectedSchema:
         timestamp_ambiguous=ambiguous,
         sample_rows=tuple(tuple(row) for row in rows[:10]),
         warnings=tuple(warnings),
+        header_symbol=header_symbol,
+        symbol_ambiguous=symbol_ambiguous,
     )
+
+
+_PRICE_ROLES = (FieldRole.OPEN, FieldRole.HIGH, FieldRole.LOW, FieldRole.CLOSE, FieldRole.VOLUME)
+#: Separators between an instrument and a field in a header: ``AAPL.Close``,
+#: ``AAPL_Close``, ``AAPL Close``, ``AAPL-Close``.
+_HEADER_SPLIT = re.compile(r"^(?P<prefix>.+?)[._\- ](?P<field>[^._\- ]+)$")
+#: What an instrument code looks like: ``AAPL``, ``BRK.B``, ``RELIANCE``,
+#: ``^GSPC``, ``NSE:INFY``. Upper case: a guess from content needs the values to
+#: look like codes, not words (``Increasing``) or names.
+_INSTRUMENT_CODE = re.compile(r"^(?=.*[A-Z])[A-Z0-9^][A-Z0-9.^&:/_\-]{0,29}$")
+
+
+def _split_header(header: str) -> tuple[str, FieldRole] | None:
+    """``("AAPL", CLOSE)`` for ``AAPL.Close``; ``None`` unless the field is an exact alias."""
+
+    found = _HEADER_SPLIT.match(header.strip())
+    if found is None:
+        return None
+    field_name = _normalise_header(found.group("field"))
+    for role in _PRICE_ROLES:
+        if field_name in _HEADER_ALIASES[role]:
+            return found.group("prefix").strip(), role
+    return None
+
+
+def _instrument_from_headers(
+    headers: Sequence[str], matches: dict[FieldRole, FieldMatch]
+) -> tuple[str | None, str | None]:
+    """The instrument named by the price headers, and a finding if they name several.
+
+    Recognised only when every matched price column reads ``<instrument><sep>
+    <field>`` with one and the same instrument, and no other header names the
+    same fields for a different instrument. ``AAPL.Close,MSFT.Close`` is a wide
+    multi-instrument file: matching picks one close column, so importing it
+    would silently drop the other instruments -- refused instead.
+    """
+
+    split = {
+        role: _split_header(str(matches[role].column))
+        for role in _PRICE_ROLES
+        if matches[role].found
+    }
+    if not split or any(parts is None or parts[1] is not role for role, parts in split.items()):
+        return None, None
+    prefixes = {parts[0] for parts in split.values() if parts is not None}
+    others = sorted(
+        {parts[0] for h in headers if (parts := _split_header(h)) is not None} - prefixes
+    )
+    if len(prefixes) > 1 or others:
+        named = ", ".join(repr(p) for p in sorted(prefixes | set(others)))
+        return None, (
+            f"The price columns name several instruments ({named}). Files with one column "
+            "per instrument are not supported: import each instrument separately, or as "
+            "one row per instrument and date with a Symbol column."
+        )
+    (prefix,) = prefixes
+    if not _INSTRUMENT_CODE.match(prefix.upper()):
+        return None, None
+    return prefix, None
+
+
+def _symbol_from_content(
+    text: str,
+    delimiter: str,
+    has_header: bool,
+    headers: Sequence[str],
+    columns: list[list[str]],
+    taken: set[int],
+    matches: dict[FieldRole, FieldMatch],
+) -> tuple[FieldMatch | None, str | None, bool]:
+    """A symbol column found by its values, only with structural evidence.
+
+    A column is the symbol only if the file needs one: timestamps repeat (one
+    instrument has one bar per timestamp), the column makes every (value,
+    timestamp) pair unique, and its values look like instrument codes. Checked
+    over the whole file, not the preview, so a file grouped by instrument is
+    judged on all of it. Returns ``(match, finding, ambiguous)``.
+    """
+
+    timestamp_index = matches[FieldRole.TIMESTAMP].column_index
+    candidates = [
+        index
+        for index in range(len(headers))
+        if index not in taken
+        and len(sample := [c.strip() for c in columns[index] if c.strip()]) >= 3
+        and _numeric_ratio(sample) <= 0.2
+        and len(set(sample)) <= max(1, len(sample) // 2)
+    ]
+    if not candidates or timestamp_index is None:
+        return None, None, False
+
+    stamps: list[str] = []
+    values: dict[int, list[str]] = {index: [] for index in candidates}
+    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    for number, row in enumerate(reader):
+        if number == 0 and has_header:
+            continue
+        if not row or all(not cell.strip() for cell in row):
+            continue
+        stamps.append(row[timestamp_index].strip() if timestamp_index < len(row) else "")
+        for index in candidates:
+            values[index].append(row[index].strip() if index < len(row) else "")
+
+    if len(set(stamps)) == len(stamps):
+        one = len(candidates) == 1
+        named = ", ".join(repr(headers[i]) for i in candidates)
+        return (
+            None,
+            f"{named} {'has' if one else 'have'} only a few distinct text values but "
+            f"{'was' if one else 'were'} not taken as the symbol: every timestamp occurs "
+            "once, so the file holds a single instrument.",
+            False,
+        )
+
+    partitioning = [
+        index
+        for index in candidates
+        if len(set(zip(values[index], stamps, strict=True))) == len(stamps)
+    ]
+    codes = [
+        index
+        for index in partitioning
+        if all(_INSTRUMENT_CODE.match(v) for v in set(values[index]) if v)
+    ]
+    if len(codes) == 1 and len(partitioning) == 1:
+        index = codes[0]
+        distinct = len({v for v in values[index] if v})
+        return (
+            FieldMatch(
+                FieldRole.SYMBOL,
+                headers[index],
+                index,
+                0.45,
+                "content-symbol",
+                f"{distinct} instrument codes, one bar per code and timestamp.",
+            ),
+            None,
+            False,
+        )
+    if partitioning:
+        listed = ", ".join(repr(headers[i]) for i in partitioning)
+        return (
+            None,
+            (
+                f"Timestamps repeat, and {listed} could identify the instruments, but not "
+                "unambiguously (the values do not look like instrument codes, or several "
+                "columns qualify). Name the instrument column Symbol (or Ticker) and import "
+                "again; rows are not split into instruments on a guess."
+            ),
+            True,
+        )
+    return None, None, False

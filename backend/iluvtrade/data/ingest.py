@@ -20,6 +20,10 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session as DbSession
 
 from iluvtrade.alphalab_bridge import ALPHALAB_VERSION
+from iluvtrade.alphalab_bridge.temporal import (
+    TemporalInterpretationError,
+    require_market_timestamp,
+)
 from iluvtrade.common import storage
 from iluvtrade.config import Settings, get_settings
 from iluvtrade.data import canonical, quality
@@ -183,6 +187,7 @@ def _readable(schema: DetectedSchema) -> bool:
         schema.missing_required
         or schema.timestamp_ambiguous
         or schema.timestamp_format is TimestampFormat.UNKNOWN
+        or schema.symbol_ambiguous
     )
 
 
@@ -298,6 +303,24 @@ def _to_interval_end(result: CleaningResult, declaration: TemporalDeclaration | 
     return len(moved)
 
 
+def _require_alphalab_market_timestamps(result: CleaningResult) -> None:
+    """Fail the version if any canonical bar timestamp violates AlphaLab's contract."""
+
+    if result.fatal or not result.rows:
+        return
+    for row in result.rows:
+        try:
+            require_market_timestamp(row.timestamp)
+        except TemporalInterpretationError as exc:
+            result.fatal = (
+                "The canonical data cannot be used by AlphaLab market data: "
+                f"line {row.source_line} ({row.symbol}) has timestamp {row.timestamp!r}. "
+                f"{exc}"
+            )
+            result.rows = []
+            return
+
+
 def _temporal_record(
     declaration: TemporalDeclaration | None,
     found: TimestampSurvey,
@@ -362,6 +385,7 @@ def _canonicalize(
     result = clean(text, schema, policy, declaration)
     spacing = _check_spacing(result, declaration, found)
     moved = _to_interval_end(result, declaration)
+    _require_alphalab_market_timestamps(result)
     report = quality.analyse(result, schema)
 
     version = DatasetVersion(
@@ -618,6 +642,15 @@ def _require_runnable(version: DatasetVersion) -> None:
             "Re-import the file declaring what its "
             "timestamps mean and its bar interval; the original bytes are kept with the source."
         )
+    if version.start_timestamp is not None:
+        try:
+            require_market_timestamp(version.start_timestamp)
+        except TemporalInterpretationError as exc:
+            raise IngestError(
+                f"Dataset version {version.id} contains canonical market-data timestamps "
+                f"AlphaLab 4.1.0 will refuse: its first timestamp is "
+                f"{version.start_timestamp!r}. {exc}"
+            ) from None
 
 
 def require_runnable(version: DatasetVersion) -> None:

@@ -53,6 +53,14 @@ def _daily_csv(*, vwap: list[str] | None = None, trades: list[str] | None = None
     return ("\n".join(lines) + "\n").encode()
 
 
+def _daily_csv_for(days: list[str], *, symbol: str = "SPX") -> bytes:
+    lines = ["Date,Symbol,Open,High,Low,Close,Volume"]
+    for index, day in enumerate(days):
+        close = 100 + index
+        lines.append(f"{day},{symbol},{close - 1},{close + 2},{close - 3},{close},100000")
+    return ("\n".join(lines) + "\n").encode()
+
+
 def _intraday_times(day: str = "2024-01-02", bars: int = 12) -> list[dt.datetime]:
     start = dt.datetime.fromisoformat(f"{day}T09:15:00").replace(tzinfo=IST)
     return [start + dt.timedelta(minutes=15 * i) for i in range(bars)]
@@ -229,6 +237,210 @@ def test_a_session_date_is_stamped_at_the_end_of_that_day_in_the_exchange_zone(
     assert version["temporal"]["timezone"] == "Asia/Kolkata"
     assert version["temporal"]["timestamp_kind"] == "date"
     assert "END_OF_DAY" in version["temporal"]["rule"]
+
+
+def test_pre_1970_session_dates_are_refused_before_alpha_lab_sees_a_bar(client, headers) -> None:
+    register(client, "pre-epoch@example.com")
+    version = _upload(
+        client,
+        headers,
+        _daily_csv_for(["1950-01-03", "1950-01-04", "1950-01-05"]),
+        timestamp_convention="session_date",
+        timezone="UTC",
+    ).json()
+
+    assert version["status"] == "failed", version
+    assert version["canonical_hash"] is None
+    assert version["row_count"] == 0
+    assert "strictly positive Unix seconds" in version["failure_reason"]
+    assert "-630892800.000001" in version["failure_reason"]
+
+
+def test_date_only_daily_bars_persist_reload_and_reach_backtest_execution(client, headers) -> None:
+    from iluvtrade.backtests.worker import BacktestWorkerPool
+    from iluvtrade.common import storage
+    from iluvtrade.data import ingest
+    from iluvtrade.db.models.data import DatasetVersion
+    from iluvtrade.db.session import session_scope
+
+    register(client, "post-epoch@example.com")
+    days = [f"1970-01-0{day}" for day in range(1, 7)]
+    created = _upload(
+        client,
+        headers,
+        _daily_csv_for(days),
+        timestamp_convention="session_date",
+        timezone="UTC",
+    ).json()
+    assert created["status"] == "pending_approval", created
+    approved = client.post(f"/api/v1/datasets/versions/{created['id']}/approve", headers=headers)
+    assert approved.status_code == 200, approved.text
+
+    expected = [
+        (
+            dt.datetime.fromisoformat(day).replace(tzinfo=dt.UTC)
+            + dt.timedelta(days=1, microseconds=-1)
+        ).timestamp()
+        for day in days
+    ]
+    with session_scope() as session:
+        version = session.get(DatasetVersion, created["id"])
+        assert version is not None and version.canonical_path and version.canonical_hash
+        rows = ingest.canonical_rows(version)
+        persisted = storage.read_jsonl_verified(
+            version.canonical_path, version.canonical_hash, expected_count=version.row_count
+        )
+    assert rows == persisted
+    assert [row["timestamp"] for row in rows] == expected
+
+    strategy = _strategy(client, headers)
+    job = client.post(
+        "/api/v1/backtests",
+        json={"dataset_version_id": created["id"], "strategy_version_id": strategy, "seed": 1970},
+        headers=headers,
+    ).json()
+    BacktestWorkerPool(size=1).drain(timeout=120)
+    finished = client.get(f"/api/v1/backtests/{job['id']}").json()
+    assert finished["status"] == "completed", finished
+    result = client.get(f"/api/v1/backtests/{job['id']}/result").json()
+    assert result["result"]["records_processed"] == len(days)
+
+
+#: The first eight sessions of the Apple file that hit the production failure
+#: report (plotly ``finance-charts-apple.csv``), verbatim: Date, Open, High, Low,
+#: Close, Volume.
+APPLE_2015 = [
+    ("2015-02-17", "127.489998", "128.880005", "126.919998", "127.830002", "63152400"),
+    ("2015-02-18", "127.629997", "128.779999", "127.449997", "128.720001", "44891700"),
+    ("2015-02-19", "128.479996", "129.029999", "128.330002", "128.449997", "37362400"),
+    ("2015-02-20", "128.619995", "129.5", "128.050003", "129.5", "48948400"),
+    ("2015-02-23", "130.020004", "133", "129.660004", "133", "70974100"),
+    ("2015-02-24", "132.940002", "133.600006", "131.169998", "132.169998", "69228100"),
+    ("2015-02-25", "131.559998", "131.600006", "128.149994", "128.789993", "74711700"),
+    ("2015-02-26", "128.789993", "130.869995", "126.610001", "130.419998", "91287500"),
+]
+
+
+def test_apple_2015_sessions_with_a_mixed_case_symbol_reach_a_completed_backtest(
+    client, headers
+) -> None:
+    """The Apple-era case: positive timestamps, and a symbol not already upper case.
+
+    Its timestamps were never the problem -- 2015-02-17 ends at
+    1424217599.999999 Unix seconds, which AlphaLab accepts. What stopped such a
+    dataset was the instrument universe being keyed on AlphaLab's normalized
+    (upper-case) symbol while canonical rows keep the source's spelling: the
+    first bar failed as "not in the declared instrument universe".
+    """
+
+    from iluvtrade.backtests.worker import BacktestWorkerPool
+
+    register(client, "apple-2015@example.com")
+    lines = ["Date,Symbol,Open,High,Low,Close,Volume"]
+    lines += [f"{d},Aapl,{o},{h},{lo},{c},{v}" for d, o, h, lo, c, v in APPLE_2015]
+    created = _upload(
+        client,
+        headers,
+        ("\n".join(lines) + "\n").encode(),
+        timestamp_convention="session_date",
+        timezone="UTC",
+    ).json()
+    assert created["status"] == "pending_approval", created
+    stamps = [row["timestamp"] for row in _rows(created["id"])]
+    assert stamps[0] == 1424217599.999999  # the value the stored production file holds
+    assert all(stamp > 0 for stamp in stamps)
+    approved = client.post(f"/api/v1/datasets/versions/{created['id']}/approve", headers=headers)
+    assert approved.status_code == 200, approved.text
+
+    strategy = _strategy(client, headers)
+    job = client.post(
+        "/api/v1/backtests",
+        json={"dataset_version_id": created["id"], "strategy_version_id": strategy, "seed": 2015},
+        headers=headers,
+    ).json()
+    BacktestWorkerPool(size=1).drain(timeout=120)
+    finished = client.get(f"/api/v1/backtests/{job['id']}").json()
+    assert finished["status"] == "completed", finished
+    result = client.get(f"/api/v1/backtests/{job['id']}/result").json()
+    assert result["result"]["records_processed"] == len(APPLE_2015)
+    assert result["reproducibility"]["universe"] == ["Aapl"]
+
+
+def test_an_approved_pre_1970_version_cannot_be_backtested(client, headers) -> None:
+    """The state the production ``sp500`` and ``GSPC`` versions are in.
+
+    They were imported and approved before the import refused pre-1970 bars, so
+    the job reached AlphaLab and failed on its first bar with "Invalid timestamp
+    for bar." Submission now refuses such a version up front, saying why.
+    """
+
+    from iluvtrade.db.models.data import DatasetVersion
+    from iluvtrade.db.session import session_scope
+
+    register(client, "approved-pre-epoch@example.com")
+    created = _upload(
+        client,
+        headers,
+        _daily_csv_for(["1970-01-02", "1970-01-05", "1970-01-06"]),
+        timestamp_convention="session_date",
+        timezone="UTC",
+    ).json()
+    client.post(f"/api/v1/datasets/versions/{created['id']}/approve", headers=headers)
+    with session_scope() as session:
+        version = session.get(DatasetVersion, created["id"])
+        assert version is not None
+        version.start_timestamp = -630979200.0  # 1950-01-03, as stored for "sp500"
+    strategy = _strategy(client, headers)
+    refused = client.post(
+        "/api/v1/backtests",
+        json={"dataset_version_id": created["id"], "strategy_version_id": strategy},
+        headers=headers,
+    )
+    assert refused.status_code == 400, refused.text
+    message = refused.json()["error"]["message"]
+    assert "-630979200.0" in message and "strictly positive Unix seconds" in message
+
+
+def test_the_adapter_refuses_a_non_positive_bar_before_alphalab_does() -> None:
+    import pytest
+    from alphalab.market import TimeFrame
+
+    from iluvtrade.alphalab_bridge.instruments import universe_for
+    from iluvtrade.alphalab_bridge.market import bars_from_rows
+
+    universe = universe_for(["SPX"])
+    row = {"symbol": "SPX", "open": "1", "high": "2", "low": "0.5", "close": "1.5", "volume": "0"}
+    for stamp in (-630979200.0, 0.0, float("nan")):
+        with pytest.raises(ValueError, match=r"AlphaLab 4\.1\.0 market data rejects"):
+            list(
+                bars_from_rows(
+                    [{**row, "timestamp": stamp}],
+                    timeframe=TimeFrame.parse("1d"),
+                    universe=universe,
+                )
+            )
+    bar = next(
+        bars_from_rows(
+            [{**row, "timestamp": 1424217599.999999}],
+            timeframe=TimeFrame.parse("1d"),
+            universe=universe,
+        )
+    )
+    assert bar.timestamp == 1424217599.999999
+
+
+def test_symbols_that_normalize_to_one_instrument_are_refused() -> None:
+    import pytest
+
+    from iluvtrade.alphalab_bridge.instruments import universe_for
+
+    universe = universe_for(["Aapl", "MSFT"])
+    assert set(universe.by_symbol) == {"Aapl", "MSFT"}
+    assert universe.symbol_of(universe.by_symbol["Aapl"]) == "Aapl"
+    # The asset id is still AlphaLab's, derived from the normalized symbol.
+    assert universe.by_symbol["Aapl"] == universe_for(["AAPL"]).by_symbol["AAPL"]
+    with pytest.raises(ValueError, match="one AlphaLab instrument once normalized"):
+        universe_for(["aapl", "AAPL"])
 
 
 def test_session_dates_must_be_daily(client, headers) -> None:

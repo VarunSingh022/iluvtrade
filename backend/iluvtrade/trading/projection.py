@@ -6,9 +6,15 @@ made for display, audit and restart. Nothing in this module adds, nets, marks or
 revalues anything — where a number appears it was produced by AlphaLab and is
 being transcribed.
 
-Orders and fills are append-only and written by sequence, so a projection run
-twice does not duplicate them. Positions are replaced wholesale, because a
-position that closed must disappear rather than linger at its last quantity.
+Orders and fills are keyed by ``(session, sequence)``, so a projection run
+twice does not duplicate them. Fills are append-only: a fill never changes. An
+order does -- under next-bar execution it is projected while still working and
+fills at its instrument's next bar -- so an order already written is updated to
+the engine's current status, filled quantity and average price. Its engine order
+id must still match: a different id at the same sequence means the stored
+projection is not of this run, and it is refused rather than overwritten.
+Positions are replaced wholesale, because a position that closed must disappear
+rather than linger at its last quantity.
 """
 
 from __future__ import annotations
@@ -27,7 +33,11 @@ from iluvtrade.db.models.trading import (
     TradingSession,
 )
 
-__all__ = ["log_event", "project"]
+__all__ = ["ProjectionMismatch", "log_event", "project"]
+
+
+class ProjectionMismatch(RuntimeError):
+    """The stored projection names a different engine order or fill at a sequence."""
 
 
 def log_event(
@@ -86,13 +96,29 @@ def project(
     trading_session.last_advanced_at = utcnow()
 
     existing_orders = {
-        row.sequence
+        row.sequence: row
         for row in session.execute(
             select(SessionOrder).where(SessionOrder.session_id == trading_session.id)
         ).scalars()
     }
     for row in results.orders_of(result):
-        if row["sequence"] in existing_orders:
+        stored = existing_orders.get(row["sequence"])
+        if stored is not None:
+            if stored.engine_order_id != row["order_id"]:
+                raise ProjectionMismatch(
+                    f"Order {row['sequence']} of session {trading_session.id} is stored as "
+                    f"engine order {stored.engine_order_id}, but the engine reports "
+                    f"{row['order_id']} at that sequence; refusing to overwrite it."
+                )
+            # Its lifecycle has moved on since it was first written (a next-bar
+            # order is written working, then fills): transcribe where it is now.
+            # Until this was done the row kept its first status for good -- an
+            # order written while working read "accepted, 0 filled" beside the
+            # fill that completed it.
+            stored.status = row["status"]
+            stored.quantity = row["quantity"] or "0"
+            stored.filled_quantity = row["filled_quantity"] or "0"
+            stored.average_fill_price = row["average_fill_price"]
             continue
         session.add(
             SessionOrder(
@@ -112,13 +138,20 @@ def project(
         )
 
     existing_fills = {
-        row.sequence
+        row.sequence: row
         for row in session.execute(
             select(SessionFill).where(SessionFill.session_id == trading_session.id)
         ).scalars()
     }
     for row in results.fills_of(result):
-        if row["sequence"] in existing_fills:
+        stored_fill = existing_fills.get(row["sequence"])
+        if stored_fill is not None:
+            if stored_fill.engine_fill_id != row["fill_id"]:
+                raise ProjectionMismatch(
+                    f"Fill {row['sequence']} of session {trading_session.id} is stored as "
+                    f"engine fill {stored_fill.engine_fill_id}, but the engine reports "
+                    f"{row['fill_id']} at that sequence; refusing to overwrite it."
+                )
             continue
         session.add(
             SessionFill(
